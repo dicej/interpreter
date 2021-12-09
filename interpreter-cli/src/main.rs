@@ -1,9 +1,9 @@
 use {
     anyhow::Result,
+    interpreter::Env,
     rustyline::{error::ReadlineError, Editor},
     std::{fs::File, io::Read, path::PathBuf},
     structopt::StructOpt,
-    syn::Stmt,
 };
 
 const HISTORY_FILE: &str = ".interpreter-cli-history.txt";
@@ -19,23 +19,24 @@ fn main() -> Result<()> {
 
     let options = Options::from_args();
 
+    let mut env = Env::new();
+
     if let Some(input_file) = options.input_file {
         let mut content = String::new();
 
         File::open(&input_file)?.read_to_string(&mut content)?;
 
-        println!("{:#?}", syn::parse_file(&content)?);
+        println!("{}", env.eval_file(&content)?);
     } else {
         let mut rl = Editor::<()>::new();
         let _ = rl.load_history(HISTORY_FILE);
 
         loop {
-            let readline = rl.readline(">> ");
-            match readline {
+            match rl.readline(">> ") {
                 Ok(line) => {
                     rl.add_history_entry(line.as_str());
 
-                    println!("{:#?}", syn::parse_str::<Stmt>(line.as_str()));
+                    println!("{}", env.eval_line(line.as_str())?);
 
                     rl.save_history(HISTORY_FILE)?;
                 }

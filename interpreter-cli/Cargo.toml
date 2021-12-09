@@ -9,5 +9,4 @@ structopt = "0.3"
 anyhow = "1"
 log = "0.4"
 rustyline = "9"
-syn = { version = "1", default-features = false, features = ["parsing", "full", "extra-traits"] }
 interpreter = { path = ".." }
