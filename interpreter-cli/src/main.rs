@@ -36,15 +36,18 @@ fn main() -> Result<()> {
                 Ok(line) => {
                     rl.add_history_entry(line.as_str());
 
-                    println!("{}", env.eval_line(line.as_str())?);
+                    match env.eval_line(line.as_str()) {
+                        Ok(result) => println!("{result}"),
+                        Err(error) => println!("Error: {error:?}"),
+                    }
 
                     rl.save_history(HISTORY_FILE)?;
                 }
 
                 Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
 
-                Err(err) => {
-                    println!("Error: {:?}", err);
+                Err(error) => {
+                    println!("Error: {error:?}");
                     break;
                 }
             }
