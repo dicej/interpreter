@@ -40,7 +40,9 @@ fn main() -> Result<()> {
 
                     rl.save_history(HISTORY_FILE)?;
                 }
+
                 Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
+
                 Err(err) => {
                     println!("Error: {:?}", err);
                     break;
