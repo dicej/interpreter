@@ -5,6 +5,4 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-num-bigint = "0.4"
-num-traits = "0.2"
 syn = { version = "1", default-features = false, features = ["parsing", "full", "extra-traits"] }
