@@ -932,6 +932,41 @@ impl Env {
                                 type_: Type::Integer(Integer::U128),
                             },
 
+                            "usize" => Literal {
+                                value: Rc::new(lit.base10_digits().parse::<usize>()?),
+                                type_: Type::Integer(Integer::Usize),
+                            },
+
+                            "i8" => Literal {
+                                value: Rc::new(lit.base10_digits().parse::<i8>()?),
+                                type_: Type::Integer(Integer::I8),
+                            },
+
+                            "i16" => Literal {
+                                value: Rc::new(lit.base10_digits().parse::<i16>()?),
+                                type_: Type::Integer(Integer::I16),
+                            },
+
+                            "i32" => Literal {
+                                value: Rc::new(lit.base10_digits().parse::<i32>()?),
+                                type_: Type::Integer(Integer::I32),
+                            },
+
+                            "i64" => Literal {
+                                value: Rc::new(lit.base10_digits().parse::<i64>()?),
+                                type_: Type::Integer(Integer::I64),
+                            },
+
+                            "i128" => Literal {
+                                value: Rc::new(lit.base10_digits().parse::<i128>()?),
+                                type_: Type::Integer(Integer::I128),
+                            },
+
+                            "isize" => Literal {
+                                value: Rc::new(lit.base10_digits().parse::<isize>()?),
+                                type_: Type::Integer(Integer::Isize),
+                            },
+
                             _ => {
                                 return Err(anyhow!(
                                     "unexpected integer literal suffix: {}",
