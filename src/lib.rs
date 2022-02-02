@@ -1,9 +1,12 @@
 use {
     anyhow::{anyhow, Result},
+    maplit::hashmap,
     std::{
-        collections::HashMap,
-        fmt,
-        ops::{Add, Div, Rem, Sub},
+        any::Any,
+        collections::{HashMap, HashSet},
+        fmt, mem,
+        ops::{Add, Div, Mul, Rem, Sub},
+        rc::Rc,
     },
     syn::{
         BinOp, Expr, ExprBinary, ExprLit, ExprPath, ExprUnary, Lit, LitBool, Local, Pat, PatIdent,
@@ -26,6 +29,26 @@ enum Integer {
     I64,
     I128,
     Isize,
+}
+
+impl Integer {
+    fn parse(self, value: &str) -> Result<Rc<dyn Any>> {
+        Ok(match self {
+            Integer::Unknown => unreachable!(),
+            Integer::U8 => Rc::new(value.parse::<u8>()?),
+            Integer::U16 => Rc::new(value.parse::<u16>()?),
+            Integer::U32 => Rc::new(value.parse::<u32>()?),
+            Integer::U64 => Rc::new(value.parse::<u64>()?),
+            Integer::U128 => Rc::new(value.parse::<u128>()?),
+            Integer::Usize => Rc::new(value.parse::<usize>()?),
+            Integer::I8 => Rc::new(value.parse::<i8>()?),
+            Integer::I16 => Rc::new(value.parse::<i16>()?),
+            Integer::I32 => Rc::new(value.parse::<i32>()?),
+            Integer::I64 => Rc::new(value.parse::<i64>()?),
+            Integer::I128 => Rc::new(value.parse::<i128>()?),
+            Integer::Isize => Rc::new(value.parse::<isize>()?),
+        })
+    }
 }
 
 #[derive(Clone, Hash, Eq, PartialEq, Copy, Debug)]
@@ -79,31 +102,43 @@ enum Type {
 #[derive(Clone)]
 struct Literal {
     value: Rc<dyn Any>,
-    r#type: Type,
+    type_: Type,
 }
 
 impl fmt::Debug for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.r#type {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for Literal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.type_ {
             Type::Integer(integer) => match integer {
-                Integer::Unknown => write!(f, "{}", self.value.downcast_ref::<String>()),
-                Integer::U8 => write!(f, "{}_u8", self.value.downcast_ref::<u8>()),
-                Integer::U16 => write!(f, "{}_u16", self.value.downcast_ref::<u16>()),
-                Integer::U32 => write!(f, "{}_u32", self.value.downcast_ref::<u32>()),
-                Integer::U64 => write!(f, "{}_u64", self.value.downcast_ref::<u64>()),
-                Integer::U128 => write!(f, "{}_u128", self.value.downcast_ref::<u128>()),
-                Integer::Usize => write!(f, "{}_usize", self.value.downcast_ref::<usize>()),
-                Integer::I8 => write!(f, "{}_i8", self.value.downcast_ref::<i8>()),
-                Integer::I16 => write!(f, "{}_i16", self.value.downcast_ref::<i16>()),
-                Integer::I32 => write!(f, "{}_i32", self.value.downcast_ref::<i32>()),
-                Integer::I64 => write!(f, "{}_i64", self.value.downcast_ref::<i64>()),
-                Integer::I128 => write!(f, "{}_i128", self.value.downcast_ref::<i128>()),
-                Integer::Isize => write!(f, "{}_isize", self.value.downcast_ref::<isize>()),
+                Integer::Unknown => write!(f, "{}", self.value.downcast_ref::<String>().unwrap()),
+                Integer::U8 => write!(f, "{}_u8", self.value.downcast_ref::<u8>().unwrap()),
+                Integer::U16 => write!(f, "{}_u16", self.value.downcast_ref::<u16>().unwrap()),
+                Integer::U32 => write!(f, "{}_u32", self.value.downcast_ref::<u32>().unwrap()),
+                Integer::U64 => write!(f, "{}_u64", self.value.downcast_ref::<u64>().unwrap()),
+                Integer::U128 => write!(f, "{}_u128", self.value.downcast_ref::<u128>().unwrap()),
+                Integer::Usize => {
+                    write!(f, "{}_usize", self.value.downcast_ref::<usize>().unwrap())
+                }
+                Integer::I8 => write!(f, "{}_i8", self.value.downcast_ref::<i8>().unwrap()),
+                Integer::I16 => write!(f, "{}_i16", self.value.downcast_ref::<i16>().unwrap()),
+                Integer::I32 => write!(f, "{}_i32", self.value.downcast_ref::<i32>().unwrap()),
+                Integer::I64 => write!(f, "{}_i64", self.value.downcast_ref::<i64>().unwrap()),
+                Integer::I128 => write!(f, "{}_i128", self.value.downcast_ref::<i128>().unwrap()),
+                Integer::Isize => {
+                    write!(f, "{}_isize", self.value.downcast_ref::<isize>().unwrap())
+                }
             },
 
-            Type::Boolean => write!(f, "{}", self.value.downcast_ref::<bool>()),
+            Type::Boolean => write!(f, "{}", self.value.downcast_ref::<bool>().unwrap()),
 
-            _ => write!(f, "TODO: Debug for {}", self.r#type),
+            Type::Unit => write!(f, "()"),
+
+            _ => write!(f, "TODO: Debug for {:?}", self.type_),
         }
     }
 }
@@ -131,7 +166,7 @@ struct Abstraction {
     // reference the polymorphic version, if any.
     parameters: Rc<[(Identifier, Type)]>,
     // TODO: this seems redundant given that `body` should have a type:
-    r#return: Type,
+    return_: Type,
     body: Rc<TypedTerm>,
 }
 
@@ -141,7 +176,7 @@ enum TypedTerm {
     Literal(Literal),
     Parameter {
         index: usize,
-        r#type: Type,
+        type_: Type,
     },
     Application {
         abstraction: Abstraction,
@@ -153,9 +188,9 @@ enum TypedTerm {
     UnaryOp(UnaryOp, Rc<TypedTerm>),
     BinaryOp(BinaryOp, Rc<TypedTerm>, Rc<TypedTerm>),
     If {
-        predicate: TypedTerm,
+        predicate: Rc<TypedTerm>,
         then: Rc<TypedTerm>,
-        r#else: Rc<TypedTerm>,
+        else_: Rc<TypedTerm>,
     },
     Loop {
         label: Option<Identifier>,
@@ -171,23 +206,23 @@ enum TypedTerm {
     },
     Cast {
         term: Rc<TypedTerm>,
-        r#type: Type,
+        type_: Type,
     },
 }
 
 impl TypedTerm {
-    fn r#type(&self) -> Type {
+    fn type_(&self) -> Type {
         match self {
-            Self::Block(terms) => terms.last().map(|term| term.r#type()).unwrap_or(Type::Unit),
-            Self::Literal(literal) => literal.r#type,
+            Self::Block(terms) => terms.last().map(|term| term.type_()).unwrap_or(Type::Unit),
+            Self::Literal(literal) => literal.type_.clone(),
             // TODO: the return type of an abstraction may be a function of its type parameters unless it's already
             // been monomorphized
             Self::Application {
-                abstraction: Abstraction { ret, .. },
+                abstraction: Abstraction { return_, .. },
                 ..
-            } => r#return,
+            } => return_.clone(),
             Self::And { .. } | Self::Or { .. } => Type::Boolean,
-            Self::If { then, .. } => then.r#type(),
+            Self::If { then, .. } => then.type_(),
             _ => todo!(),
         }
     }
@@ -205,7 +240,7 @@ enum Term {
     Abstraction {
         // TODO: what about type parameters?
         parameters: Rc<[Type]>,
-        r#return: Type,
+        return_: Type,
         body: Rc<Term>,
     },
     UnaryOp {
@@ -218,9 +253,9 @@ enum Term {
         right: Rc<Term>,
     },
     If {
-        predicate: Term,
+        predicate: Rc<Term>,
         then: Rc<Term>,
-        r#else: Rc<Term>,
+        else_: Rc<Term>,
     },
     Loop {
         label: Option<Identifier>,
@@ -236,14 +271,8 @@ enum Term {
     },
     Cast {
         term: Rc<Term>,
-        r#type: Type,
+        type_: Type,
     },
-}
-
-#[derive(Clone, Debug)]
-struct TypedTerm {
-    term: Term,
-    r#type: Type,
 }
 
 #[derive(Default)]
@@ -267,8 +296,8 @@ pub struct Eval {
 
 impl fmt::Display for Eval {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut need_newline = if let Some(term) = &self.term {
-            write!(f, "{term}")?;
+        let mut need_newline = if let Some(value) = &self.value {
+            write!(f, "{value}")?;
             true
         } else {
             false
@@ -282,7 +311,7 @@ impl fmt::Display for Eval {
             write!(f, "{symbol}")?;
 
             if let Some(term) = term {
-                write!(f, " = {term}")?;
+                write!(f, " = {term:?}")?;
             }
 
             need_newline = true;
@@ -303,13 +332,13 @@ impl Env {
             impls: HashMap::new(),
         };
 
-        // TODO: should traits and impls from core/std source files
+        // TODO: should load traits and impls from core/std source files
 
         let self_ = env.intern("self");
         let other = env.intern("other");
 
         // These functions won't ever be called at runtime, so just use an empty body:
-        let empty = TypedTerm::Block(Rc::new([]));
+        let empty = Rc::new(TypedTerm::Block(Rc::new([])));
 
         let signed = [
             Integer::I8,
@@ -319,35 +348,40 @@ impl Env {
             Integer::I128,
             Integer::Isize,
         ]
-        .iter()
+        .into_iter()
         .map(Type::Integer)
         .collect::<Vec<_>>();
 
-        let unaries = &[("Neg", "neg", &signed), ("Not", "not", &[Type::Boolean])];
+        let unaries = &[
+            ("Neg", "neg", &signed as &[Type]),
+            ("Not", "not", &[Type::Boolean]),
+        ];
 
         for (name, function, types) in unaries {
             let name = env.intern(name);
             let function = env.intern(function);
-            let r#trait = Trait(name, Rc::new([]));
+            let trait_ = Trait(name, Rc::new([]));
 
-            env.traits.insert(name, r#trait);
+            env.traits.insert(name, trait_.clone());
 
-            for r#type in types {
+            for type_ in *types {
                 env.impls.insert(
-                    (r#type, r#trait),
-                    Impl {
+                    (type_.clone(), trait_.clone()),
+                    Some(Impl {
                         arguments: Rc::new([]),
-                        functions: Rc::new(hashmap![function => Abstraction {
-                            parameters: Rc::new([(self_, r#type)]),
-                            r#return: r#type,
-                            body: empty
-                        }]),
-                    },
+                        functions: Rc::new(hashmap! {
+                            function => Abstraction {
+                                parameters: Rc::new([(self_, type_.clone())]),
+                                return_: type_.clone(),
+                                body: empty.clone()
+                            }
+                        }),
+                    }),
                 );
             }
         }
 
-        let integers = &[
+        let integers = [
             Integer::I8,
             Integer::I16,
             Integer::I32,
@@ -361,7 +395,7 @@ impl Env {
             Integer::U128,
             Integer::Usize,
         ]
-        .iter()
+        .into_iter()
         .map(Type::Integer)
         .collect::<Vec<_>>();
 
@@ -371,28 +405,26 @@ impl Env {
             ("Mul", "mul", &integers),
             ("Div", "div", &integers),
             ("Rem", "rem", &integers),
-            ("And", "and", &[Type::Boolean]),
-            ("Or", "or", &[Type::Boolean]),
         ];
 
         for (name, function, types) in binaries {
             let name = env.intern(name);
             let function = env.intern(function);
-            let r#trait = Trait(name, Rc::new([]));
+            let trait_ = Trait(name, Rc::new([]));
 
-            env.traits.insert(name, r#trait);
+            env.traits.insert(name, trait_.clone());
 
-            for r#type in types {
+            for type_ in *types {
                 env.impls.insert(
-                    (r#type, r#trait),
-                    Impl {
-                        arguments: Rc::new([]),
+                    (type_.clone(), trait_.clone()),
+                    Some(Impl {
+                        arguments: Rc::new([type_.clone()]),
                         functions: Rc::new(hashmap![function => Abstraction {
-                            parameters: Rc::new([(self_, r#type), (other, r#type)]),
-                            r#return: r#type,
-                            body: empty
+                            parameters: Rc::new([(self_, type_.clone()), (other, type_.clone())]),
+                            return_: type_.clone(),
+                            body: empty.clone()
                         }]),
-                    },
+                    }),
                 );
             }
         }
@@ -402,6 +434,16 @@ impl Env {
 
     fn inner_scope(&mut self) -> &mut Scope {
         self.scopes.last_mut().unwrap()
+    }
+
+    fn find_term(&self, id: Identifier) -> Option<Option<Term>> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(term) = scope.terms.get(&id) {
+                return Some(term.clone());
+            }
+        }
+
+        None
     }
 
     pub fn eval_line(&mut self, line: &str) -> Result<Eval> {
@@ -419,9 +461,11 @@ impl Env {
 
         let mut new_term_bindings = HashSet::new();
 
-        let value = self.eval_term(
-            &self.type_check(&self.stmt_to_term(&stmt, &mut new_term_bindings)?, None)?,
-        )?;
+        let term = &self.stmt_to_term(&stmt, &mut new_term_bindings)?;
+
+        let term = &self.type_check(term, None)?;
+
+        let value = self.eval_term(term)?;
 
         Ok(Eval {
             value: Some(value),
@@ -431,35 +475,35 @@ impl Env {
                     self.find_term(id)
                         .map(|term| (self.unintern(id).clone(), term))
                 })
-                .collect()?,
+                .collect(),
         })
     }
 
     fn intern(&mut self, name: &str) -> Identifier {
-        if let Some(id) = self.names_to_ids.get(name) {
-            id
+        if let Some(&id) = self.names_to_ids.get(name) {
+            Identifier(id)
         } else {
-            let name = Rc::from(name);
-            let id = Identifier(self.ids_to_names.len());
-            self.ids_to_names.push(name);
+            let name = Rc::<str>::from(name);
+            let id = self.ids_to_names.len();
+            self.ids_to_names.push(name.clone());
             self.names_to_ids.insert(name, id);
-            id
+            Identifier(id)
         }
     }
 
     fn unintern(&mut self, Identifier(id): Identifier) -> Rc<str> {
-        self.ids_to_names[id]
+        self.ids_to_names[id].clone()
     }
 
-    fn get_impl(&mut self, r#type: &Type, r#trait: &Trait) -> Option<Impl> {
-        if let Some(result) = self.impls.get(&(r#type, r#trait)) {
-            result
+    fn get_impl(&mut self, type_: &Type, trait_: &Trait) -> Option<Impl> {
+        if let Some(result) = self.impls.get(&(type_.clone(), trait_.clone())) {
+            result.clone()
         } else {
             // TODO: any exact-match impls should already be in impls, so if we reach here then either the type
             // doesn't implement the trait or there's a matching polymorphic impl we need to find, monomorphize,
             // and add to impls.
 
-            self.impls.insert((r#type, r#trait), None);
+            self.impls.insert((type_.clone(), trait_.clone()), None);
 
             None
         }
@@ -467,7 +511,7 @@ impl Env {
 
     fn eval_term(&mut self, term: &TypedTerm) -> Result<Literal> {
         match term {
-            TypedTerm::Literal(literal) => literal.clone(),
+            TypedTerm::Literal(literal) => Ok(literal.clone()),
 
             TypedTerm::Application {
                 abstraction: Abstraction { body, .. },
@@ -475,12 +519,12 @@ impl Env {
             } => {
                 let mut parameters = arguments
                     .iter()
-                    .map(|term| self.eval_term(term)?)
+                    .map(|term| self.eval_term(term))
                     .collect::<Result<_>>()?;
 
                 mem::swap(&mut self.parameters, &mut parameters);
 
-                let result = self.eval_term(body)?;
+                let result = self.eval_term(body);
 
                 mem::swap(&mut self.parameters, &mut parameters);
 
@@ -488,23 +532,23 @@ impl Env {
             }
 
             TypedTerm::And(left, right) => {
-                if *self.eval_term(left)?.value.downcast_ref::<bool>() {
+                if *self.eval_term(left)?.value.downcast_ref::<bool>().unwrap() {
                     self.eval_term(right)
                 } else {
                     Ok(Literal {
                         value: Rc::new(false),
-                        r#type: Type::Boolean,
+                        type_: Type::Boolean,
                     })
                 }
             }
 
             TypedTerm::Or(left, right) => {
-                if !*self.eval_term(left)?.value.downcast_ref::<bool>() {
+                if !*self.eval_term(left)?.value.downcast_ref::<bool>().unwrap() {
                     self.eval_term(right)
                 } else {
                     Ok(Literal {
                         value: Rc::new(true),
-                        r#type: Type::Boolean,
+                        type_: Type::Boolean,
                     })
                 }
             }
@@ -513,16 +557,28 @@ impl Env {
                 let result = self.eval_term(term)?;
 
                 match op {
-                    UnaryOp::Neg => match result.r#type {
+                    UnaryOp::Neg => match result.type_ {
                         Type::Integer(integer_type) => Ok(Literal {
-                            r#type: Type::Integer(integer_type),
+                            type_: Type::Integer(integer_type),
                             value: match integer_type {
-                                Integer::I8 => Box::new(-result.value.downcast_ref::<i8>()),
-                                Integer::I16 => Box::new(-result.value.downcast_ref::<i16>()),
-                                Integer::I32 => Box::new(-result.value.downcast_ref::<i32>()),
-                                Integer::I64 => Box::new(-result.value.downcast_ref::<i64>()),
-                                Integer::I128 => Box::new(-result.value.downcast_ref::<i128>()),
-                                Integer::Isize => Box::new(-result.value.downcast_ref::<isize>()),
+                                Integer::I8 => {
+                                    Rc::new(-*result.value.downcast_ref::<i8>().unwrap())
+                                }
+                                Integer::I16 => {
+                                    Rc::new(-*result.value.downcast_ref::<i16>().unwrap())
+                                }
+                                Integer::I32 => {
+                                    Rc::new(-*result.value.downcast_ref::<i32>().unwrap())
+                                }
+                                Integer::I64 => {
+                                    Rc::new(-*result.value.downcast_ref::<i64>().unwrap())
+                                }
+                                Integer::I128 => {
+                                    Rc::new(-*result.value.downcast_ref::<i128>().unwrap())
+                                }
+                                Integer::Isize => {
+                                    Rc::new(-*result.value.downcast_ref::<isize>().unwrap())
+                                }
                                 _ => unreachable!(),
                             },
                         }),
@@ -531,8 +587,8 @@ impl Env {
                     },
 
                     UnaryOp::Not => Ok(Literal {
-                        r#type: Type::Boolean,
-                        value: Box::new(!result.value.downcast_ref::<bool>()),
+                        type_: Type::Boolean,
+                        value: Rc::new(!*result.value.downcast_ref::<bool>().unwrap()),
                     }),
                 }
             }
@@ -544,80 +600,92 @@ impl Env {
                 macro_rules! integer_binary_op {
                     ($op:ident, $type:ident, $left:ident, $right:ident) => {
                         match $type {
-                            Integer::U8 => Box::new(
+                            Integer::U8 => Rc::new(
                                 left.value
                                     .downcast_ref::<u8>()
-                                    .$op(right.value.downcast_ref::<u8>()),
+                                    .unwrap()
+                                    .$op(right.value.downcast_ref::<u8>().unwrap()),
                             ),
-                            Integer::U16 => Box::new(
+                            Integer::U16 => Rc::new(
                                 left.value
                                     .downcast_ref::<u16>()
-                                    .$op(right.value.downcast_ref::<u16>()),
+                                    .unwrap()
+                                    .$op(right.value.downcast_ref::<u16>().unwrap()),
                             ),
-                            Integer::U32 => Box::new(
+                            Integer::U32 => Rc::new(
                                 left.value
                                     .downcast_ref::<u32>()
-                                    .$op(right.value.downcast_ref::<u32>()),
+                                    .unwrap()
+                                    .$op(right.value.downcast_ref::<u32>().unwrap()),
                             ),
-                            Integer::U64 => Box::new(
+                            Integer::U64 => Rc::new(
                                 left.value
                                     .downcast_ref::<u64>()
-                                    .$op(right.value.downcast_ref::<u64>()),
+                                    .unwrap()
+                                    .$op(right.value.downcast_ref::<u64>().unwrap()),
                             ),
-                            Integer::U128 => Box::new(
+                            Integer::U128 => Rc::new(
                                 left.value
                                     .downcast_ref::<u128>()
-                                    .$op(right.value.downcast_ref::<u128>()),
+                                    .unwrap()
+                                    .$op(right.value.downcast_ref::<u128>().unwrap()),
                             ),
-                            Integer::Usize => Box::new(
+                            Integer::Usize => Rc::new(
                                 left.value
                                     .downcast_ref::<usize>()
-                                    .$op(right.value.downcast_ref::<usize>()),
+                                    .unwrap()
+                                    .$op(right.value.downcast_ref::<usize>().unwrap()),
                             ),
-                            Integer::I8 => Box::new(
+                            Integer::I8 => Rc::new(
                                 left.value
                                     .downcast_ref::<i8>()
-                                    .$op(right.value.downcast_ref::<i8>()),
+                                    .unwrap()
+                                    .$op(right.value.downcast_ref::<i8>().unwrap()),
                             ),
-                            Integer::I16 => Box::new(
+                            Integer::I16 => Rc::new(
                                 left.value
                                     .downcast_ref::<i16>()
-                                    .$op(right.value.downcast_ref::<i16>()),
+                                    .unwrap()
+                                    .$op(right.value.downcast_ref::<i16>().unwrap()),
                             ),
-                            Integer::I32 => Box::new(
+                            Integer::I32 => Rc::new(
                                 left.value
                                     .downcast_ref::<i32>()
-                                    .$op(right.value.downcast_ref::<i32>()),
+                                    .unwrap()
+                                    .$op(right.value.downcast_ref::<i32>().unwrap()),
                             ),
-                            Integer::I64 => Box::new(
+                            Integer::I64 => Rc::new(
                                 left.value
                                     .downcast_ref::<i64>()
-                                    .$op(right.value.downcast_ref::<i64>()),
+                                    .unwrap()
+                                    .$op(right.value.downcast_ref::<i64>().unwrap()),
                             ),
-                            Integer::I128 => Box::new(
+                            Integer::I128 => Rc::new(
                                 left.value
                                     .downcast_ref::<i128>()
-                                    .$op(right.value.downcast_ref::<i128>()),
+                                    .unwrap()
+                                    .$op(right.value.downcast_ref::<i128>().unwrap()),
                             ),
-                            Integer::Isize => Box::new(
+                            Integer::Isize => Rc::new(
                                 left.value
                                     .downcast_ref::<isize>()
-                                    .$op(right.value.downcast_ref::<isize>()),
+                                    .unwrap()
+                                    .$op(right.value.downcast_ref::<isize>().unwrap()),
                             ),
                             _ => unreachable!(),
                         }
                     };
                 }
 
-                match left.r#type {
+                match left.type_ {
                     Type::Integer(integer_type) => Ok(Literal {
-                        r#type: Type::Integer(integer_type),
+                        type_: Type::Integer(integer_type),
                         value: match op {
-                            UnaryOp::Add => integer_binary_op!(add, integer_type, left, right),
-                            UnaryOp::Sub => integer_binary_op!(sub, integer_type, left, right),
-                            UnaryOp::Mul => integer_binary_op!(mul, integer_type, left, right),
-                            UnaryOp::Div => integer_binary_op!(div, integer_type, left, right),
-                            UnaryOp::Rem => integer_binary_op!(rem, integer_type, left, right),
+                            BinaryOp::Add => integer_binary_op!(add, integer_type, left, right),
+                            BinaryOp::Sub => integer_binary_op!(sub, integer_type, left, right),
+                            BinaryOp::Mul => integer_binary_op!(mul, integer_type, left, right),
+                            BinaryOp::Div => integer_binary_op!(div, integer_type, left, right),
+                            BinaryOp::Rem => integer_binary_op!(rem, integer_type, left, right),
                             _ => unreachable!(),
                         },
                     }),
@@ -631,58 +699,58 @@ impl Env {
 
     fn type_check(&mut self, term: &Term, expected_type: Option<&Type>) -> Result<TypedTerm> {
         match term {
-            Term::Literal(Literal { value, r#type }) => {
-                let literal = if let Type::Integer(Integer::Unknown) = r#type {
+            Term::Literal(Literal { value, type_ }) => {
+                let literal = if let Type::Integer(Integer::Unknown) = type_ {
                     match expected_type
                         .cloned()
                         .unwrap_or(Type::Integer(Integer::I32))
                     {
                         Type::Integer(integer_type) => Literal {
-                            value: Rc::new(Integer::parse(
-                                value.downcast_ref::<String>().unwrap(),
-                            )?),
-                            r#type: Type::Integer(integer_type),
+                            value: integer_type.parse(value.downcast_ref::<String>().unwrap())?,
+                            type_: Type::Integer(integer_type),
                         },
 
                         _ => Literal {
-                            value: Rc::new(value.downcast_ref::<String>().unwrap().parse::<I32>()?),
-                            r#type: Type::Integer(Integer::I32),
+                            value: Rc::new(value.downcast_ref::<String>().unwrap().parse::<i32>()?),
+                            type_: Type::Integer(Integer::I32),
                         },
+                    }
+                } else {
+                    Literal {
+                        value: value.clone(),
+                        type_: type_.clone(),
                     }
                 };
 
-                Ok(TypedTerm {
-                    term: Term::Literal(literal),
-                    r#type: literal.r#type,
-                })
+                Ok(TypedTerm::Literal(literal))
             }
 
             Term::UnaryOp { op, term } => {
                 let term = self.type_check(&term, expected_type)?;
 
-                let (r#trait, function) = match op {
-                    UnaryOp::Neg => (
-                        self.traits.get(self.intern("Neg")).unwrap(),
-                        self.intern("neg"),
-                    ),
-                    UnaryOp::Not => (
-                        self.traits.get(self.intern("Not")).unwrap(),
-                        self.intern("not"),
-                    ),
+                let (trait_, function) = match op {
+                    UnaryOp::Neg => ("Neg", "neg"),
+                    UnaryOp::Not => ("Not", "not"),
                 };
 
-                let r#impl = self.get_impl(term.r#type(), r#trait).unwrap_or_else(|| {
-                    anyhow!("type {r#type} is not compatible with unary operator {op}")
+                let trait_ = self.intern(trait_);
+                let trait_ = self.traits.get(&trait_).unwrap().clone();
+                let function = self.intern(function);
+
+                let type_ = term.type_();
+
+                let impl_ = self.get_impl(&type_, &trait_).ok_or_else(|| {
+                    anyhow!("type {type_:?} is not compatible with unary operator {op:?}")
                 })?;
 
-                let r#type = term.r#type();
+                let type_ = term.type_();
 
-                Ok(match (op, r#type) {
+                Ok(match (op, type_) {
                     (UnaryOp::Neg, Type::Integer(_)) | (UnaryOp::Not, Type::Boolean) => {
-                        TypedTerm::UnaryOp(op, term)
+                        TypedTerm::UnaryOp(*op, Rc::new(term))
                     }
                     _ => TypedTerm::Application {
-                        abstraction: r#impl.functions.get(function).unwrap(),
+                        abstraction: impl_.functions.get(&function).unwrap().clone(),
                         arguments: Rc::new([term]),
                     },
                 })
@@ -693,47 +761,43 @@ impl Env {
 
                 let (expected_type, impl_and_function) = match op {
                     BinaryOp::And | BinaryOp::Or => (Type::Boolean, None),
+
                     _ => {
-                        let (r#trait, function) = match op {
-                            BinaryOp::Add => (
-                                self.traits.get(self.intern("Add")).unwrap(),
-                                self.intern("add"),
-                            ),
-                            BinaryOp::Sub => (
-                                self.traits.get(self.intern("Sub")).unwrap(),
-                                self.intern("sub"),
-                            ),
-                            BinaryOp::Mul => (
-                                self.traits.get(self.intern("Mul")).unwrap(),
-                                self.intern("mul"),
-                            ),
-                            BinaryOp::Div => (
-                                self.traits.get(self.intern("Div")).unwrap(),
-                                self.intern("div"),
-                            ),
-                            BinaryOp::Rem => (
-                                self.traits.get(self.intern("Rem")).unwrap(),
-                                self.intern("rem"),
-                            ),
+                        let (trait_, function) = match op {
+                            BinaryOp::Add => ("Add", "add"),
+                            BinaryOp::Sub => ("Sub", "sub"),
+                            BinaryOp::Mul => ("Mul", "mul"),
+                            BinaryOp::Div => ("Div", "div"),
+                            BinaryOp::Rem => ("Rem", "rem"),
                             _ => unreachable!(),
                         };
 
-                        let r#impl = self.get_impl(r#type, r#trait).unwrap_or_else(|| {
-                            anyhow!("type {r#type} is not compatible with binary operator {op}")
+                        let trait_ = self.intern(trait_);
+                        let trait_ = self.traits.get(&trait_).unwrap().clone();
+                        let function = self.intern(function);
+
+                        let left_type = left.type_();
+
+                        let impl_ = self.get_impl(&left_type, &trait_).ok_or_else(|| {
+                            anyhow!(
+                                "type {left_type:?} is not compatible with binary operator {op:?}"
+                            )
                         })?;
 
-                        (r#impl.argument[0], Some((r#impl, function)))
+                        (impl_.arguments[0].clone(), Some((impl_, function)))
                     }
                 };
 
                 let right = self.type_check(&right, Some(&expected_type))?;
 
-                if expected_type != right.r#type() {
-                    Err(anyhow!("expected {expected_type}, got {right_type}"))
-                } else {
-                    let r#type = left.r#type();
+                let right_type = right.type_();
 
-                    Ok(match (op, r#type) {
+                if expected_type != right_type {
+                    Err(anyhow!("expected {expected_type:?}, got {right_type:?}"))
+                } else {
+                    let type_ = left.type_();
+
+                    Ok(match (op, type_) {
                         (BinaryOp::And, _) => TypedTerm::And(Rc::new(left), Rc::new(right)),
 
                         (BinaryOp::Or, _) => TypedTerm::Or(Rc::new(left), Rc::new(right)),
@@ -745,13 +809,13 @@ impl Env {
                             | BinaryOp::Div
                             | BinaryOp::Rem,
                             Type::Integer(_),
-                        ) => TypedTerm::BinaryOp(op, Rc::new(left), Rc::new(right)),
+                        ) => TypedTerm::BinaryOp(*op, Rc::new(left), Rc::new(right)),
 
                         _ => {
-                            let (r#impl, function) = impl_and_function.unwrap();
+                            let (impl_, function) = impl_and_function.unwrap();
 
                             TypedTerm::Application {
-                                abstraction: r#impl.get_associated_function(function).unwrap(),
+                                abstraction: impl_.functions.get(&function).unwrap().clone(),
                                 arguments: Rc::new([left, right]),
                             }
                         }
@@ -759,16 +823,16 @@ impl Env {
                 }
             }
 
-            Term::Variable(identifier) => match self.inner_scope().terms.get(identifier) {
-                Some(Some(term)) => self.type_check(term, expected_type),
+            Term::Variable(identifier) => match self.inner_scope().terms.get(identifier).cloned() {
+                Some(Some(term)) => self.type_check(&term, expected_type),
 
                 // TODO: will need to do some control/data flow analysis to support uninitialized lets
                 Some(None) => Err(anyhow!(
                     "use of uninitialized symbol: {}",
-                    self.unintern(identifier)
+                    self.unintern(*identifier)
                 )),
 
-                None => Err(anyhow!("symbol not found: {}", self.unintern(identifier))),
+                None => Err(anyhow!("symbol not found: {}", self.unintern(*identifier))),
             },
 
             _ => Err(anyhow!("type checking not yet supported for term {term:?}")),
@@ -778,14 +842,14 @@ impl Env {
     fn stmt_to_term(
         &mut self,
         stmt: &Stmt,
-        new_term_bindings: &mut HashSet<Indentifier>,
+        new_term_bindings: &mut HashSet<Identifier>,
     ) -> Result<Term> {
         match stmt {
             Stmt::Local(Local {
                 pat, init, attrs, ..
             }) => {
                 if !attrs.is_empty() {
-                    Err(anyhow!("attributes not yet supported"));
+                    Err(anyhow!("attributes not yet supported"))
                 } else {
                     match pat {
                         Pat::Ident(PatIdent {
@@ -795,9 +859,9 @@ impl Env {
                             ..
                         }) => {
                             if by_ref.is_some() {
-                                Err(anyhow!("ref patterns not yet supported"));
+                                Err(anyhow!("ref patterns not yet supported"))
                             } else if mutability.is_some() {
-                                Err(anyhow!("mut patterns not yet supported"));
+                                Err(anyhow!("mut patterns not yet supported"))
                             } else {
                                 self.scopes.push(Scope::default());
 
@@ -810,11 +874,11 @@ impl Env {
                                     .map(|(_, expr)| self.expr_to_term(expr))
                                     .transpose()?;
 
-                                self.inner_scope().insert(identifier, value);
+                                self.inner_scope().terms.insert(identifier, value);
 
                                 Ok(Term::Literal(Literal {
                                     value: Rc::new(()),
-                                    r#type: Type::Unit,
+                                    type_: Type::Unit,
                                 }))
                             }
                         }
@@ -824,7 +888,7 @@ impl Env {
                 }
             }
 
-            Stmt::Semi(expr, _) => self.expr_to_term(expr)?,
+            Stmt::Semi(expr, _) => self.expr_to_term(expr),
 
             _ => Err(anyhow!("stmt not yet supported: {stmt:?}")),
         }
@@ -836,51 +900,53 @@ impl Env {
                 if !attrs.is_empty() {
                     Err(anyhow!("attributes not yet supported"))
                 } else {
-                    match lit {
+                    Ok(Term::Literal(match lit {
                         Lit::Int(lit) => match lit.suffix() {
-                            "" => Ok(Term::Literal {
+                            "" => Literal {
                                 value: Rc::new(lit.base10_digits().to_owned()),
-                                r#type: Type::Integer(Integer::Unknown),
-                            }),
+                                type_: Type::Integer(Integer::Unknown),
+                            },
 
-                            "u8" => Ok(Term::Literal {
+                            "u8" => Literal {
                                 value: Rc::new(lit.base10_digits().parse::<u8>()?),
-                                r#type: Type::Integer(Integer::U8),
-                            }),
+                                type_: Type::Integer(Integer::U8),
+                            },
 
-                            "u16" => Ok(Term::Literal {
+                            "u16" => Literal {
                                 value: Rc::new(lit.base10_digits().parse::<u16>()?),
-                                r#type: Type::Integer(Integer::U16),
-                            }),
+                                type_: Type::Integer(Integer::U16),
+                            },
 
-                            "u32" => Ok(Term::Literal {
+                            "u32" => Literal {
                                 value: Rc::new(lit.base10_digits().parse::<u32>()?),
-                                r#type: Type::Integer(Integer::U32),
-                            }),
+                                type_: Type::Integer(Integer::U32),
+                            },
 
-                            "u64" => Ok(Term::Literal {
+                            "u64" => Literal {
                                 value: Rc::new(lit.base10_digits().parse::<u64>()?),
-                                r#type: Type::Integer(Integer::U64),
-                            }),
+                                type_: Type::Integer(Integer::U64),
+                            },
 
-                            "u128" => Ok(Term::Literal {
+                            "u128" => Literal {
                                 value: Rc::new(lit.base10_digits().parse::<u128>()?),
-                                r#type: Type::Integer(Integer::U128),
-                            }),
+                                type_: Type::Integer(Integer::U128),
+                            },
 
-                            _ => Err(anyhow!(
-                                "unexpected integer literal suffix: {}",
-                                lit.suffix()
-                            )),
+                            _ => {
+                                return Err(anyhow!(
+                                    "unexpected integer literal suffix: {}",
+                                    lit.suffix()
+                                ))
+                            }
                         },
 
-                        Lit::Bool(LitBool { value, .. }) => Ok(Term::Literal {
+                        Lit::Bool(LitBool { value, .. }) => Literal {
                             value: Rc::new(*value),
-                            r#type: Type::Boolean,
-                        }),
+                            type_: Type::Boolean,
+                        },
 
-                        _ => Err(anyhow!("literal not yet supported: {lit:?}")),
-                    }
+                        _ => return Err(anyhow!("literal not yet supported: {lit:?}")),
+                    }))
                 }
             }
 
@@ -888,7 +954,7 @@ impl Env {
                 if !attrs.is_empty() {
                     Err(anyhow!("attributes not yet supported"))
                 } else {
-                    let term = self.expr_to_term(expr)?;
+                    let term = Rc::new(self.expr_to_term(expr)?);
 
                     Ok(Term::UnaryOp {
                         op: match op {
@@ -910,8 +976,8 @@ impl Env {
                 if !attrs.is_empty() {
                     Err(anyhow!("attributes not yet supported"))
                 } else {
-                    let left = self.expr_to_term(left)?;
-                    let right = self.expr_to_term(right)?;
+                    let left = Rc::new(self.expr_to_term(left)?);
+                    let right = Rc::new(self.expr_to_term(right)?);
 
                     Ok(Term::BinaryOp {
                         op: match op {
@@ -949,7 +1015,7 @@ impl Env {
                     Err(anyhow!("qualified paths not yet supported"))
                 } else if let Some(PathSegment { ident, arguments }) = segments.last() {
                     if let PathArguments::None = arguments {
-                        Ok(Term::Variable(self.intern(&ident.to_string())?))
+                        Ok(Term::Variable(self.intern(&ident.to_string())))
                     } else {
                         Err(anyhow!("path arguments not yet supported"))
                     }

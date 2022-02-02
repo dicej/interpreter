@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+maplit = "1"
 syn = { version = "1", default-features = false, features = ["parsing", "full", "extra-traits"] }
