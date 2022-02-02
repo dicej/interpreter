@@ -9,8 +9,8 @@ use {
         rc::Rc,
     },
     syn::{
-        BinOp, Expr, ExprBinary, ExprLit, ExprPath, ExprUnary, Lit, LitBool, Local, Pat, PatIdent,
-        Path, PathArguments, PathSegment, Stmt, UnOp,
+        BinOp, Block, Expr, ExprBinary, ExprBlock, ExprIf, ExprLit, ExprParen, ExprPath, ExprUnary,
+        Lit, LitBool, Local, Pat, PatIdent, Path, PathArguments, PathSegment, Stmt, UnOp,
     },
 };
 
@@ -223,7 +223,9 @@ impl TypedTerm {
             } => return_.clone(),
             Self::And { .. } | Self::Or { .. } => Type::Boolean,
             Self::If { then, .. } => then.type_(),
-            _ => todo!(),
+            Self::UnaryOp(_, term) => term.type_(),
+            Self::BinaryOp(_, term, _) => term.type_(),
+            _ => todo!("{self:?}"),
         }
     }
 }
@@ -287,6 +289,7 @@ pub struct Env {
     parameters: Vec<Literal>,
     traits: HashMap<Identifier, Trait>,
     impls: HashMap<(Type, Trait), Option<Impl>>,
+    unit: Literal,
 }
 
 pub struct Eval {
@@ -330,6 +333,10 @@ impl Env {
             parameters: Vec::new(),
             traits: HashMap::new(),
             impls: HashMap::new(),
+            unit: Literal {
+                value: Rc::new(()),
+                type_: Type::Unit,
+            },
         };
 
         // TODO: should load traits and impls from core/std source files
@@ -863,6 +870,12 @@ impl Env {
                             } else if mutability.is_some() {
                                 Err(anyhow!("mut patterns not yet supported"))
                             } else {
+                                // TODO: if we're pushing a new scope for each new binding, each scope only needs
+                                // to hold at most a single binding, so perhaps use an Option<(Identifier, Term)>
+                                // instead of a HashMap.  Also, if we use a singly-linked list of those to
+                                // represent a spaghetti stack of scopes, we could get rid of new_term_bindings;
+                                // instead, the caller can just diff the before and after scope stack versions to
+                                // identify new bindings.
                                 self.scopes.push(Scope::default());
 
                                 let identifier = self.intern(&ident.to_string());
@@ -876,10 +889,7 @@ impl Env {
 
                                 self.inner_scope().terms.insert(identifier, value);
 
-                                Ok(Term::Literal(Literal {
-                                    value: Rc::new(()),
-                                    type_: Type::Unit,
-                                }))
+                                Ok(Term::Literal(self.unit.clone()))
                             }
                         }
 
@@ -888,7 +898,7 @@ impl Env {
                 }
             }
 
-            Stmt::Semi(expr, _) => self.expr_to_term(expr),
+            Stmt::Semi(expr, _) | Stmt::Expr(expr) => self.expr_to_term(expr),
 
             _ => Err(anyhow!("stmt not yet supported: {stmt:?}")),
         }
@@ -1050,6 +1060,7 @@ impl Env {
                     Err(anyhow!("qualified paths not yet supported"))
                 } else if let Some(PathSegment { ident, arguments }) = segments.last() {
                     if let PathArguments::None = arguments {
+                        // TODO: save a reference to the scope so we can use it during resolution and type checking
                         Ok(Term::Variable(self.intern(&ident.to_string())))
                     } else {
                         Err(anyhow!("path arguments not yet supported"))
@@ -1059,8 +1070,76 @@ impl Env {
                 }
             }
 
+            Expr::Paren(ExprParen { expr, attrs, .. }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else {
+                    self.expr_to_term(expr)
+                }
+            }
+
+            Expr::If(ExprIf {
+                cond,
+                then_branch: Block { stmts, .. },
+                else_branch,
+                attrs,
+                ..
+            }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else {
+                    Ok(Term::If {
+                        predicate: Rc::new(self.expr_to_term(cond)?),
+                        then: Rc::new(self.block_to_term(stmts)?),
+                        else_: Rc::new(
+                            else_branch
+                                .as_ref()
+                                .map(|(_, expr)| self.expr_to_term(&expr))
+                                .transpose()?
+                                .unwrap_or_else(|| Term::Literal(self.unit.clone())),
+                        ),
+                    })
+                }
+            }
+
+            Expr::Block(ExprBlock {
+                block: Block { stmts, .. },
+                attrs,
+                label,
+            }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else if label.is_some() {
+                    Err(anyhow!("block labels not yet supported"))
+                } else {
+                    self.block_to_term(stmts)
+                }
+            }
+
             _ => Err(anyhow!("expr not yet supported: {expr:?}")),
         }
+    }
+
+    fn block_to_term(&mut self, stmts: &[Stmt]) -> Result<Term> {
+        let scope_count = self.scopes.len();
+
+        let mut dummy = HashSet::new();
+
+        let result = stmts
+            .iter()
+            .map(|stmt| self.stmt_to_term(stmt, &mut dummy))
+            .collect::<Result<Vec<_>>>()
+            .map(|terms| match &terms[..] {
+                [] => Term::Literal(self.unit.clone()),
+
+                [term] => term.clone(),
+
+                terms => Term::Block(Rc::from(terms)),
+            });
+
+        self.scopes.truncate(scope_count);
+
+        result
     }
 
     pub fn eval_file(&mut self, _file: &str) -> Result<Eval> {
