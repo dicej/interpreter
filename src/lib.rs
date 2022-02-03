@@ -162,17 +162,29 @@ enum BinaryOp {
 
 #[derive(Clone, Debug)]
 struct Abstraction {
-    // TODO: what about type parameters?  Or will this always be monomorphized?  If the latter, we may want to
-    // reference the polymorphic version, if any.
+    // TODO: support type parameters for polymorphic functions, and consider referencing the polymorphic function
+    // from a monomorphization of that function.
     parameters: Rc<[(Identifier, Type)]>,
     // TODO: this seems redundant given that `body` should have a type:
     return_: Type,
-    body: Rc<TypedTerm>,
+    body: Rc<Term>,
+}
+
+enum Pattern {
+    Literal(Literal),
+    // TODO: support other patterns
 }
 
 #[derive(Clone, Debug)]
-enum TypedTerm {
-    Block(Rc<[TypedTerm]>),
+struct MatchArm {
+    pattern: Pattern,
+    guard: Option<Term>,
+    body: Term,
+}
+
+#[derive(Clone, Debug)]
+enum Term {
+    Block(Rc<[Term]>),
     Literal(Literal),
     Parameter {
         index: usize,
@@ -180,37 +192,36 @@ enum TypedTerm {
     },
     Application {
         abstraction: Abstraction,
-        arguments: Rc<[TypedTerm]>,
+        arguments: Rc<[Term]>,
     },
     Abstraction(Abstraction),
-    And(Rc<TypedTerm>, Rc<TypedTerm>),
-    Or(Rc<TypedTerm>, Rc<TypedTerm>),
-    UnaryOp(UnaryOp, Rc<TypedTerm>),
-    BinaryOp(BinaryOp, Rc<TypedTerm>, Rc<TypedTerm>),
-    If {
-        predicate: Rc<TypedTerm>,
-        then: Rc<TypedTerm>,
-        else_: Rc<TypedTerm>,
+    And(Rc<Term>, Rc<Term>),
+    Or(Rc<Term>, Rc<Term>),
+    UnaryOp(UnaryOp, Rc<Term>),
+    BinaryOp(BinaryOp, Rc<Term>, Rc<Term>),
+    Match {
+        scrutinee: Rc<Term>,
+        arms: Rc<[MatchArm]>,
     },
     Loop {
         label: Option<Identifier>,
-        body: Rc<TypedTerm>,
+        body: Rc<Term>,
     },
     Continue(Option<Identifier>),
     Break {
         label: Option<Identifier>,
-        term: Rc<TypedTerm>,
+        term: Rc<Term>,
     },
     Return {
-        term: Rc<TypedTerm>,
+        term: Rc<Term>,
     },
     Cast {
-        term: Rc<TypedTerm>,
+        term: Rc<Term>,
         type_: Type,
     },
 }
 
-impl TypedTerm {
+impl Term {
     fn type_(&self) -> Type {
         match self {
             Self::Block(terms) => terms.last().map(|term| term.type_()).unwrap_or(Type::Unit),
@@ -230,56 +241,12 @@ impl TypedTerm {
     }
 }
 
-#[derive(Clone, Debug)]
-enum Term {
-    Block(Rc<[Term]>),
-    Literal(Literal),
-    Variable(Identifier),
-    Application {
-        abstraction: Rc<Term>,
-        arguments: Rc<[Term]>,
+enum Scope {
+    Binding {
+        name: Identifier,
+        term: Option<Term>,
     },
-    Abstraction {
-        // TODO: what about type parameters?
-        parameters: Rc<[Type]>,
-        return_: Type,
-        body: Rc<Term>,
-    },
-    UnaryOp {
-        op: UnaryOp,
-        term: Rc<Term>,
-    },
-    BinaryOp {
-        op: BinaryOp,
-        left: Rc<Term>,
-        right: Rc<Term>,
-    },
-    If {
-        predicate: Rc<Term>,
-        then: Rc<Term>,
-        else_: Rc<Term>,
-    },
-    Loop {
-        label: Option<Identifier>,
-        body: Rc<Term>,
-    },
-    Continue(Option<Identifier>),
-    Break {
-        label: Option<Identifier>,
-        term: Rc<Term>,
-    },
-    Return {
-        term: Rc<Term>,
-    },
-    Cast {
-        term: Rc<Term>,
-        type_: Type,
-    },
-}
-
-#[derive(Default)]
-struct Scope {
-    terms: HashMap<Identifier, Option<Term>>,
+    Branch,
 }
 
 pub struct Env {
@@ -290,6 +257,8 @@ pub struct Env {
     traits: HashMap<Identifier, Trait>,
     impls: HashMap<(Type, Trait), Option<Impl>>,
     unit: Literal,
+    true_: Literal,
+    false_: Literal,
 }
 
 pub struct Eval {
@@ -329,13 +298,21 @@ impl Env {
         let mut env = Self {
             ids_to_names: Vec::new(),
             names_to_ids: HashMap::new(),
-            scopes: vec![Scope::default()],
+            scopes: Vec::new(),
             parameters: Vec::new(),
             traits: HashMap::new(),
             impls: HashMap::new(),
             unit: Literal {
                 value: Rc::new(()),
                 type_: Type::Unit,
+            },
+            true_: Literal {
+                value: Rc::new(true),
+                type_: Type::Boolean,
+            },
+            false_: Literal {
+                value: Rc::new(false),
+                type_: Type::Boolean,
             },
         };
 
@@ -345,7 +322,7 @@ impl Env {
         let other = env.intern("other");
 
         // These functions won't ever be called at runtime, so just use an empty body:
-        let empty = Rc::new(TypedTerm::Block(Rc::new([])));
+        let empty = Rc::new(Term::Block(Rc::new([])));
 
         let signed = [
             Integer::I8,
@@ -439,14 +416,12 @@ impl Env {
         env
     }
 
-    fn inner_scope(&mut self) -> &mut Scope {
-        self.scopes.last_mut().unwrap()
-    }
-
     fn find_term(&self, id: Identifier) -> Option<Option<Term>> {
         for scope in self.scopes.iter().rev() {
-            if let Some(term) = scope.terms.get(&id) {
-                return Some(term.clone());
+            if let Scope::Binding { name, term } = scope {
+                if name == id {
+                    return Some(term.clone());
+                }
             }
         }
 
@@ -466,9 +441,9 @@ impl Env {
         // If it's not an expression (i.e. it's an item), update the relevant symbol tables.  If it's an item with
         // code inside (e.g. an impl block or fn) do all of the above except evaluation.
 
-        let mut new_term_bindings = HashSet::new();
+        let scope_count = self.scopes.len();
 
-        let term = &self.stmt_to_term(&stmt, &mut new_term_bindings)?;
+        let term = &self.stmt_to_term(&stmt)?;
 
         let term = &self.type_check(term, None)?;
 
@@ -476,11 +451,14 @@ impl Env {
 
         Ok(Eval {
             value: Some(value),
-            new_term_bindings: new_term_bindings
-                .into_iter()
-                .filter_map(|id| {
-                    self.find_term(id)
-                        .map(|term| (self.unintern(id).clone(), term))
+            new_term_bindings: self.scopes[scope_count..]
+                .iter()
+                .filter_map(|scope| {
+                    if let Scope::Binding { name, term } = scope {
+                        Some((self.unintern(name).clone(), term.clone()))
+                    } else {
+                        None
+                    }
                 })
                 .collect(),
         })
@@ -516,11 +494,11 @@ impl Env {
         }
     }
 
-    fn eval_term(&mut self, term: &TypedTerm) -> Result<Literal> {
+    fn eval_term(&mut self, term: &Term) -> Result<Literal> {
         match term {
-            TypedTerm::Literal(literal) => Ok(literal.clone()),
+            Term::Literal(literal) => Ok(literal.clone()),
 
-            TypedTerm::Application {
+            Term::Application {
                 abstraction: Abstraction { body, .. },
                 arguments,
             } => {
@@ -538,7 +516,7 @@ impl Env {
                 result
             }
 
-            TypedTerm::And(left, right) => {
+            Term::And(left, right) => {
                 if *self.eval_term(left)?.value.downcast_ref::<bool>().unwrap() {
                     self.eval_term(right)
                 } else {
@@ -549,7 +527,7 @@ impl Env {
                 }
             }
 
-            TypedTerm::Or(left, right) => {
+            Term::Or(left, right) => {
                 if !*self.eval_term(left)?.value.downcast_ref::<bool>().unwrap() {
                     self.eval_term(right)
                 } else {
@@ -560,7 +538,7 @@ impl Env {
                 }
             }
 
-            TypedTerm::UnaryOp(op, term) => {
+            Term::UnaryOp(op, term) => {
                 let result = self.eval_term(term)?;
 
                 match op {
@@ -600,7 +578,7 @@ impl Env {
                 }
             }
 
-            TypedTerm::BinaryOp(op, left, right) => {
+            Term::BinaryOp(op, left, right) => {
                 let left = self.eval_term(left)?;
                 let right = self.eval_term(right)?;
 
@@ -704,7 +682,7 @@ impl Env {
         }
     }
 
-    fn type_check(&mut self, term: &Term, expected_type: Option<&Type>) -> Result<TypedTerm> {
+    fn type_check(&mut self, term: &Term, expected_type: Option<&Type>) -> Result<Term> {
         match term {
             Term::Literal(Literal { value, type_ }) => {
                 let literal = if let Type::Integer(Integer::Unknown) = type_ {
@@ -729,10 +707,10 @@ impl Env {
                     }
                 };
 
-                Ok(TypedTerm::Literal(literal))
+                Ok(Term::Literal(literal))
             }
 
-            Term::UnaryOp { op, term } => {
+            Term::UnaryOp(op, term) => {
                 let term = self.type_check(&term, expected_type)?;
 
                 let (trait_, function) = match op {
@@ -754,16 +732,16 @@ impl Env {
 
                 Ok(match (op, type_) {
                     (UnaryOp::Neg, Type::Integer(_)) | (UnaryOp::Not, Type::Boolean) => {
-                        TypedTerm::UnaryOp(*op, Rc::new(term))
+                        Term::UnaryOp(*op, Rc::new(term))
                     }
-                    _ => TypedTerm::Application {
+                    _ => Term::Application {
                         abstraction: impl_.functions.get(&function).unwrap().clone(),
                         arguments: Rc::new([term]),
                     },
                 })
             }
 
-            Term::BinaryOp { op, left, right } => {
+            Term::BinaryOp(op, left, right) => {
                 let left = self.type_check(&left, expected_type)?;
 
                 let (expected_type, impl_and_function) = match op {
@@ -805,9 +783,9 @@ impl Env {
                     let type_ = left.type_();
 
                     Ok(match (op, type_) {
-                        (BinaryOp::And, _) => TypedTerm::And(Rc::new(left), Rc::new(right)),
+                        (BinaryOp::And, _) => Term::And(Rc::new(left), Rc::new(right)),
 
-                        (BinaryOp::Or, _) => TypedTerm::Or(Rc::new(left), Rc::new(right)),
+                        (BinaryOp::Or, _) => Term::Or(Rc::new(left), Rc::new(right)),
 
                         (
                             BinaryOp::Add
@@ -816,12 +794,12 @@ impl Env {
                             | BinaryOp::Div
                             | BinaryOp::Rem,
                             Type::Integer(_),
-                        ) => TypedTerm::BinaryOp(*op, Rc::new(left), Rc::new(right)),
+                        ) => Term::BinaryOp(*op, Rc::new(left), Rc::new(right)),
 
                         _ => {
                             let (impl_, function) = impl_and_function.unwrap();
 
-                            TypedTerm::Application {
+                            Term::Application {
                                 abstraction: impl_.functions.get(&function).unwrap().clone(),
                                 arguments: Rc::new([left, right]),
                             }
@@ -830,27 +808,11 @@ impl Env {
                 }
             }
 
-            Term::Variable(identifier) => match self.inner_scope().terms.get(identifier).cloned() {
-                Some(Some(term)) => self.type_check(&term, expected_type),
-
-                // TODO: will need to do some control/data flow analysis to support uninitialized lets
-                Some(None) => Err(anyhow!(
-                    "use of uninitialized symbol: {}",
-                    self.unintern(*identifier)
-                )),
-
-                None => Err(anyhow!("symbol not found: {}", self.unintern(*identifier))),
-            },
-
             _ => Err(anyhow!("type checking not yet supported for term {term:?}")),
         }
     }
 
-    fn stmt_to_term(
-        &mut self,
-        stmt: &Stmt,
-        new_term_bindings: &mut HashSet<Identifier>,
-    ) -> Result<Term> {
+    fn stmt_to_term(&mut self, stmt: &Stmt) -> Result<Term> {
         match stmt {
             Stmt::Local(Local {
                 pat, init, attrs, ..
@@ -870,24 +832,14 @@ impl Env {
                             } else if mutability.is_some() {
                                 Err(anyhow!("mut patterns not yet supported"))
                             } else {
-                                // TODO: if we're pushing a new scope for each new binding, each scope only needs
-                                // to hold at most a single binding, so perhaps use an Option<(Identifier, Term)>
-                                // instead of a HashMap.  Also, if we use a singly-linked list of those to
-                                // represent a spaghetti stack of scopes, we could get rid of new_term_bindings;
-                                // instead, the caller can just diff the before and after scope stack versions to
-                                // identify new bindings.
-                                self.scopes.push(Scope::default());
+                                let name = self.intern(&ident.to_string());
 
-                                let identifier = self.intern(&ident.to_string());
-
-                                new_term_bindings.insert(identifier);
-
-                                let value = init
+                                let term = init
                                     .as_ref()
                                     .map(|(_, expr)| self.expr_to_term(expr))
                                     .transpose()?;
 
-                                self.inner_scope().terms.insert(identifier, value);
+                                self.scopes.push(Scope::Binding { name, term });
 
                                 Ok(Term::Literal(self.unit.clone()))
                             }
@@ -1060,8 +1012,16 @@ impl Env {
                     Err(anyhow!("qualified paths not yet supported"))
                 } else if let Some(PathSegment { ident, arguments }) = segments.last() {
                     if let PathArguments::None = arguments {
-                        // TODO: save a reference to the scope so we can use it during resolution and type checking
-                        Ok(Term::Variable(self.intern(&ident.to_string())))
+                        let name_string = ident.to_string();
+                        let name = self.intern(&name_string);
+
+                        match self.find_term(name) {
+                            Some(Some(term)) => Ok(term.clone()),
+                            Some(None) => {
+                                Err(anyhow!("use of uninitialized variable: {name_string}"))
+                            }
+                            None => Err(anyhow!("symbol not found: {name_string}")),
+                        }
                     } else {
                         Err(anyhow!("path arguments not yet supported"))
                     }
@@ -1088,17 +1048,38 @@ impl Env {
                 if !attrs.is_empty() {
                     Err(anyhow!("attributes not yet supported"))
                 } else {
-                    Ok(Term::If {
-                        predicate: Rc::new(self.expr_to_term(cond)?),
-                        then: Rc::new(self.block_to_term(stmts)?),
-                        else_: Rc::new(
-                            else_branch
-                                .as_ref()
-                                .map(|(_, expr)| self.expr_to_term(&expr))
-                                .transpose()?
-                                .unwrap_or_else(|| Term::Literal(self.unit.clone())),
-                        ),
-                    })
+                    let scrutinee = Rc::new(self.expr_to_term(cond)?);
+
+                    let scope_count = self.scopes.len();
+
+                    self.scopes.push(Scope::Branch);
+
+                    let then = self.block_to_term(stmts);
+
+                    let else_ = else_branch
+                        .as_ref()
+                        .map(|(_, expr)| self.expr_to_term(&expr))
+                        .transpose();
+
+                    self.scopes.pop();
+
+                    assert_eq!(scope_count, self.scopes.len());
+
+                    let then = MatchArm {
+                        pattern: Pattern::Literal(self.true_.clone()),
+                        guard: None,
+                        body: then?,
+                    };
+
+                    let else_ = MatchArm {
+                        pattern: Pattern::Literal(self.false_.clone()),
+                        guard: None,
+                        body: else_?.unwrap_or_else(|| Term::Literal(self.unit.clone())),
+                    };
+
+                    let arms = Rc::new([then, else_]);
+
+                    Ok(Term::Match { scrutinee, arms })
                 }
             }
 
@@ -1116,6 +1097,12 @@ impl Env {
                 }
             }
 
+            Expr::Assign(ExprAssign { .. }) => {
+                // TODO: when handling initialization of a variable declared in an outer scope, use a phi node if
+                // appropriate (but be careful to distinguish between initialization and reassignment to a mutable
+                // variable).
+            }
+
             _ => Err(anyhow!("expr not yet supported: {expr:?}")),
         }
     }
@@ -1123,11 +1110,9 @@ impl Env {
     fn block_to_term(&mut self, stmts: &[Stmt]) -> Result<Term> {
         let scope_count = self.scopes.len();
 
-        let mut dummy = HashSet::new();
-
         let result = stmts
             .iter()
-            .map(|stmt| self.stmt_to_term(stmt, &mut dummy))
+            .map(|stmt| self.stmt_to_term(stmt))
             .collect::<Result<Vec<_>>>()
             .map(|terms| match &terms[..] {
                 [] => Term::Literal(self.unit.clone()),
