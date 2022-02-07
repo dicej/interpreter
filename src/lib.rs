@@ -9,8 +9,9 @@ use {
         rc::Rc,
     },
     syn::{
-        BinOp, Block, Expr, ExprBinary, ExprBlock, ExprIf, ExprLit, ExprParen, ExprPath, ExprUnary,
-        Lit, LitBool, Local, Pat, PatIdent, Path, PathArguments, PathSegment, Stmt, UnOp,
+        BinOp, Block, Expr, ExprAssign, ExprBinary, ExprBlock, ExprIf, ExprLit, ExprParen,
+        ExprPath, ExprUnary, Lit, LitBool, Local, Pat, PatIdent, Path, PathArguments, PathSegment,
+        Stmt, UnOp,
     },
 };
 
@@ -162,8 +163,7 @@ enum BinaryOp {
 
 #[derive(Clone, Debug)]
 struct Abstraction {
-    // TODO: support type parameters for polymorphic functions, and consider referencing the polymorphic function
-    // from a monomorphization of that function.
+    // TODO: support type and lifetime parameters.
     parameters: Rc<[(Identifier, Type)]>,
     // TODO: this seems redundant given that `body` should have a type:
     return_: Type,
@@ -186,14 +186,19 @@ struct MatchArm {
 enum Term {
     Block(Rc<[Term]>),
     Literal(Literal),
-    Parameter {
+    Let {
         index: usize,
-        type_: Type,
+        term: Rc<Term>,
     },
+    Phi(Rc<[Term]>),
+    Variable(usize),
     Application {
+        // TODO: support type and lifetime arguments.
         abstraction: Abstraction,
         arguments: Rc<[Term]>,
     },
+    // TODO: should this be a term, or should functions just be functions (no state), and closures just be structs
+    // that impl the relevant Fn* trait?
     Abstraction(Abstraction),
     And(Rc<Term>, Rc<Term>),
     Or(Rc<Term>, Rc<Term>),
@@ -233,7 +238,6 @@ impl Term {
                 ..
             } => return_.clone(),
             Self::And { .. } | Self::Or { .. } => Type::Boolean,
-            Self::If { then, .. } => then.type_(),
             Self::UnaryOp(_, term) => term.type_(),
             Self::BinaryOp(_, term, _) => term.type_(),
             _ => todo!("{self:?}"),
@@ -241,19 +245,85 @@ impl Term {
     }
 }
 
-enum Scope {
-    Binding {
-        name: Identifier,
-        term: Option<Term>,
-    },
-    Branch,
+#[derive(Clone, Copy, Debug)]
+enum BindingStatus {
+    Untyped,
+    Typed,
+    Evaluated,
+}
+
+#[derive(Clone, Debug)]
+struct BindingTerm {
+    status: BindingStatus,
+    term: Term,
+}
+
+#[derive(Clone, Debug)]
+struct Binding {
+    name: Identifier,
+    term: Option<BindingTerm>,
+}
+
+struct BranchContext {
+    indexes: Box<[usize]>,
+    terms: Vec<Option<BindingTerm>>,
+}
+
+impl BranchContext {
+    fn new(bindings: &[Binding]) -> Self {
+        Self {
+            indexes: bindings
+                .iter()
+                .enumerate()
+                .filter_map(|(index, binding)| {
+                    if binding.term.is_none() {
+                        Some(index)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            terms: Vec::new(),
+        }
+    }
+
+    fn record_and_reset(&mut self, bindings: &mut [Binding]) {
+        self.terms.extend(
+            self.indexes
+                .iter()
+                .map(|&index| bindings[index].term.clone()),
+        );
+
+        for index in &self.indexes {
+            bindings[index].term = None;
+        }
+    }
+
+    fn make_phi_nodes(&mut self, bindings: &mut [Binding]) {
+        for (my_index, binding_index) in self.indexes.iter().enumerate() {
+            let terms = self
+                .terms
+                .iter()
+                .skip(my_index)
+                .step_by(self.indexes.len())
+                .collect::<Vec<_>>();
+
+            bindings[binding_index].term = if terms.iter().any(|term| term.is_none()) {
+                None
+            } else {
+                Some(BindingTerm {
+                    status: BindingStatus::Untyped,
+                    term: Term::Phi(terms.into_iter().map(|term| term.unwrap().term).collect()),
+                })
+            }
+        }
+    }
 }
 
 pub struct Env {
     ids_to_names: Vec<Rc<str>>,
     names_to_ids: HashMap<Rc<str>, usize>,
-    scopes: Vec<Scope>,
-    parameters: Vec<Literal>,
+    bindings: Vec<Binding>,
     traits: HashMap<Identifier, Trait>,
     impls: HashMap<(Type, Trait), Option<Impl>>,
     unit: Literal,
@@ -298,8 +368,7 @@ impl Env {
         let mut env = Self {
             ids_to_names: Vec::new(),
             names_to_ids: HashMap::new(),
-            scopes: Vec::new(),
-            parameters: Vec::new(),
+            bindings: Vec::new(),
             traits: HashMap::new(),
             impls: HashMap::new(),
             unit: Literal {
@@ -416,12 +485,10 @@ impl Env {
         env
     }
 
-    fn find_term(&self, id: Identifier) -> Option<Option<Term>> {
-        for scope in self.scopes.iter().rev() {
-            if let Scope::Binding { name, term } = scope {
-                if name == id {
-                    return Some(term.clone());
-                }
+    fn find_term(&self, id: Identifier) -> Option<Option<BindingTerm>> {
+        for binding in self.bindings.iter().rev() {
+            if binding.name == id {
+                return Some(binding.term.clone());
             }
         }
 
@@ -441,7 +508,7 @@ impl Env {
         // If it's not an expression (i.e. it's an item), update the relevant symbol tables.  If it's an item with
         // code inside (e.g. an impl block or fn) do all of the above except evaluation.
 
-        let scope_count = self.scopes.len();
+        let binding_count = self.bindings.len();
 
         let term = &self.stmt_to_term(&stmt)?;
 
@@ -451,15 +518,9 @@ impl Env {
 
         Ok(Eval {
             value: Some(value),
-            new_term_bindings: self.scopes[scope_count..]
+            new_term_bindings: self.bindings[binding_count..]
                 .iter()
-                .filter_map(|scope| {
-                    if let Scope::Binding { name, term } = scope {
-                        Some((self.unintern(name).clone(), term.clone()))
-                    } else {
-                        None
-                    }
-                })
+                .map(|binding| (self.unintern(binding.name).clone(), binding.term.clone()))
                 .collect(),
         })
     }
@@ -499,19 +560,33 @@ impl Env {
             Term::Literal(literal) => Ok(literal.clone()),
 
             Term::Application {
-                abstraction: Abstraction { body, .. },
+                abstraction:
+                    Abstraction {
+                        body, parameters, ..
+                    },
                 arguments,
             } => {
-                let mut parameters = arguments
+                let parameters = arguments
                     .iter()
-                    .map(|term| self.eval_term(term))
+                    .zip(parameters.iter())
+                    .map(|(term, (name, _))| {
+                        Ok(Binding {
+                            name,
+                            term: Some(BindingTerm {
+                                status: BindingStatus::Evaluated,
+                                term: Term::Literal(self.eval_term(term)?),
+                            }),
+                        })
+                    })
                     .collect::<Result<_>>()?;
 
-                mem::swap(&mut self.parameters, &mut parameters);
+                let binding_count = self.bindings.len();
+
+                self.bindings.extend(parameters);
 
                 let result = self.eval_term(body);
 
-                mem::swap(&mut self.parameters, &mut parameters);
+                self.bindings.truncate(binding_count);
 
                 result
             }
@@ -839,9 +914,22 @@ impl Env {
                                     .map(|(_, expr)| self.expr_to_term(expr))
                                     .transpose()?;
 
-                                self.scopes.push(Scope::Binding { name, term });
+                                self.bindings.push(Binding {
+                                    name,
+                                    term: term.clone().map(|term| BindingTerm {
+                                        status: BindingStatus::Untyped,
+                                        term,
+                                    }),
+                                });
 
-                                Ok(Term::Literal(self.unit.clone()))
+                                Ok(if let Some(term) = term {
+                                    Term::Let {
+                                        index: self.bindings.len() - 1,
+                                        term,
+                                    }
+                                } else {
+                                    Term::Literal(self.unit.clone())
+                                })
                             }
                         }
 
@@ -1050,20 +1138,18 @@ impl Env {
                 } else {
                     let scrutinee = Rc::new(self.expr_to_term(cond)?);
 
-                    let scope_count = self.scopes.len();
-
-                    self.scopes.push(Scope::Branch);
+                    let branch_context = BranchContext::new(&self.bindings);
 
                     let then = self.block_to_term(stmts);
+
+                    branch_context.record_and_reset(&mut self.bindings);
 
                     let else_ = else_branch
                         .as_ref()
                         .map(|(_, expr)| self.expr_to_term(&expr))
                         .transpose();
 
-                    self.scopes.pop();
-
-                    assert_eq!(scope_count, self.scopes.len());
+                    branch_context.record_and_reset(&mut self.bindings);
 
                     let then = MatchArm {
                         pattern: Pattern::Literal(self.true_.clone()),
@@ -1077,9 +1163,12 @@ impl Env {
                         body: else_?.unwrap_or_else(|| Term::Literal(self.unit.clone())),
                     };
 
-                    let arms = Rc::new([then, else_]);
+                    branch_context.make_phi_nodes(&mut self.bindings);
 
-                    Ok(Term::Match { scrutinee, arms })
+                    Ok(Term::Match {
+                        scrutinee,
+                        arms: Rc::new([then, else_]),
+                    })
                 }
             }
 
@@ -1101,6 +1190,7 @@ impl Env {
                 // TODO: when handling initialization of a variable declared in an outer scope, use a phi node if
                 // appropriate (but be careful to distinguish between initialization and reassignment to a mutable
                 // variable).
+                todo!()
             }
 
             _ => Err(anyhow!("expr not yet supported: {expr:?}")),
@@ -1108,7 +1198,7 @@ impl Env {
     }
 
     fn block_to_term(&mut self, stmts: &[Stmt]) -> Result<Term> {
-        let scope_count = self.scopes.len();
+        let binding_count = self.bindings.len();
 
         let result = stmts
             .iter()
@@ -1122,7 +1212,7 @@ impl Env {
                 terms => Term::Block(Rc::from(terms)),
             });
 
-        self.scopes.truncate(scope_count);
+        self.bindings.truncate(binding_count);
 
         result
     }
