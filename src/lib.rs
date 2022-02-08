@@ -10,7 +10,7 @@ use {
         cmp::Ordering,
         collections::HashMap,
         fmt,
-        ops::{Add, Div, Mul, Rem, Sub},
+        ops::{Add, Deref, Div, Mul, Rem, Sub},
         rc::Rc,
     },
     syn::{
@@ -19,6 +19,10 @@ use {
         Stmt, UnOp,
     },
 };
+
+fn id<A>(a: A) -> A {
+    a
+}
 
 #[derive(Clone, Hash, Eq, PartialEq, Copy, Debug)]
 enum Integer {
@@ -190,6 +194,7 @@ struct MatchArm {
 enum Term {
     Block(Rc<[Term]>),
     Literal(Literal),
+    // TODO: is there a more elegant way to do lazy type checking for let bindings, i.e. without RefCells?
     Let {
         name: Identifier,
         index: usize,
@@ -199,6 +204,10 @@ enum Term {
     Variable {
         index: usize,
         type_: Type,
+    },
+    Assignment {
+        left: Rc<Term>,
+        right: Rc<Term>,
     },
     Application {
         // TODO: support type and lifetime arguments.
@@ -247,6 +256,8 @@ impl Term {
             Self::UnaryOp(_, term) => term.type_(),
             Self::BinaryOp(_, term, _) => term.type_(),
             Self::Variable { type_, .. } => type_.clone(),
+            Self::Assignment { .. } => Type::Unit,
+            Self::Match { arms, .. } => arms[0].body.type_(),
             _ => todo!("{self:?}"),
         }
     }
@@ -294,6 +305,12 @@ impl BranchContext {
         }
     }
 
+    fn reset(&self, bindings: &mut [Binding]) {
+        for &index in self.indexes.iter() {
+            bindings[index].term = None;
+        }
+    }
+
     fn record_and_reset(&mut self, bindings: &mut [Binding]) {
         self.terms.extend(
             self.indexes
@@ -301,9 +318,7 @@ impl BranchContext {
                 .map(|&index| bindings[index].term.clone()),
         );
 
-        for &index in self.indexes.iter() {
-            bindings[index].term = None;
-        }
+        self.reset(bindings);
     }
 
     fn make_phi_nodes(&mut self, bindings: &mut [Binding]) {
@@ -332,15 +347,96 @@ impl BranchContext {
     }
 }
 
-pub struct Env {
-    ids_to_names: Vec<Rc<str>>,
-    names_to_ids: HashMap<Rc<str>, usize>,
-    bindings: Vec<Binding>,
-    traits: HashMap<Identifier, Trait>,
-    impls: HashMap<(Type, Trait), Option<Impl>>,
-    unit: Literal,
-    true_: Literal,
-    false_: Literal,
+macro_rules! integer_binary_op {
+    ($op:ident, $type:ident, $left:ident, $right:ident, $wrap:path) => {
+        match $type {
+            Integer::U8 => $wrap(
+                $left
+                    .value
+                    .downcast_ref::<u8>()
+                    .unwrap()
+                    .$op($right.value.downcast_ref::<u8>().unwrap()),
+            ),
+            Integer::U16 => $wrap(
+                $left
+                    .value
+                    .downcast_ref::<u16>()
+                    .unwrap()
+                    .$op($right.value.downcast_ref::<u16>().unwrap()),
+            ),
+            Integer::U32 => $wrap(
+                $left
+                    .value
+                    .downcast_ref::<u32>()
+                    .unwrap()
+                    .$op($right.value.downcast_ref::<u32>().unwrap()),
+            ),
+            Integer::U64 => $wrap(
+                $left
+                    .value
+                    .downcast_ref::<u64>()
+                    .unwrap()
+                    .$op($right.value.downcast_ref::<u64>().unwrap()),
+            ),
+            Integer::U128 => $wrap(
+                $left
+                    .value
+                    .downcast_ref::<u128>()
+                    .unwrap()
+                    .$op($right.value.downcast_ref::<u128>().unwrap()),
+            ),
+            Integer::Usize => $wrap(
+                $left
+                    .value
+                    .downcast_ref::<usize>()
+                    .unwrap()
+                    .$op($right.value.downcast_ref::<usize>().unwrap()),
+            ),
+            Integer::I8 => $wrap(
+                $left
+                    .value
+                    .downcast_ref::<i8>()
+                    .unwrap()
+                    .$op($right.value.downcast_ref::<i8>().unwrap()),
+            ),
+            Integer::I16 => $wrap(
+                $left
+                    .value
+                    .downcast_ref::<i16>()
+                    .unwrap()
+                    .$op($right.value.downcast_ref::<i16>().unwrap()),
+            ),
+            Integer::I32 => $wrap(
+                $left
+                    .value
+                    .downcast_ref::<i32>()
+                    .unwrap()
+                    .$op($right.value.downcast_ref::<i32>().unwrap()),
+            ),
+            Integer::I64 => $wrap(
+                $left
+                    .value
+                    .downcast_ref::<i64>()
+                    .unwrap()
+                    .$op($right.value.downcast_ref::<i64>().unwrap()),
+            ),
+            Integer::I128 => $wrap(
+                $left
+                    .value
+                    .downcast_ref::<i128>()
+                    .unwrap()
+                    .$op($right.value.downcast_ref::<i128>().unwrap()),
+            ),
+            Integer::Isize => $wrap(
+                $left
+                    .value
+                    .downcast_ref::<isize>()
+                    .unwrap()
+                    .$op($right.value.downcast_ref::<isize>().unwrap()),
+            ),
+            _ => unreachable!(),
+        }
+    };
 }
 
 pub struct Eval {
@@ -373,6 +469,17 @@ impl fmt::Display for Eval {
 
         Ok(())
     }
+}
+
+pub struct Env {
+    ids_to_names: Vec<Rc<str>>,
+    names_to_ids: HashMap<Rc<str>, usize>,
+    bindings: Vec<Binding>,
+    traits: HashMap<Identifier, Trait>,
+    impls: HashMap<(Type, Trait), Option<Impl>>,
+    unit: Literal,
+    true_: Literal,
+    false_: Literal,
 }
 
 impl Env {
@@ -528,6 +635,8 @@ impl Env {
         let term = &self.stmt_to_term(&stmt)?;
 
         let term = &self.type_check(term, None)?;
+
+        self.type_check_bindings(0)?;
 
         let value = self.eval_term(term)?;
 
@@ -720,95 +829,25 @@ impl Env {
                 let left = self.eval_term(left)?;
                 let right = self.eval_term(right)?;
 
-                macro_rules! integer_binary_op {
-                    ($op:ident, $type:ident, $left:ident, $right:ident) => {
-                        match $type {
-                            Integer::U8 => Rc::new(
-                                left.value
-                                    .downcast_ref::<u8>()
-                                    .unwrap()
-                                    .$op(right.value.downcast_ref::<u8>().unwrap()),
-                            ),
-                            Integer::U16 => Rc::new(
-                                left.value
-                                    .downcast_ref::<u16>()
-                                    .unwrap()
-                                    .$op(right.value.downcast_ref::<u16>().unwrap()),
-                            ),
-                            Integer::U32 => Rc::new(
-                                left.value
-                                    .downcast_ref::<u32>()
-                                    .unwrap()
-                                    .$op(right.value.downcast_ref::<u32>().unwrap()),
-                            ),
-                            Integer::U64 => Rc::new(
-                                left.value
-                                    .downcast_ref::<u64>()
-                                    .unwrap()
-                                    .$op(right.value.downcast_ref::<u64>().unwrap()),
-                            ),
-                            Integer::U128 => Rc::new(
-                                left.value
-                                    .downcast_ref::<u128>()
-                                    .unwrap()
-                                    .$op(right.value.downcast_ref::<u128>().unwrap()),
-                            ),
-                            Integer::Usize => Rc::new(
-                                left.value
-                                    .downcast_ref::<usize>()
-                                    .unwrap()
-                                    .$op(right.value.downcast_ref::<usize>().unwrap()),
-                            ),
-                            Integer::I8 => Rc::new(
-                                left.value
-                                    .downcast_ref::<i8>()
-                                    .unwrap()
-                                    .$op(right.value.downcast_ref::<i8>().unwrap()),
-                            ),
-                            Integer::I16 => Rc::new(
-                                left.value
-                                    .downcast_ref::<i16>()
-                                    .unwrap()
-                                    .$op(right.value.downcast_ref::<i16>().unwrap()),
-                            ),
-                            Integer::I32 => Rc::new(
-                                left.value
-                                    .downcast_ref::<i32>()
-                                    .unwrap()
-                                    .$op(right.value.downcast_ref::<i32>().unwrap()),
-                            ),
-                            Integer::I64 => Rc::new(
-                                left.value
-                                    .downcast_ref::<i64>()
-                                    .unwrap()
-                                    .$op(right.value.downcast_ref::<i64>().unwrap()),
-                            ),
-                            Integer::I128 => Rc::new(
-                                left.value
-                                    .downcast_ref::<i128>()
-                                    .unwrap()
-                                    .$op(right.value.downcast_ref::<i128>().unwrap()),
-                            ),
-                            Integer::Isize => Rc::new(
-                                left.value
-                                    .downcast_ref::<isize>()
-                                    .unwrap()
-                                    .$op(right.value.downcast_ref::<isize>().unwrap()),
-                            ),
-                            _ => unreachable!(),
-                        }
-                    };
-                }
-
                 match left.type_ {
                     Type::Integer(integer_type) => Ok(Literal {
                         type_: Type::Integer(integer_type),
                         value: match op {
-                            BinaryOp::Add => integer_binary_op!(add, integer_type, left, right),
-                            BinaryOp::Sub => integer_binary_op!(sub, integer_type, left, right),
-                            BinaryOp::Mul => integer_binary_op!(mul, integer_type, left, right),
-                            BinaryOp::Div => integer_binary_op!(div, integer_type, left, right),
-                            BinaryOp::Rem => integer_binary_op!(rem, integer_type, left, right),
+                            BinaryOp::Add => {
+                                integer_binary_op!(add, integer_type, left, right, Rc::new)
+                            }
+                            BinaryOp::Sub => {
+                                integer_binary_op!(sub, integer_type, left, right, Rc::new)
+                            }
+                            BinaryOp::Mul => {
+                                integer_binary_op!(mul, integer_type, left, right, Rc::new)
+                            }
+                            BinaryOp::Div => {
+                                integer_binary_op!(div, integer_type, left, right, Rc::new)
+                            }
+                            BinaryOp::Rem => {
+                                integer_binary_op!(rem, integer_type, left, right, Rc::new)
+                            }
                             _ => unreachable!(),
                         },
                     }),
@@ -816,7 +855,81 @@ impl Env {
                 }
             }
 
+            Term::Match { scrutinee, arms } => {
+                let scrutinee = self.eval_term(scrutinee)?;
+
+                for arm in arms.iter() {
+                    if self.match_pattern(&arm.pattern, &scrutinee) {
+                        // TODO: push and pop pattern bindings
+
+                        let match_guard = if let Some(guard) = &arm.guard {
+                            *self
+                                .eval_term(&guard)?
+                                .value
+                                .downcast_ref::<bool>()
+                                .unwrap()
+                        } else {
+                            true
+                        };
+
+                        if match_guard {
+                            return self.eval_term(&arm.body);
+                        }
+                    }
+                }
+
+                unreachable!(
+                    "exhaustiveness checking during type checking should prevent reaching this point"
+                )
+            }
+
+            Term::Assignment { left, right } => {
+                if let Term::Variable { index, .. } = left.deref() {
+                    let right = self.eval_term(right)?;
+
+                    self.bindings[*index].term = Some(Rc::new(RefCell::new(BindingTerm {
+                        status: BindingStatus::Evaluated,
+                        term: Term::Literal(right),
+                    })));
+
+                    Ok(self.unit.clone())
+                } else {
+                    todo!("assignment to {left:?}")
+                }
+            }
+
+            Term::Block(terms) => {
+                let binding_count = self.bindings.len();
+
+                let terms = terms
+                    .iter()
+                    .map(|term| self.eval_term(term))
+                    .collect::<Result<Vec<_>>>();
+
+                self.bindings.truncate(binding_count);
+
+                Ok(terms?.into_iter().last().unwrap())
+            }
+
             _ => Err(anyhow!("evaluation not yet supported for term {term:?}")),
+        }
+    }
+
+    // Does this need to be a method of Env, or can we move it to Pattern?
+    fn match_pattern(&mut self, pattern: &Pattern, scrutinee: &Literal) -> bool {
+        match pattern {
+            Pattern::Literal(literal) => match &scrutinee.type_ {
+                Type::Boolean => {
+                    *literal.value.downcast_ref::<bool>().unwrap()
+                        == *scrutinee.value.downcast_ref::<bool>().unwrap()
+                }
+
+                Type::Integer(integer_type) => {
+                    integer_binary_op!(eq, integer_type, literal, scrutinee, id)
+                }
+
+                _ => todo!("literal match for {:?}", scrutinee.type_),
+            },
         }
     }
 
@@ -846,20 +959,6 @@ impl Env {
                     let binding = &self.bindings[index];
 
                     if let Some(term) = &binding.term {
-                        {
-                            let term = RefCell::borrow(term);
-
-                            match term.status {
-                                BindingStatus::Untyped => (),
-                                BindingStatus::Typed | BindingStatus::Evaluated => {
-                                    return Ok(Term::Variable {
-                                        index,
-                                        type_: term.term.type_(),
-                                    })
-                                }
-                            }
-                        }
-
                         term.clone()
                     } else {
                         return Err(anyhow!(
@@ -869,16 +968,10 @@ impl Env {
                     }
                 };
 
-                let typed = self.type_check(&RefCell::borrow(&term).term, expected_type)?;
-
-                let type_ = typed.type_();
-
-                *RefCell::borrow_mut(&term) = BindingTerm {
-                    status: BindingStatus::Typed,
-                    term: typed,
-                };
-
-                Ok(Term::Variable { index, type_ })
+                Ok(Term::Variable {
+                    index,
+                    type_: self.type_check_binding(&term, expected_type)?,
+                })
             }
 
             Term::Literal(Literal { value, type_ }) => {
@@ -939,7 +1032,7 @@ impl Env {
             }
 
             Term::BinaryOp(op, left, right) => {
-                let left = self.type_check(&left, expected_type)?;
+                let left = self.type_check(left, expected_type)?;
 
                 let (expected_type, impl_and_function) = match op {
                     BinaryOp::And | BinaryOp::Or => (Type::Boolean, None),
@@ -970,7 +1063,17 @@ impl Env {
                     }
                 };
 
-                let right = self.type_check(&right, Some(&expected_type))?;
+                let branch_context = if let BinaryOp::And | BinaryOp::Or = op {
+                    Some(BranchContext::new(&self.bindings))
+                } else {
+                    None
+                };
+
+                let right = self.type_check(right, Some(&expected_type))?;
+
+                if let Some(branch_context) = branch_context {
+                    branch_context.reset(&mut self.bindings);
+                }
 
                 let right_type = right.type_();
 
@@ -1005,7 +1108,236 @@ impl Env {
                 }
             }
 
+            Term::Match { scrutinee, arms } => {
+                let scrutinee = self.type_check(scrutinee, None)?;
+
+                let scrutinee_type = scrutinee.type_();
+
+                let mut my_expected_type = None;
+
+                let mut branch_context = BranchContext::new(&self.bindings);
+
+                let mut typed_arms = Vec::with_capacity(arms.len());
+
+                // TODO: exhaustiveness check
+
+                for arm in arms.iter() {
+                    self.type_check_pattern(&arm.pattern, &scrutinee_type)?;
+
+                    // TODO: push and pop pattern bindings
+
+                    let guard = if let Some(guard) = &arm.guard {
+                        let guard = self.type_check(guard, Some(&Type::Boolean))?;
+
+                        let guard_type = guard.type_();
+
+                        if guard_type != Type::Boolean {
+                            return Err(anyhow!(
+                                "expected boolean pattern guard, got {guard_type:?}"
+                            ));
+                        }
+
+                        Some(guard)
+                    } else {
+                        None
+                    };
+
+                    let body =
+                        self.type_check(&arm.body, my_expected_type.as_ref().or(expected_type));
+
+                    branch_context.record_and_reset(&mut self.bindings);
+
+                    let body = body?;
+
+                    let body_type = body.type_();
+
+                    if let Some(expected_type) = my_expected_type.as_ref() {
+                        if expected_type != &body_type {
+                            return Err(anyhow!(
+                                "match arm mismatch: expected {expected_type:?}, got {body_type:?}"
+                            ));
+                        }
+                    }
+
+                    my_expected_type.get_or_insert(body_type);
+
+                    typed_arms.push(MatchArm {
+                        pattern: arm.pattern.clone(),
+                        guard,
+                        body,
+                    });
+                }
+
+                branch_context.make_phi_nodes(&mut self.bindings);
+
+                Ok(Term::Match {
+                    scrutinee: Rc::new(scrutinee),
+                    arms: typed_arms.into_iter().collect(),
+                })
+            }
+
+            Term::Assignment { left, right } => {
+                if let Term::Variable { index, .. } = left.deref() {
+                    let index = *index;
+
+                    let expected_type = if self.bindings[index].term.is_none() {
+                        None
+                    } else if let Term::Variable { type_, .. } = self.type_check(left, None)? {
+                        // TODO: check mutability
+                        Some(type_)
+                    } else {
+                        unreachable!();
+                    };
+
+                    let right = self.type_check(right, expected_type.as_ref())?;
+
+                    let right_type = right.type_();
+
+                    // TODO: check binding type ascription, if present
+
+                    if let Some(expected_type) = expected_type {
+                        if expected_type != right_type {
+                            return Err(anyhow!(
+                                "invalid assignment: expected {expected_type:?}, got {right_type:?}"
+                            ));
+                        }
+                    }
+
+                    self.bindings[index].term = Some(Rc::new(RefCell::new(BindingTerm {
+                        status: BindingStatus::Typed,
+                        term: right.clone(),
+                    })));
+
+                    Ok(Term::Assignment {
+                        left: Rc::new(Term::Variable {
+                            index,
+                            type_: right_type,
+                        }),
+                        right: Rc::new(right),
+                    })
+                } else {
+                    todo!("assignment to {left:?}")
+                }
+            }
+
+            Term::Block(terms) => {
+                let binding_count = self.bindings.len();
+
+                let terms = terms
+                    .iter()
+                    .map(|term| self.type_check(term, None))
+                    .collect::<Result<_>>();
+
+                let binding_check = if terms.is_ok() {
+                    self.type_check_bindings(binding_count)
+                } else {
+                    Ok(())
+                };
+
+                // TODO: check for bound values which implement Drop and insert the appropriate calls
+
+                self.bindings.truncate(binding_count);
+
+                binding_check?;
+
+                Ok(Term::Block(terms?))
+            }
+
+            Term::Phi(terms) => {
+                let mut my_expected_type = None;
+
+                for term in terms.iter() {
+                    let type_ =
+                        self.type_check_binding(term, my_expected_type.as_ref().or(expected_type))?;
+
+                    if let Some(expected_type) = my_expected_type.as_ref() {
+                        if expected_type != &type_ {
+                            return Err(anyhow!(
+                                "inconsistent type assignments: expected {expected_type:?}, got {type_:?}"
+                            ));
+                        }
+                    }
+
+                    my_expected_type.get_or_insert(type_);
+                }
+
+                Ok(Term::Literal(self.unit.clone()))
+            }
+
             _ => Err(anyhow!("type checking not yet supported for term {term:?}")),
+        }
+    }
+
+    fn type_check_binding(
+        &mut self,
+        term: &RefCell<BindingTerm>,
+        expected_type: Option<&Type>,
+    ) -> Result<Type> {
+        {
+            let term = RefCell::borrow(term);
+
+            match term.status {
+                BindingStatus::Untyped => (),
+                BindingStatus::Typed | BindingStatus::Evaluated => return Ok(term.term.type_()),
+            }
+        }
+
+        let typed = self.type_check(&RefCell::borrow(term).term, expected_type)?;
+
+        let type_ = typed.type_();
+
+        *RefCell::borrow_mut(term) = BindingTerm {
+            status: BindingStatus::Typed,
+            term: typed,
+        };
+
+        Ok(type_)
+    }
+
+    fn type_check_bindings(&mut self, offset: usize) -> Result<()> {
+        let indexes = self
+            .bindings
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .filter_map(|(index, binding)| {
+                binding.term.as_ref().and_then(|term| {
+                    if let BindingStatus::Untyped = term.borrow().status {
+                        Some(index)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        indexes
+            .into_iter()
+            .map(|index| {
+                self.type_check(
+                    &Term::Variable {
+                        index,
+                        type_: Type::Never,
+                    },
+                    None,
+                )
+                .map(drop)
+            })
+            .collect::<Result<()>>()
+    }
+
+    // Does this need to be a method of Env, or can we move it to Pattern?
+    fn type_check_pattern(&mut self, pattern: &Pattern, expected_type: &Type) -> Result<()> {
+        let actual_type = match pattern {
+            Pattern::Literal(literal) => &literal.type_,
+        };
+
+        if expected_type == actual_type {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "match arm mismatch: expected {expected_type:?}, got {actual_type:?}"
+            ))
         }
     }
 
@@ -1263,18 +1595,12 @@ impl Env {
                 } else {
                     let scrutinee = Rc::new(self.expr_to_term(cond)?);
 
-                    let mut branch_context = BranchContext::new(&self.bindings);
-
                     let then = self.block_to_term(stmts);
-
-                    branch_context.record_and_reset(&mut self.bindings);
 
                     let else_ = else_branch
                         .as_ref()
                         .map(|(_, expr)| self.expr_to_term(&expr))
                         .transpose();
-
-                    branch_context.record_and_reset(&mut self.bindings);
 
                     let then = MatchArm {
                         pattern: Pattern::Literal(self.true_.clone()),
@@ -1287,8 +1613,6 @@ impl Env {
                         guard: None,
                         body: else_?.unwrap_or_else(|| Term::Literal(self.unit.clone())),
                     };
-
-                    branch_context.make_phi_nodes(&mut self.bindings);
 
                     Ok(Term::Match {
                         scrutinee,
@@ -1311,11 +1635,17 @@ impl Env {
                 }
             }
 
-            Expr::Assign(ExprAssign { .. }) => {
-                // TODO: when handling initialization of a variable declared in an outer scope, use a phi node if
-                // appropriate (but be careful to distinguish between initialization and reassignment to a mutable
-                // variable).
-                todo!()
+            Expr::Assign(ExprAssign {
+                left, right, attrs, ..
+            }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else {
+                    Ok(Term::Assignment {
+                        left: Rc::new(self.expr_to_term(left)?),
+                        right: Rc::new(self.expr_to_term(right)?),
+                    })
+                }
             }
 
             _ => Err(anyhow!("expr not yet supported: {expr:?}")),
@@ -1331,8 +1661,6 @@ impl Env {
             .collect::<Result<Vec<_>>>()
             .map(|terms| match &terms[..] {
                 [] => Term::Literal(self.unit.clone()),
-
-                [term] => term.clone(),
 
                 terms => Term::Block(Rc::from(terms)),
             });
