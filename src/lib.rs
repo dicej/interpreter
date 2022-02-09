@@ -197,7 +197,7 @@ enum Term {
         index: usize,
         term: Option<Rc<RefCell<BindingTerm>>>,
     },
-    Phi(Rc<[Rc<RefCell<BindingTerm>>]>),
+    Phi(Rc<[Option<Rc<RefCell<BindingTerm>>>]>),
     Variable {
         index: usize,
         type_: Type,
@@ -333,19 +333,14 @@ impl BranchContext {
                 .iter()
                 .skip(my_index)
                 .step_by(self.indexes.len())
-                .collect::<Vec<_>>();
+                .collect::<Rc<[_]>>();
 
-            bindings[binding_index].term = if terms.iter().any(|term| term.is_none()) {
+            bindings[binding_index].term = if terms.iter().all(|term| term.is_none()) {
                 None
             } else {
                 Some(Rc::new(RefCell::new(BindingTerm {
                     status: BindingStatus::Untyped,
-                    term: Term::Phi(
-                        terms
-                            .into_iter()
-                            .map(|term| term.as_ref().unwrap().clone())
-                            .collect(),
-                    ),
+                    term: Term::Phi(terms),
                 })))
             }
         }
@@ -1005,13 +1000,23 @@ impl Env {
                 let term = {
                     let binding = &self.bindings[index];
 
-                    if let Some(term) = &binding.term {
-                        term.clone()
-                    } else {
-                        return Err(anyhow!(
+                    let error = || {
+                        Err(anyhow!(
                             "use of uninitialized variable: {}",
                             self.unintern(binding.name)
-                        ));
+                        ))
+                    };
+
+                    if let Some(term) = &binding.term {
+                        if let Term::Phi(terms) = term {
+                            if terms.iter().any(|term| term.is_none()) {
+                                return error();
+                            }
+                        }
+
+                        term.clone()
+                    } else {
+                        return error();
                     }
                 };
 
@@ -1125,6 +1130,9 @@ impl Env {
                 let right_type = right.type_();
 
                 // TODO: for this and all other type comparisons, treat Type::Never as a match
+                //
+                // Of course, we'll need to tweak these comparisons even more once we start doing unification,
+                // which will presumably require repeated calls to type_check until we reach a fixed point.
                 if expected_type != right_type {
                     Err(anyhow!("expected {expected_type:?}, got {right_type:?}"))
                 } else {
@@ -1231,7 +1239,8 @@ impl Env {
                     let expected_type = if self.bindings[index].term.is_none() {
                         None
                     } else if let Term::Variable { type_, .. } = self.type_check(left, None)? {
-                        // TODO: check mutability
+                        // TODO: check mutability, and only allow assignment to immutable bindings which have not
+                        // been initialized in any branch.
                         Some(type_)
                     } else {
                         unreachable!();
@@ -1294,19 +1303,23 @@ impl Env {
             Term::Phi(terms) => {
                 let mut my_expected_type = None;
 
-                for term in terms.iter() {
-                    let type_ =
-                        self.type_check_binding(term, my_expected_type.as_ref().or(expected_type))?;
+                if terms.iter().all(|term| term.is_some()) {
+                    for term in terms.iter() {
+                        let type_ = self.type_check_binding(
+                            term.unwrap(),
+                            my_expected_type.as_ref().or(expected_type),
+                        )?;
 
-                    if let Some(expected_type) = my_expected_type.as_ref() {
-                        if expected_type != &type_ {
-                            return Err(anyhow!(
+                        if let Some(expected_type) = my_expected_type.as_ref() {
+                            if expected_type != &type_ {
+                                return Err(anyhow!(
                                 "inconsistent type assignments: expected {expected_type:?}, got {type_:?}"
                             ));
+                            }
                         }
-                    }
 
-                    my_expected_type.get_or_insert(type_);
+                        my_expected_type.get_or_insert(type_);
+                    }
                 }
 
                 Ok(Term::Literal(self.unit.clone()))
