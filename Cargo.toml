@@ -6,4 +6,8 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 maplit = "1"
+log = "0.4"
 syn = { version = "1", default-features = false, features = ["parsing", "full", "extra-traits"] }
+
+[dev-dependencies]
+pretty_env_logger = "0.4"

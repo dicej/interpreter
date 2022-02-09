@@ -3,26 +3,24 @@
 
 use {
     anyhow::{anyhow, Result},
+    log::info,
     maplit::hashmap,
     std::{
         any::Any,
         cell::RefCell,
         cmp::Ordering,
         collections::HashMap,
-        fmt,
+        convert::identity,
+        fmt, mem,
         ops::{Add, Deref, Div, Mul, Rem, Sub},
         rc::Rc,
     },
     syn::{
-        BinOp, Block, Expr, ExprAssign, ExprBinary, ExprBlock, ExprIf, ExprLit, ExprParen,
-        ExprPath, ExprUnary, Lit, LitBool, Local, Pat, PatIdent, Path, PathArguments, PathSegment,
-        Stmt, UnOp,
+        BinOp, Block, Expr, ExprAssign, ExprBinary, ExprBlock, ExprBreak, ExprIf, ExprLit,
+        ExprLoop, ExprParen, ExprPath, ExprUnary, Lit, LitBool, Local, Pat, PatIdent, Path,
+        PathArguments, PathSegment, Stmt, UnOp,
     },
 };
-
-fn id<A>(a: A) -> A {
-    a
-}
 
 #[derive(Clone, Hash, Eq, PartialEq, Copy, Debug)]
 enum Integer {
@@ -194,11 +192,10 @@ struct MatchArm {
 enum Term {
     Block(Rc<[Term]>),
     Literal(Literal),
-    // TODO: is there a more elegant way to do lazy type checking for let bindings, i.e. without RefCells?
     Let {
         name: Identifier,
         index: usize,
-        term: Rc<RefCell<BindingTerm>>,
+        term: Option<Rc<RefCell<BindingTerm>>>,
     },
     Phi(Rc<[Rc<RefCell<BindingTerm>>]>),
     Variable {
@@ -226,6 +223,7 @@ enum Term {
     Loop {
         label: Option<Identifier>,
         body: Rc<Term>,
+        type_: Type,
     },
     Continue(Option<Identifier>),
     Break {
@@ -246,8 +244,7 @@ impl Term {
         match self {
             Self::Block(terms) => terms.last().map(|term| term.type_()).unwrap_or(Type::Unit),
             Self::Literal(literal) => literal.type_.clone(),
-            // TODO: the return type of an abstraction may be a function of its type parameters unless it's already
-            // been monomorphized
+            // TODO: the return type of an abstraction may be a function of its type parameters
             Self::Application {
                 abstraction: Abstraction { body, .. },
                 ..
@@ -258,9 +255,17 @@ impl Term {
             Self::Variable { type_, .. } => type_.clone(),
             Self::Assignment { .. } => Type::Unit,
             Self::Match { arms, .. } => arms[0].body.type_(),
-            _ => todo!("{self:?}"),
+            Self::Break { .. } | Self::Return { .. } => Type::Never,
+            _ => todo!("Term::type_ for {self:?}"),
         }
     }
+}
+
+struct Loop {
+    label: Option<Identifier>,
+    expected_type: Option<Type>,
+    break_terms: Vec<Term>,
+    branch_context: BranchContext,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -345,6 +350,17 @@ impl BranchContext {
             }
         }
     }
+}
+
+#[derive(Debug)]
+enum EvalException {
+    Break {
+        label: Option<Identifier>,
+        result: Literal,
+    },
+    Return {
+        result: Literal,
+    },
 }
 
 macro_rules! integer_binary_op {
@@ -440,17 +456,18 @@ macro_rules! integer_binary_op {
 }
 
 pub struct Eval {
-    value: Option<Literal>,
+    value: Literal,
     new_term_bindings: HashMap<Rc<str>, Option<Term>>,
 }
 
 impl fmt::Display for Eval {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut need_newline = if let Some(value) = &self.value {
-            write!(f, "{value}")?;
-            true
-        } else {
-            false
+        let mut need_newline = match &self.value.type_ {
+            Type::Unit => false,
+            _ => {
+                write!(f, "{}", self.value)?;
+                true
+            }
         };
 
         for (symbol, term) in &self.new_term_bindings {
@@ -475,6 +492,7 @@ pub struct Env {
     ids_to_names: Vec<Rc<str>>,
     names_to_ids: HashMap<Rc<str>, usize>,
     bindings: Vec<Binding>,
+    loops: Vec<Loop>,
     traits: HashMap<Identifier, Trait>,
     impls: HashMap<(Type, Trait), Option<Impl>>,
     unit: Literal,
@@ -488,6 +506,7 @@ impl Env {
             ids_to_names: Vec::new(),
             names_to_ids: HashMap::new(),
             bindings: Vec::new(),
+            loops: Vec::new(),
             traits: HashMap::new(),
             impls: HashMap::new(),
             unit: Literal {
@@ -608,13 +627,17 @@ impl Env {
     }
 
     fn find_term(&self, id: Identifier) -> Option<usize> {
-        for (index, binding) in self.bindings.iter().enumerate().rev() {
-            if binding.name == id {
-                return Some(index);
-            }
-        }
-
-        None
+        self.bindings
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, binding)| {
+                if binding.name == id {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
     }
 
     pub fn eval_line(&mut self, line: &str) -> Result<Eval> {
@@ -622,7 +645,7 @@ impl Env {
             .or_else(|_| syn::parse_str::<Stmt>(&format!("{line};")))
             .or_else(|_| syn::parse_str::<Expr>(line).map(Stmt::Expr))?;
 
-        println!("{stmt:#?}");
+        info!("{stmt:#?}");
 
         // TODO: convert stmt to a term (if it's an expression), then typecheck it, then lower it to something
         // MIR-like, then borrow-check it, then evaluate it.
@@ -638,10 +661,17 @@ impl Env {
 
         self.type_check_bindings(0)?;
 
-        let value = self.eval_term(term)?;
+        let value = match self.eval_term(term) {
+            Ok(value) => value,
+            Err(EvalException::Return { result }) => {
+                self.bindings.clear();
+                result
+            }
+            _ => unreachable!(),
+        };
 
         Ok(Eval {
-            value: Some(value),
+            value,
             new_term_bindings: self.bindings[binding_count..]
                 .iter()
                 .map(|binding| {
@@ -687,32 +717,29 @@ impl Env {
         }
     }
 
-    fn eval_term(&mut self, term: &Term) -> Result<Literal> {
+    fn eval_term(&mut self, term: &Term) -> Result<Literal, EvalException> {
         match term {
             Term::Let { name, index, term } => {
                 match index.cmp(&self.bindings.len()) {
                     Ordering::Less => (),
                     Ordering::Equal => self.bindings.push(Binding {
                         name: *name,
-                        term: Some(term.clone()),
+                        term: term.clone(),
                     }),
                     Ordering::Greater => unreachable!(),
                 }
 
-                let mut term = RefCell::borrow_mut(term);
+                if let Some(term) = term {
+                    let mut term = RefCell::borrow_mut(term);
 
-                *term = BindingTerm {
-                    status: BindingStatus::Evaluated,
-                    term: Term::Literal(match term.status {
-                        BindingStatus::Untyped => {
-                            let typed = self.type_check(&term.term, None)?;
-
-                            self.eval_term(&typed)?
-                        }
-                        BindingStatus::Typed => self.eval_term(&term.term)?,
-                        _ => unreachable!(),
-                    }),
-                };
+                    *term = BindingTerm {
+                        status: BindingStatus::Evaluated,
+                        term: Term::Literal(match term.status {
+                            BindingStatus::Typed => self.eval_term(&term.term)?,
+                            _ => unreachable!(),
+                        }),
+                    };
+                }
 
                 Ok(self.unit.clone())
             }
@@ -738,7 +765,7 @@ impl Env {
                     },
                 arguments,
             } => {
-                let parameters = arguments
+                let mut parameters = arguments
                     .iter()
                     .zip(parameters.iter())
                     .map(|(term, (name, _))| {
@@ -750,15 +777,13 @@ impl Env {
                             }))),
                         })
                     })
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect::<Result<Vec<_>, EvalException>>()?;
 
-                let binding_count = self.bindings.len();
-
-                self.bindings.extend(parameters);
+                mem::swap(&mut parameters, &mut self.bindings);
 
                 let result = self.eval_term(body);
 
-                self.bindings.truncate(binding_count);
+                mem::swap(&mut parameters, &mut self.bindings);
 
                 result
             }
@@ -904,14 +929,36 @@ impl Env {
                 let terms = terms
                     .iter()
                     .map(|term| self.eval_term(term))
-                    .collect::<Result<Vec<_>>>();
+                    .collect::<Result<Vec<_>, EvalException>>();
 
                 self.bindings.truncate(binding_count);
 
                 Ok(terms?.into_iter().last().unwrap())
             }
 
-            _ => Err(anyhow!("evaluation not yet supported for term {term:?}")),
+            Term::Loop { label, body, .. } => loop {
+                match self.eval_term(body) {
+                    Ok(_) => (),
+
+                    Err(EvalException::Break {
+                        label: break_label,
+                        result,
+                    }) if break_label.is_none() || break_label == *label => break Ok(result),
+
+                    err => break err,
+                }
+            },
+
+            Term::Break { label, term } => Err(EvalException::Break {
+                label: *label,
+                result: self.eval_term(term)?,
+            }),
+
+            Term::Return { term } => Err(EvalException::Return {
+                result: self.eval_term(term)?,
+            }),
+
+            _ => todo!("evaluation not yet supported for term {term:?}"),
         }
     }
 
@@ -925,7 +972,7 @@ impl Env {
                 }
 
                 Type::Integer(integer_type) => {
-                    integer_binary_op!(eq, integer_type, literal, scrutinee, id)
+                    integer_binary_op!(eq, integer_type, literal, scrutinee, identity)
                 }
 
                 _ => todo!("literal match for {:?}", scrutinee.type_),
@@ -944,7 +991,7 @@ impl Env {
                     Ordering::Less => (),
                     Ordering::Equal => self.bindings.push(Binding {
                         name: *name,
-                        term: Some(binding_term.clone()),
+                        term: binding_term.clone(),
                     }),
                     Ordering::Greater => unreachable!(),
                 }
@@ -1077,6 +1124,7 @@ impl Env {
 
                 let right_type = right.type_();
 
+                // TODO: for this and all other type comparisons, treat Type::Never as a match
                 if expected_type != right_type {
                     Err(anyhow!("expected {expected_type:?}, got {right_type:?}"))
                 } else {
@@ -1264,6 +1312,98 @@ impl Env {
                 Ok(Term::Literal(self.unit.clone()))
             }
 
+            Term::Loop { label, body, .. } => {
+                let label = *label;
+
+                self.loops.push(Loop {
+                    label,
+                    expected_type: expected_type.cloned(),
+                    break_terms: Vec::new(),
+                    branch_context: BranchContext::new(&self.bindings),
+                });
+
+                let body = self.type_check(body, None);
+
+                let mut loop_ = self.loops.pop().unwrap();
+
+                loop_.branch_context.make_phi_nodes(&mut self.bindings);
+
+                Ok(Term::Loop {
+                    label,
+                    body: Rc::new(body?),
+                    type_: loop_
+                        .break_terms
+                        .iter()
+                        .find_map(|term| match term.type_() {
+                            Type::Never => None,
+                            type_ => Some(type_.clone()),
+                        })
+                        .unwrap_or(Type::Never),
+                })
+            }
+
+            Term::Break { label, term } => {
+                let label = *label;
+
+                if let Some((index, expected_type)) =
+                    self.loops
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(index, loop_)| {
+                            if label.is_none() || loop_.label == label {
+                                Some((index, loop_.expected_type.clone()))
+                            } else {
+                                None
+                            }
+                        })
+                {
+                    let term = self.type_check(term, expected_type.as_ref());
+
+                    let loop_ = &mut self.loops[index];
+
+                    loop_.branch_context.record_and_reset(&mut self.bindings);
+
+                    let term = term?;
+
+                    if let Some(expected_type) =
+                        loop_
+                            .break_terms
+                            .iter()
+                            .find_map(|term| match term.type_() {
+                                Type::Never => None,
+                                type_ => Some(type_.clone()),
+                            })
+                    {
+                        let actual_type = term.type_();
+
+                        if expected_type != actual_type {
+                            return Err(anyhow!("expected {expected_type:?}, got {actual_type:?}"));
+                        }
+                    }
+
+                    loop_.break_terms.push(term.clone());
+
+                    Ok(Term::Break {
+                        label,
+                        term: Rc::new(term),
+                    })
+                } else {
+                    Err(anyhow!(
+                        "break without matching loop{}",
+                        if let Some(label) = label {
+                            format!(" (label: {})", self.unintern(label))
+                        } else {
+                            String::new()
+                        }
+                    ))
+                }
+            }
+
+            Term::Return { .. } => {
+                todo!()
+            }
+
             _ => Err(anyhow!("type checking not yet supported for term {term:?}")),
         }
     }
@@ -1379,14 +1519,10 @@ impl Env {
                                     term: term.clone(),
                                 });
 
-                                Ok(if let Some(term) = term {
-                                    Term::Let {
-                                        name,
-                                        index: self.bindings.len() - 1,
-                                        term: term,
-                                    }
-                                } else {
-                                    Term::Literal(self.unit.clone())
+                                Ok(Term::Let {
+                                    name,
+                                    index: self.bindings.len() - 1,
+                                    term,
                                 })
                             }
                         }
@@ -1595,23 +1731,20 @@ impl Env {
                 } else {
                     let scrutinee = Rc::new(self.expr_to_term(cond)?);
 
-                    let then = self.block_to_term(stmts);
-
-                    let else_ = else_branch
-                        .as_ref()
-                        .map(|(_, expr)| self.expr_to_term(&expr))
-                        .transpose();
-
                     let then = MatchArm {
                         pattern: Pattern::Literal(self.true_.clone()),
                         guard: None,
-                        body: then?,
+                        body: self.block_to_term(stmts)?,
                     };
 
                     let else_ = MatchArm {
                         pattern: Pattern::Literal(self.false_.clone()),
                         guard: None,
-                        body: else_?.unwrap_or_else(|| Term::Literal(self.unit.clone())),
+                        body: else_branch
+                            .as_ref()
+                            .map(|(_, expr)| self.expr_to_term(&expr))
+                            .transpose()?
+                            .unwrap_or_else(|| Term::Literal(self.unit.clone())),
                     };
 
                     Ok(Term::Match {
@@ -1648,6 +1781,45 @@ impl Env {
                 }
             }
 
+            Expr::Loop(ExprLoop {
+                label,
+                body: Block { stmts, .. },
+                attrs,
+                ..
+            }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else {
+                    Ok(Term::Loop {
+                        label: label
+                            .as_ref()
+                            .map(|label| self.intern(&label.name.ident.to_string())),
+                        body: Rc::new(self.block_to_term(stmts)?),
+                        type_: Type::Never,
+                    })
+                }
+            }
+
+            Expr::Break(ExprBreak {
+                label, expr, attrs, ..
+            }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else {
+                    Ok(Term::Break {
+                        label: label
+                            .as_ref()
+                            .map(|label| self.intern(&label.ident.to_string())),
+                        term: Rc::new(
+                            expr.as_ref()
+                                .map(|expr| self.expr_to_term(&expr))
+                                .transpose()?
+                                .unwrap_or_else(|| Term::Literal(self.unit.clone())),
+                        ),
+                    })
+                }
+            }
+
             _ => Err(anyhow!("expr not yet supported: {expr:?}")),
         }
     }
@@ -1672,5 +1844,89 @@ impl Env {
 
     pub fn eval_file(&mut self, _file: &str) -> Result<Eval> {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use {super::*, std::sync::Once};
+
+    fn eval<T: Copy + 'static>(line: &str) -> Result<T> {
+        {
+            static ONCE: Once = Once::new();
+
+            ONCE.call_once(pretty_env_logger::init_timed);
+        }
+
+        Ok(*Env::new()
+            .eval_line(line)?
+            .value
+            .value
+            .downcast_ref::<T>()
+            .unwrap())
+    }
+
+    #[test]
+    fn int_literal() {
+        assert_eq!(42_i32, eval("42").unwrap())
+    }
+
+    #[test]
+    fn bool_literal() {
+        assert!(eval::<bool>("true").unwrap())
+    }
+
+    #[test]
+    fn if_expression() {
+        assert_eq!(
+            77_i32,
+            eval("{ let x = false; if x { 27 } else { 77 } }").unwrap()
+        )
+    }
+
+    #[test]
+    fn bad_if_expression() {
+        assert!(eval::<()>("{ let x = false; if x { 27 } else { true } }").is_err())
+    }
+
+    #[test]
+    fn conditional_initialization() {
+        assert_eq!(
+            27_i32,
+            eval("{ let x; if true { x = 27 } else { x = 77 } x }").unwrap()
+        )
+    }
+
+    #[test]
+    fn bad_conditional_initialization() {
+        assert!(eval::<()>("{ let x; if true { x = 27 } else { x = true } x }").is_err())
+    }
+
+    #[test]
+    fn minimal_loop() {
+        assert_eq!(9_i32, eval("loop { break 9 }").unwrap())
+    }
+
+    #[test]
+    fn conditional_break() {
+        assert_eq!(
+            9_i32,
+            eval("loop { if true { break 9 } else { break 7 } }").unwrap()
+        )
+    }
+
+    #[test]
+    fn bad_conditional_break() {
+        assert!(eval::<()>("loop { if true { break 9 } else { break false } }").is_err())
+    }
+
+    #[test]
+    fn loop_initialization() {
+        assert_eq!(81_i32, eval("{ let x; loop { x = 81; break } x }").unwrap())
+    }
+
+    #[test]
+    fn bad_loop_initialization() {
+        assert!(eval::<()>("{ let x; loop { break; x = 81 } x }").is_err())
     }
 }
