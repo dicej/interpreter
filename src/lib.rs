@@ -16,9 +16,9 @@ use {
         rc::Rc,
     },
     syn::{
-        BinOp, Block, Expr, ExprAssign, ExprBinary, ExprBlock, ExprBreak, ExprIf, ExprLit,
-        ExprLoop, ExprParen, ExprPath, ExprUnary, Lit, LitBool, Local, Pat, PatIdent, Path,
-        PathArguments, PathSegment, Stmt, UnOp,
+        BinOp, Block, Expr, ExprAssign, ExprAssignOp, ExprBinary, ExprBlock, ExprBreak, ExprIf,
+        ExprLit, ExprLoop, ExprParen, ExprPath, ExprUnary, Lit, LitBool, Local, Pat, PatIdent,
+        Path, PathArguments, PathSegment, Stmt, UnOp,
     },
 };
 
@@ -97,7 +97,11 @@ enum Type {
     Array(Rc<Type>),
     Tuple(Rc<[Type]>),
     Pointer(Rc<Type>),
-    Reference(Rc<Type>, Lifetime),
+    Reference {
+        // TODO: add lifetime field
+        unique: bool,
+        type_: Rc<Type>,
+    },
     Slice(Rc<Type>, Lifetime),
     Str(Lifetime),
     Function {
@@ -155,6 +159,7 @@ impl fmt::Display for Literal {
 enum UnaryOp {
     Neg,
     Not,
+    Deref,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -166,12 +171,29 @@ enum BinaryOp {
     Mul,
     Div,
     Rem,
+    AddAssign,
+    SubAssign,
+    MulAssign,
+    DivAssign,
+    RemAssign,
+    Eq,
+    Ge,
+    Gt,
+    Le,
+    Lt,
+}
+
+#[derive(Clone, Debug)]
+struct Parameter {
+    name: Identifier,
+    mutable: bool,
+    type_: Type,
 }
 
 #[derive(Clone, Debug)]
 struct Abstraction {
     // TODO: support type and lifetime parameters.
-    parameters: Rc<[(Identifier, Type)]>,
+    parameters: Rc<[Parameter]>,
     body: Rc<Term>,
 }
 
@@ -192,8 +214,14 @@ struct MatchArm {
 enum Term {
     Block(Rc<[Term]>),
     Literal(Literal),
+    Reference {
+        // TODO: add lifetime field
+        unique: bool,
+        term: Rc<Term>,
+    },
     Let {
         name: Identifier,
+        mutable: bool,
         index: usize,
         term: Option<Rc<RefCell<BindingTerm>>>,
     },
@@ -251,11 +279,24 @@ impl Term {
             } => body.type_(),
             Self::And { .. } | Self::Or { .. } => Type::Boolean,
             Self::UnaryOp(_, term) => term.type_(),
-            Self::BinaryOp(_, term, _) => term.type_(),
+            Self::BinaryOp(op, term, _) => match op {
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
+                    term.type_()
+                }
+                BinaryOp::Eq | BinaryOp::Ge | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Lt => {
+                    Type::Boolean
+                }
+                _ => unreachable!(),
+            },
             Self::Variable { type_, .. } => type_.clone(),
             Self::Assignment { .. } => Type::Unit,
             Self::Match { arms, .. } => arms[0].body.type_(),
             Self::Break { .. } | Self::Return { .. } => Type::Never,
+            Self::Phi(terms) => {
+                RefCell::borrow(terms.iter().find_map(|term| term.as_ref()).unwrap())
+                    .term
+                    .type_()
+            }
             _ => todo!("Term::type_ for {self:?}"),
         }
     }
@@ -284,6 +325,7 @@ struct BindingTerm {
 #[derive(Clone, Debug)]
 struct Binding {
     name: Identifier,
+    mutable: bool,
     term: Option<Rc<RefCell<BindingTerm>>>,
 }
 
@@ -333,6 +375,7 @@ impl BranchContext {
                 .iter()
                 .skip(my_index)
                 .step_by(self.indexes.len())
+                .cloned()
                 .collect::<Rc<[_]>>();
 
             bindings[binding_index].term = if terms.iter().all(|term| term.is_none()) {
@@ -483,6 +526,19 @@ impl fmt::Display for Eval {
     }
 }
 
+fn match_types(expected: &Type, actual: &Type) -> Result<()> {
+    // TODO: this will need to be refined once we start doing unification, and we'll probably need to move this
+    // function into Env's impl
+
+    if expected != &Type::Never && actual != &Type::Never && expected != actual {
+        Err(anyhow!(
+            "type mismatch: expected {expected:?}, got {actual:?}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub struct Env {
     ids_to_names: Vec<Rc<str>>,
     names_to_ids: HashMap<Rc<str>, usize>,
@@ -536,11 +592,11 @@ impl Env {
         .collect::<Vec<_>>();
 
         let unaries = &[
-            ("Neg", "neg", &signed as &[Type]),
-            ("Not", "not", &[Type::Boolean]),
+            (UnaryOp::Neg, "Neg", "neg", &signed as &[Type]),
+            (UnaryOp::Not, "Not", "not", &[Type::Boolean]),
         ];
 
-        for (name, function, types) in unaries {
+        for (op, name, function, types) in unaries {
             let name = env.intern(name);
             let function = env.intern(function);
             let trait_ = Trait(name, Rc::new([]));
@@ -549,11 +605,18 @@ impl Env {
 
             for type_ in *types {
                 let abstraction = Abstraction {
-                    parameters: Rc::new([(self_, type_.clone())]),
-                    body: Rc::new(Term::Literal(Literal {
-                        value: Rc::new(()),
+                    parameters: Rc::new([Parameter {
+                        name: self_,
+                        mutable: false,
                         type_: type_.clone(),
-                    })),
+                    }]),
+                    body: Rc::new(Term::UnaryOp(
+                        *op,
+                        Rc::new(Term::Variable {
+                            index: 0,
+                            type_: type_.clone(),
+                        }),
+                    )),
                 };
 
                 env.impls.insert(
@@ -585,14 +648,14 @@ impl Env {
         .collect::<Vec<_>>();
 
         let binaries = &[
-            ("Add", "add", &integers),
-            ("Sub", "sub", &integers),
-            ("Mul", "mul", &integers),
-            ("Div", "div", &integers),
-            ("Rem", "rem", &integers),
+            (BinaryOp::Add, "Add", "add", &integers),
+            (BinaryOp::Sub, "Sub", "sub", &integers),
+            (BinaryOp::Mul, "Mul", "mul", &integers),
+            (BinaryOp::Div, "Div", "div", &integers),
+            (BinaryOp::Rem, "Rem", "rem", &integers),
         ];
 
-        for (name, function, types) in binaries {
+        for (op, name, function, types) in binaries {
             let name = env.intern(name);
             let function = env.intern(function);
             let trait_ = Trait(name, Rc::new([]));
@@ -601,11 +664,29 @@ impl Env {
 
             for type_ in *types {
                 let abstraction = Abstraction {
-                    parameters: Rc::new([(self_, type_.clone()), (other, type_.clone())]),
-                    body: Rc::new(Term::Literal(Literal {
-                        value: Rc::new(()),
-                        type_: type_.clone(),
-                    })),
+                    parameters: Rc::new([
+                        Parameter {
+                            name: self_,
+                            mutable: false,
+                            type_: type_.clone(),
+                        },
+                        Parameter {
+                            name: other,
+                            mutable: false,
+                            type_: type_.clone(),
+                        },
+                    ]),
+                    body: Rc::new(Term::BinaryOp(
+                        *op,
+                        Rc::new(Term::Variable {
+                            index: 0,
+                            type_: type_.clone(),
+                        }),
+                        Rc::new(Term::Variable {
+                            index: 1,
+                            type_: type_.clone(),
+                        }),
+                    )),
                 };
 
                 env.impls.insert(
@@ -613,6 +694,151 @@ impl Env {
                     Some(Impl {
                         arguments: Rc::new([type_.clone()]),
                         functions: Rc::new(hashmap![function => abstraction]),
+                    }),
+                );
+            }
+        }
+
+        let assignments = &[
+            (BinaryOp::AddAssign, "AddAssign", "add_assign", &integers),
+            (BinaryOp::SubAssign, "SubAssign", "sub_assign", &integers),
+            (BinaryOp::MulAssign, "MulAssign", "mul_assign", &integers),
+            (BinaryOp::DivAssign, "DivAssign", "div_assign", &integers),
+            (BinaryOp::RemAssign, "RemAssign", "rem_assign", &integers),
+        ];
+
+        for (op, name, function, types) in assignments {
+            let name = env.intern(name);
+            let function = env.intern(function);
+            let trait_ = Trait(name, Rc::new([]));
+
+            env.traits.insert(name, trait_.clone());
+
+            for type_ in *types {
+                let self_type = Type::Reference {
+                    unique: true,
+                    type_: Rc::new(type_.clone()),
+                };
+
+                let abstraction = Abstraction {
+                    parameters: Rc::new([
+                        Parameter {
+                            name: self_,
+                            mutable: false,
+                            type_: self_type.clone(),
+                        },
+                        Parameter {
+                            name: other,
+                            mutable: false,
+                            type_: type_.clone(),
+                        },
+                    ]),
+                    body: Rc::new(Term::Assignment {
+                        left: Rc::new(Term::UnaryOp(
+                            UnaryOp::Deref,
+                            Rc::new(Term::Variable {
+                                index: 0,
+                                type_: self_type.clone(),
+                            }),
+                        )),
+                        right: Rc::new(Term::BinaryOp(
+                            *op,
+                            Rc::new(Term::UnaryOp(
+                                UnaryOp::Deref,
+                                Rc::new(Term::Variable {
+                                    index: 0,
+                                    type_: self_type.clone(),
+                                }),
+                            )),
+                            Rc::new(Term::Variable {
+                                index: 1,
+                                type_: type_.clone(),
+                            }),
+                        )),
+                    }),
+                };
+
+                env.impls.insert(
+                    (type_.clone(), trait_.clone()),
+                    Some(Impl {
+                        arguments: Rc::new([type_.clone()]),
+                        functions: Rc::new(hashmap![function => abstraction]),
+                    }),
+                );
+            }
+        }
+
+        let comparisons = &[
+            ("PartialEq", &[(BinaryOp::Eq, "eq")] as &[_], &integers),
+            (
+                "PartialOrd",
+                &[
+                    (BinaryOp::Ge, "ge"),
+                    (BinaryOp::Gt, "gt"),
+                    (BinaryOp::Le, "le"),
+                    (BinaryOp::Lt, "lt"),
+                ],
+                &integers,
+            ),
+        ];
+
+        for (name, ops_and_functions, types) in comparisons {
+            let name = env.intern(name);
+            let trait_ = Trait(name, Rc::new([]));
+
+            env.traits.insert(name, trait_.clone());
+
+            for type_ in *types {
+                let ref_type = Type::Reference {
+                    unique: false,
+                    type_: Rc::new(type_.clone()),
+                };
+
+                let functions = ops_and_functions
+                    .iter()
+                    .map(|(op, function)| {
+                        (
+                            env.intern(function),
+                            Abstraction {
+                                parameters: Rc::new([
+                                    Parameter {
+                                        name: self_,
+                                        mutable: false,
+                                        type_: ref_type.clone(),
+                                    },
+                                    Parameter {
+                                        name: other,
+                                        mutable: false,
+                                        type_: ref_type.clone(),
+                                    },
+                                ]),
+                                body: Rc::new(Term::BinaryOp(
+                                    *op,
+                                    Rc::new(Term::UnaryOp(
+                                        UnaryOp::Deref,
+                                        Rc::new(Term::Variable {
+                                            index: 0,
+                                            type_: ref_type.clone(),
+                                        }),
+                                    )),
+                                    Rc::new(Term::UnaryOp(
+                                        UnaryOp::Deref,
+                                        Rc::new(Term::Variable {
+                                            index: 1,
+                                            type_: ref_type.clone(),
+                                        }),
+                                    )),
+                                )),
+                            },
+                        )
+                    })
+                    .collect();
+
+                env.impls.insert(
+                    (type_.clone(), trait_.clone()),
+                    Some(Impl {
+                        arguments: Rc::new([type_.clone()]),
+                        functions: Rc::new(functions),
                     }),
                 );
             }
@@ -714,11 +940,17 @@ impl Env {
 
     fn eval_term(&mut self, term: &Term) -> Result<Literal, EvalException> {
         match term {
-            Term::Let { name, index, term } => {
+            Term::Let {
+                name,
+                mutable,
+                index,
+                term,
+            } => {
                 match index.cmp(&self.bindings.len()) {
                     Ordering::Less => (),
                     Ordering::Equal => self.bindings.push(Binding {
                         name: *name,
+                        mutable: *mutable,
                         term: term.clone(),
                     }),
                     Ordering::Greater => unreachable!(),
@@ -763,9 +995,10 @@ impl Env {
                 let mut parameters = arguments
                     .iter()
                     .zip(parameters.iter())
-                    .map(|(term, (name, _))| {
+                    .map(|(term, Parameter { name, mutable, .. })| {
                         Ok(Binding {
                             name: *name,
+                            mutable: *mutable,
                             term: Some(Rc::new(RefCell::new(BindingTerm {
                                 status: BindingStatus::Evaluated,
                                 term: Term::Literal(self.eval_term(term)?),
@@ -842,6 +1075,8 @@ impl Env {
                         type_: Type::Boolean,
                         value: Rc::new(!*result.value.downcast_ref::<bool>().unwrap()),
                     }),
+
+                    UnaryOp::Deref => todo!(),
                 }
             }
 
@@ -850,26 +1085,59 @@ impl Env {
                 let right = self.eval_term(right)?;
 
                 match left.type_ {
-                    Type::Integer(integer_type) => Ok(Literal {
-                        type_: Type::Integer(integer_type),
-                        value: match op {
-                            BinaryOp::Add => {
-                                integer_binary_op!(add, integer_type, left, right, Rc::new)
-                            }
-                            BinaryOp::Sub => {
-                                integer_binary_op!(sub, integer_type, left, right, Rc::new)
-                            }
-                            BinaryOp::Mul => {
-                                integer_binary_op!(mul, integer_type, left, right, Rc::new)
-                            }
-                            BinaryOp::Div => {
-                                integer_binary_op!(div, integer_type, left, right, Rc::new)
-                            }
-                            BinaryOp::Rem => {
-                                integer_binary_op!(rem, integer_type, left, right, Rc::new)
-                            }
-                            _ => unreachable!(),
+                    Type::Integer(integer_type) => Ok(match op {
+                        BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Div
+                        | BinaryOp::Rem => Literal {
+                            type_: Type::Integer(integer_type),
+                            value: match op {
+                                BinaryOp::Add => {
+                                    integer_binary_op!(add, integer_type, left, right, Rc::new)
+                                }
+                                BinaryOp::Sub => {
+                                    integer_binary_op!(sub, integer_type, left, right, Rc::new)
+                                }
+                                BinaryOp::Mul => {
+                                    integer_binary_op!(mul, integer_type, left, right, Rc::new)
+                                }
+                                BinaryOp::Div => {
+                                    integer_binary_op!(div, integer_type, left, right, Rc::new)
+                                }
+                                BinaryOp::Rem => {
+                                    integer_binary_op!(rem, integer_type, left, right, Rc::new)
+                                }
+                                _ => unreachable!(),
+                            },
                         },
+
+                        BinaryOp::Eq
+                        | BinaryOp::Ge
+                        | BinaryOp::Gt
+                        | BinaryOp::Le
+                        | BinaryOp::Lt => Literal {
+                            type_: Type::Boolean,
+                            value: Rc::new(match op {
+                                BinaryOp::Eq => {
+                                    integer_binary_op!(eq, integer_type, left, right, identity)
+                                }
+                                BinaryOp::Ge => {
+                                    integer_binary_op!(ge, integer_type, left, right, identity)
+                                }
+                                BinaryOp::Gt => {
+                                    integer_binary_op!(gt, integer_type, left, right, identity)
+                                }
+                                BinaryOp::Le => {
+                                    integer_binary_op!(le, integer_type, left, right, identity)
+                                }
+                                BinaryOp::Lt => {
+                                    integer_binary_op!(lt, integer_type, left, right, identity)
+                                }
+                                _ => unreachable!(),
+                            }),
+                        },
+                        _ => unreachable!(),
                     }),
                     _ => unreachable!(),
                 }
@@ -979,6 +1247,7 @@ impl Env {
         match term {
             Term::Let {
                 name,
+                mutable,
                 index,
                 term: binding_term,
             } => {
@@ -986,6 +1255,7 @@ impl Env {
                     Ordering::Less => (),
                     Ordering::Equal => self.bindings.push(Binding {
                         name: *name,
+                        mutable: *mutable,
                         term: binding_term.clone(),
                     }),
                     Ordering::Greater => unreachable!(),
@@ -1008,7 +1278,7 @@ impl Env {
                     };
 
                     if let Some(term) = &binding.term {
-                        if let Term::Phi(terms) = term {
+                        if let Term::Phi(terms) = &RefCell::borrow(term).term {
                             if terms.iter().any(|term| term.is_none()) {
                                 return error();
                             }
@@ -1058,6 +1328,7 @@ impl Env {
                 let (trait_, function) = match op {
                     UnaryOp::Neg => ("Neg", "neg"),
                     UnaryOp::Not => ("Not", "not"),
+                    UnaryOp::Deref => todo!(),
                 };
 
                 let trait_ = self.intern(trait_);
@@ -1076,6 +1347,9 @@ impl Env {
                     (UnaryOp::Neg, Type::Integer(_)) | (UnaryOp::Not, Type::Boolean) => {
                         Term::UnaryOp(*op, Rc::new(term))
                     }
+
+                    (UnaryOp::Deref, _) => todo!(),
+
                     _ => Term::Application {
                         abstraction: impl_.functions.get(&function).unwrap().clone(),
                         arguments: Rc::new([term]),
@@ -1096,6 +1370,16 @@ impl Env {
                             BinaryOp::Mul => ("Mul", "mul"),
                             BinaryOp::Div => ("Div", "div"),
                             BinaryOp::Rem => ("Rem", "rem"),
+                            BinaryOp::AddAssign => ("AddAssign", "add_assign"),
+                            BinaryOp::SubAssign => ("SubAssign", "sub_assign"),
+                            BinaryOp::MulAssign => ("MulAssign", "mul_assign"),
+                            BinaryOp::DivAssign => ("DivAssign", "div_assign"),
+                            BinaryOp::RemAssign => ("RemAssign", "rem_assign"),
+                            BinaryOp::Eq => ("PartialEq", "eq"),
+                            BinaryOp::Ge => ("PartialOrd", "ge"),
+                            BinaryOp::Gt => ("PartialOrd", "gt"),
+                            BinaryOp::Le => ("PartialOrd", "le"),
+                            BinaryOp::Lt => ("PartialOrd", "lt"),
                             _ => unreachable!(),
                         };
 
@@ -1129,39 +1413,104 @@ impl Env {
 
                 let right_type = right.type_();
 
-                // TODO: for this and all other type comparisons, treat Type::Never as a match
-                //
-                // Of course, we'll need to tweak these comparisons even more once we start doing unification,
-                // which will presumably require repeated calls to type_check until we reach a fixed point.
-                if expected_type != right_type {
-                    Err(anyhow!("expected {expected_type:?}, got {right_type:?}"))
-                } else {
-                    let type_ = left.type_();
+                match_types(&expected_type, &right_type)?;
 
-                    Ok(match (op, type_) {
-                        (BinaryOp::And, _) => Term::And(Rc::new(left), Rc::new(right)),
+                let type_ = left.type_();
 
-                        (BinaryOp::Or, _) => Term::Or(Rc::new(left), Rc::new(right)),
+                Ok(match (op, type_) {
+                    (BinaryOp::And, _) => Term::And(Rc::new(left), Rc::new(right)),
 
-                        (
-                            BinaryOp::Add
-                            | BinaryOp::Sub
-                            | BinaryOp::Mul
-                            | BinaryOp::Div
-                            | BinaryOp::Rem,
-                            Type::Integer(_),
-                        ) => Term::BinaryOp(*op, Rc::new(left), Rc::new(right)),
+                    (BinaryOp::Or, _) => Term::Or(Rc::new(left), Rc::new(right)),
 
-                        _ => {
-                            let (impl_, function) = impl_and_function.unwrap();
+                    (
+                        BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Div
+                        | BinaryOp::Rem
+                        | BinaryOp::Eq
+                        | BinaryOp::Ge
+                        | BinaryOp::Gt
+                        | BinaryOp::Le
+                        | BinaryOp::Lt,
+                        Type::Integer(_),
+                    ) => Term::BinaryOp(*op, Rc::new(left), Rc::new(right)),
 
-                            Term::Application {
-                                abstraction: impl_.functions.get(&function).unwrap().clone(),
-                                arguments: Rc::new([left, right]),
-                            }
+                    (
+                        BinaryOp::AddAssign
+                        | BinaryOp::SubAssign
+                        | BinaryOp::MulAssign
+                        | BinaryOp::DivAssign
+                        | BinaryOp::RemAssign,
+                        Type::Integer(_),
+                    ) => Term::Assignment {
+                        left: Rc::new(left.clone()),
+                        right: Rc::new(Term::BinaryOp(
+                            match op {
+                                BinaryOp::AddAssign => BinaryOp::Add,
+                                BinaryOp::SubAssign => BinaryOp::Sub,
+                                BinaryOp::MulAssign => BinaryOp::Mul,
+                                BinaryOp::DivAssign => BinaryOp::Div,
+                                BinaryOp::RemAssign => BinaryOp::Rem,
+                                _ => unreachable!(),
+                            },
+                            Rc::new(left),
+                            Rc::new(right),
+                        )),
+                    },
+
+                    (
+                        BinaryOp::AddAssign
+                        | BinaryOp::SubAssign
+                        | BinaryOp::MulAssign
+                        | BinaryOp::DivAssign
+                        | BinaryOp::RemAssign,
+                        _,
+                    ) => {
+                        let (impl_, function) = impl_and_function.unwrap();
+
+                        Term::Application {
+                            abstraction: impl_.functions.get(&function).unwrap().clone(),
+                            arguments: Rc::new([
+                                Term::Reference {
+                                    unique: true,
+                                    term: Rc::new(left),
+                                },
+                                right,
+                            ]),
                         }
-                    })
-                }
+                    }
+
+                    (
+                        BinaryOp::Eq | BinaryOp::Ge | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Lt,
+                        _,
+                    ) => {
+                        let (impl_, function) = impl_and_function.unwrap();
+
+                        Term::Application {
+                            abstraction: impl_.functions.get(&function).unwrap().clone(),
+                            arguments: Rc::new([
+                                Term::Reference {
+                                    unique: false,
+                                    term: Rc::new(left),
+                                },
+                                Term::Reference {
+                                    unique: false,
+                                    term: Rc::new(right),
+                                },
+                            ]),
+                        }
+                    }
+
+                    _ => {
+                        let (impl_, function) = impl_and_function.unwrap();
+
+                        Term::Application {
+                            abstraction: impl_.functions.get(&function).unwrap().clone(),
+                            arguments: Rc::new([left, right]),
+                        }
+                    }
+                })
             }
 
             Term::Match { scrutinee, arms } => {
@@ -1187,11 +1536,7 @@ impl Env {
 
                         let guard_type = guard.type_();
 
-                        if guard_type != Type::Boolean {
-                            return Err(anyhow!(
-                                "expected boolean pattern guard, got {guard_type:?}"
-                            ));
-                        }
+                        match_types(&Type::Boolean, &guard_type)?;
 
                         Some(guard)
                     } else {
@@ -1208,11 +1553,7 @@ impl Env {
                     let body_type = body.type_();
 
                     if let Some(expected_type) = my_expected_type.as_ref() {
-                        if expected_type != &body_type {
-                            return Err(anyhow!(
-                                "match arm mismatch: expected {expected_type:?}, got {body_type:?}"
-                            ));
-                        }
+                        match_types(expected_type, &body_type)?
                     }
 
                     my_expected_type.get_or_insert(body_type);
@@ -1236,15 +1577,11 @@ impl Env {
                 if let Term::Variable { index, .. } = left.deref() {
                     let index = *index;
 
-                    let expected_type = if self.bindings[index].term.is_none() {
-                        None
-                    } else if let Term::Variable { type_, .. } = self.type_check(left, None)? {
-                        // TODO: check mutability, and only allow assignment to immutable bindings which have not
-                        // been initialized in any branch.
-                        Some(type_)
-                    } else {
-                        unreachable!();
-                    };
+                    let expected_type = self.type_check_binding_index(index, None)?;
+
+                    if expected_type.is_some() && !self.bindings[index].mutable {
+                        return Err(anyhow!("invalid assignment to immutable variable"));
+                    }
 
                     let right = self.type_check(right, expected_type.as_ref())?;
 
@@ -1253,11 +1590,7 @@ impl Env {
                     // TODO: check binding type ascription, if present
 
                     if let Some(expected_type) = expected_type {
-                        if expected_type != right_type {
-                            return Err(anyhow!(
-                                "invalid assignment: expected {expected_type:?}, got {right_type:?}"
-                            ));
-                        }
+                        match_types(&expected_type, &right_type)?;
                     }
 
                     self.bindings[index].term = Some(Rc::new(RefCell::new(BindingTerm {
@@ -1301,28 +1634,9 @@ impl Env {
             }
 
             Term::Phi(terms) => {
-                let mut my_expected_type = None;
+                self.type_check_phi(terms, expected_type)?;
 
-                if terms.iter().all(|term| term.is_some()) {
-                    for term in terms.iter() {
-                        let type_ = self.type_check_binding(
-                            term.unwrap(),
-                            my_expected_type.as_ref().or(expected_type),
-                        )?;
-
-                        if let Some(expected_type) = my_expected_type.as_ref() {
-                            if expected_type != &type_ {
-                                return Err(anyhow!(
-                                "inconsistent type assignments: expected {expected_type:?}, got {type_:?}"
-                            ));
-                            }
-                        }
-
-                        my_expected_type.get_or_insert(type_);
-                    }
-                }
-
-                Ok(Term::Literal(self.unit.clone()))
+                Ok(Term::Phi(terms.clone()))
             }
 
             Term::Loop { label, body, .. } => {
@@ -1388,11 +1702,7 @@ impl Env {
                                 type_ => Some(type_.clone()),
                             })
                     {
-                        let actual_type = term.type_();
-
-                        if expected_type != actual_type {
-                            return Err(anyhow!("expected {expected_type:?}, got {actual_type:?}"));
-                        }
+                        match_types(&expected_type, &term.type_())?;
                     }
 
                     loop_.break_terms.push(term.clone());
@@ -1419,6 +1729,39 @@ impl Env {
 
             _ => Err(anyhow!("type checking not yet supported for term {term:?}")),
         }
+    }
+
+    fn type_check_phi(
+        &mut self,
+        terms: &[Option<Rc<RefCell<BindingTerm>>>],
+        expected_type: Option<&Type>,
+    ) -> Result<Option<Type>> {
+        let mut my_expected_type = None;
+
+        for term in terms.iter().filter_map(|term| term.as_ref()) {
+            let type_ =
+                self.type_check_binding(term, my_expected_type.as_ref().or(expected_type))?;
+
+            if let Some(expected_type) = my_expected_type.as_ref() {
+                match_types(expected_type, &type_)?;
+            }
+
+            my_expected_type.get_or_insert(type_);
+        }
+
+        Ok(my_expected_type)
+    }
+
+    fn type_check_binding_index(
+        &mut self,
+        index: usize,
+        expected_type: Option<&Type>,
+    ) -> Result<Option<Type>> {
+        Ok(if let Some(term) = self.bindings[index].term.clone() {
+            Some(self.type_check_binding(&term, expected_type)?)
+        } else {
+            None
+        })
     }
 
     fn type_check_binding(
@@ -1481,17 +1824,12 @@ impl Env {
 
     // Does this need to be a method of Env, or can we move it to Pattern?
     fn type_check_pattern(&mut self, pattern: &Pattern, expected_type: &Type) -> Result<()> {
-        let actual_type = match pattern {
-            Pattern::Literal(literal) => &literal.type_,
-        };
-
-        if expected_type == actual_type {
-            Ok(())
-        } else {
-            Err(anyhow!(
-                "match arm mismatch: expected {expected_type:?}, got {actual_type:?}"
-            ))
-        }
+        match_types(
+            expected_type,
+            match pattern {
+                Pattern::Literal(literal) => &literal.type_,
+            },
+        )
     }
 
     fn stmt_to_term(&mut self, stmt: &Stmt) -> Result<Term> {
@@ -1511,8 +1849,6 @@ impl Env {
                         }) => {
                             if by_ref.is_some() {
                                 Err(anyhow!("ref patterns not yet supported"))
-                            } else if mutability.is_some() {
-                                Err(anyhow!("mut patterns not yet supported"))
                             } else {
                                 let name = self.intern(&ident.to_string());
 
@@ -1529,11 +1865,13 @@ impl Env {
 
                                 self.bindings.push(Binding {
                                     name,
+                                    mutable: mutability.is_some(),
                                     term: term.clone(),
                                 });
 
                                 Ok(Term::Let {
                                     name,
+                                    mutable: mutability.is_some(),
                                     index: self.bindings.len() - 1,
                                     term,
                                 })
@@ -1680,6 +2018,11 @@ impl Env {
                             BinOp::Mul(_) => BinaryOp::Mul,
                             BinOp::Div(_) => BinaryOp::Div,
                             BinOp::Rem(_) => BinaryOp::Rem,
+                            BinOp::Eq(_) => BinaryOp::Eq,
+                            BinOp::Ge(_) => BinaryOp::Ge,
+                            BinOp::Gt(_) => BinaryOp::Gt,
+                            BinOp::Le(_) => BinaryOp::Le,
+                            BinOp::Lt(_) => BinaryOp::Lt,
                             _ => return Err(anyhow!("operation not yet supported: {op:?}")),
                         },
                         left,
@@ -1791,6 +2134,30 @@ impl Env {
                         left: Rc::new(self.expr_to_term(left)?),
                         right: Rc::new(self.expr_to_term(right)?),
                     })
+                }
+            }
+
+            Expr::AssignOp(ExprAssignOp {
+                left,
+                op,
+                right,
+                attrs,
+            }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else {
+                    Ok(Term::BinaryOp(
+                        match op {
+                            BinOp::AddEq(_) => BinaryOp::AddAssign,
+                            BinOp::SubEq(_) => BinaryOp::SubAssign,
+                            BinOp::MulEq(_) => BinaryOp::MulAssign,
+                            BinOp::DivEq(_) => BinaryOp::DivAssign,
+                            BinOp::RemEq(_) => BinaryOp::RemAssign,
+                            _ => return Err(anyhow!("operation not yet supported: {op:?}")),
+                        },
+                        Rc::new(self.expr_to_term(left)?),
+                        Rc::new(self.expr_to_term(right)?),
+                    ))
                 }
             }
 
@@ -1916,6 +2283,29 @@ mod test {
     }
 
     #[test]
+    fn assignment_to_mutable() {
+        assert_eq!(7_i32, eval("{ let mut x = 27; x = 7; x }").unwrap())
+    }
+
+    #[test]
+    fn conditional_assignment_to_mutable() {
+        assert_eq!(
+            7_i32,
+            eval("{ let mut x; if true { x = 27 } x = 7; x }").unwrap()
+        )
+    }
+
+    #[test]
+    fn bad_assignment_to_immutable() {
+        assert!(eval::<()>("{ let x = 27; x = 7; x }").is_err())
+    }
+
+    #[test]
+    fn bad_conditional_assignment_to_immutable() {
+        assert!(eval::<()>("{ let x; if true { x = 27 } x = 7; x }").is_err())
+    }
+
+    #[test]
     fn minimal_loop() {
         assert_eq!(9_i32, eval("loop { break 9 }").unwrap())
     }
@@ -1941,5 +2331,13 @@ mod test {
     #[test]
     fn bad_loop_initialization() {
         assert!(eval::<()>("{ let x; loop { break; x = 81 } x }").is_err())
+    }
+
+    #[test]
+    fn loop_a_few_times() {
+        assert_eq!(
+            11_i32,
+            eval("{ let mut x = 0; loop { if x > 10 { break } x += 1; } x }").unwrap()
+        )
     }
 }
