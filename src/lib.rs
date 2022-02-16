@@ -20,8 +20,8 @@ use {
     },
     syn::{
         BinOp, Block, Expr, ExprAssign, ExprAssignOp, ExprBinary, ExprBlock, ExprBreak, ExprIf,
-        ExprLit, ExprLoop, ExprParen, ExprPath, ExprUnary, Lit, LitBool, Local, Pat, PatIdent,
-        Path, PathArguments, PathSegment, Stmt, UnOp,
+        ExprLit, ExprLoop, ExprParen, ExprPath, ExprReference, ExprUnary, Lit, LitBool, Local, Pat,
+        PatIdent, Path, PathArguments, PathSegment, Stmt, UnOp,
     },
 };
 
@@ -297,6 +297,14 @@ macro_rules! integer_suffix_op {
     };
 }
 
+impl ToBytes for () {
+    type Bytes = [u8; 0];
+
+    fn to_bytes(self) -> Self::Bytes {
+        []
+    }
+}
+
 impl ToBytes for bool {
     type Bytes = [u8; 1];
 
@@ -347,9 +355,12 @@ struct Identifier(usize);
 #[derive(Clone, Hash, Eq, PartialEq, Copy, Debug)]
 struct Lifetime(Identifier);
 
-// TODO: will need more fields here for associated types, functions, etc.
+// todo: will need more fields here for associated types, functions, etc.
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
-struct Trait(Identifier, Rc<[Type]>);
+struct Trait {
+    name: Identifier,
+    parameters: Rc<[Type]>,
+}
 
 #[derive(Clone, Debug)]
 struct Impl {
@@ -374,7 +385,7 @@ enum Type {
     Tuple(Rc<[Type]>),
     Pointer(Rc<Type>),
     Reference {
-        // TODO: add lifetime field
+        // todo: add lifetime field
         unique: bool,
         type_: Rc<Type>,
     },
@@ -385,6 +396,16 @@ enum Type {
         ret: Rc<Type>,
     },
     Nominal(Identifier, Rc<[Type]>, Rc<[Lifetime]>),
+}
+
+impl Type {
+    fn at(&self, path: &[Identifier]) -> Type {
+        if path.is_empty() {
+            self.clone()
+        } else {
+            todo!()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -421,7 +442,7 @@ impl fmt::Display for Literal {
 
             Type::Unit => write!(f, "()"),
 
-            _ => write!(f, "TODO: Debug for {:?}", self.type_),
+            _ => write!(f, "todo: Debug for {:?}", self.type_),
         }
     }
 }
@@ -463,7 +484,7 @@ struct Parameter {
 
 #[derive(Clone, Debug)]
 struct Abstraction {
-    // TODO: support type and lifetime parameters.
+    // todo: support type and lifetime parameters.
     parameters: Rc<[Parameter]>,
     body: Rc<Term>,
 }
@@ -471,7 +492,7 @@ struct Abstraction {
 #[derive(Clone, Debug)]
 enum Pattern {
     Literal(Literal),
-    // TODO: support other patterns
+    // todo: support other patterns
 }
 
 #[derive(Clone, Debug)]
@@ -482,15 +503,18 @@ struct MatchArm {
 }
 
 #[derive(Clone, Debug)]
+struct Reference {
+    // todo: add lifetime field
+    unique: bool,
+    path: Rc<[Identifier]>,
+    term: Rc<RefCell<BindingTerm>>,
+}
+
+#[derive(Clone, Debug)]
 enum Term {
     Block(Rc<[Term]>),
     Literal(Literal),
-    Reference {
-        // TODO: add lifetime field
-        unique: bool,
-        // TODO: this should be something like a Weak<RefCell<BindingTerm>> plus a usize offset
-        term: Rc<Term>,
-    },
+    Reference(Reference),
     Let {
         name: Identifier,
         mutable: bool,
@@ -507,7 +531,7 @@ enum Term {
         right: Rc<Term>,
     },
     Application {
-        // TODO: support type and lifetime arguments.
+        // todo: support type and lifetime arguments.
         abstraction: Abstraction,
         arguments: Rc<[Term]>,
     },
@@ -544,13 +568,22 @@ impl Term {
         match self {
             Self::Block(terms) => terms.last().map(|term| term.type_()).unwrap_or(Type::Unit),
             Self::Literal(literal) => literal.type_.clone(),
-            // TODO: the return type of an abstraction may be a function of its type parameters
+            // todo: the return type of an abstraction may be a function of its type parameters
             Self::Application {
                 abstraction: Abstraction { body, .. },
                 ..
             } => body.type_(),
             Self::And { .. } | Self::Or { .. } => Type::Boolean,
-            Self::UnaryOp(_, term) => term.type_(),
+            Self::UnaryOp(op, term) => match op {
+                UnaryOp::Neg | UnaryOp::Not => term.type_(),
+                UnaryOp::Deref => {
+                    if let Term::Reference(Reference { path, term, .. }) = term.deref() {
+                        RefCell::borrow(term).term.type_().at(path)
+                    } else {
+                        unreachable!()
+                    }
+                }
+            },
             Self::BinaryOp(op, term, _) => match op {
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
                     term.type_()
@@ -569,6 +602,10 @@ impl Term {
                     .term
                     .type_()
             }
+            Self::Reference(Reference { path, term, unique }) => Type::Reference {
+                unique: *unique,
+                type_: Rc::new(RefCell::borrow(term).term.type_().at(path)),
+            },
             _ => todo!("Term::type_ for {self:?}"),
         }
     }
@@ -662,14 +699,38 @@ impl BranchContext {
     }
 }
 
+#[derive(Debug, Clone)]
+enum EvalTerm {
+    Value(Literal),
+    Reference(Reference),
+    Deref(Reference),
+}
+
+impl EvalTerm {
+    fn rvalue(&self) -> Literal {
+        match self {
+            Self::Value(literal) => literal.clone(),
+            Self::Deref(Reference { term, .. }) => {
+                // todo: use path
+                if let Term::Literal(literal) = &RefCell::borrow(term).term {
+                    literal.clone()
+                } else {
+                    unreachable!()
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum EvalException {
     Break {
         label: Option<Identifier>,
-        result: Literal,
+        result: EvalTerm,
     },
     Return {
-        result: Literal,
+        result: EvalTerm,
     },
 }
 
@@ -707,7 +768,7 @@ impl fmt::Display for Eval {
 }
 
 fn match_types(expected: &Type, actual: &Type) -> Result<()> {
-    // TODO: this will need to be refined once we start doing unification, and we'll probably need to move this
+    // todo: this will need to be refined once we start doing unification, and we'll probably need to move this
     // function into Env's impl
 
     if expected != &Type::Never && actual != &Type::Never && expected != actual {
@@ -747,20 +808,20 @@ impl Env {
             traits: HashMap::new(),
             impls: HashMap::new(),
             unit: Literal {
-                value: Rc::new([]),
+                value: ().to_rc(),
                 type_: Type::Unit,
             },
             true_: Literal {
-                value: Rc::new([1]),
+                value: true.to_rc(),
                 type_: Type::Boolean,
             },
             false_: Literal {
-                value: Rc::new([0]),
+                value: false.to_rc(),
                 type_: Type::Boolean,
             },
         };
 
-        // TODO: should load traits and impls from core/std source files
+        // todo: should load traits and impls from core/std source files (lazily if appropriate)
 
         let self_ = env.intern("self");
         let other = env.intern("other");
@@ -780,12 +841,17 @@ impl Env {
         let unaries = &[
             (UnaryOp::Neg, "Neg", "neg", &signed as &[Type]),
             (UnaryOp::Not, "Not", "not", &[Type::Boolean]),
+            (UnaryOp::Not, "Deref", "deref", &[]),
+            (UnaryOp::Not, "DerefMut", "deref_mut", &[]),
         ];
 
         for (op, name, function, types) in unaries {
             let name = env.intern(name);
             let function = env.intern(function);
-            let trait_ = Trait(name, Rc::new([]));
+            let trait_ = Trait {
+                name,
+                parameters: Rc::new([]),
+            };
 
             env.traits.insert(name, trait_.clone());
 
@@ -844,7 +910,10 @@ impl Env {
         for (op, name, function, types) in binaries {
             let name = env.intern(name);
             let function = env.intern(function);
-            let trait_ = Trait(name, Rc::new([]));
+            let trait_ = Trait {
+                name,
+                parameters: Rc::new([]),
+            };
 
             env.traits.insert(name, trait_.clone());
 
@@ -896,7 +965,10 @@ impl Env {
         for (op, name, function, types) in assignments {
             let name = env.intern(name);
             let function = env.intern(function);
-            let trait_ = Trait(name, Rc::new([]));
+            let trait_ = Trait {
+                name,
+                parameters: Rc::new([]),
+            };
 
             env.traits.insert(name, trait_.clone());
 
@@ -970,7 +1042,10 @@ impl Env {
 
         for (name, ops_and_functions, types) in comparisons {
             let name = env.intern(name);
-            let trait_ = Trait(name, Rc::new([]));
+            let trait_ = Trait {
+                name,
+                parameters: Rc::new([]),
+            };
 
             env.traits.insert(name, trait_.clone());
 
@@ -1054,7 +1129,7 @@ impl Env {
 
         info!("{stmt:#?}");
 
-        // TODO: convert stmt to a term (if it's an expression), then typecheck it, then lower it to something
+        // todo: convert stmt to a term (if it's an expression), then typecheck it, then lower it to something
         // MIR-like, then borrow-check it, then evaluate it.
         //
         // If it's not an expression (i.e. it's an item), update the relevant symbol tables.  If it's an item with
@@ -1078,7 +1153,7 @@ impl Env {
         };
 
         Ok(Eval {
-            value,
+            value: value.rvalue(), // todo: handle references gracefully
             new_term_bindings: self.bindings[binding_count..]
                 .iter()
                 .map(|binding| {
@@ -1114,17 +1189,73 @@ impl Env {
         if let Some(result) = self.impls.get(&(type_.clone(), trait_.clone())) {
             result.clone()
         } else {
-            // TODO: any exact-match impls should already be in impls, so if we reach here then either the type
-            // doesn't implement the trait or there's a matching polymorphic impl we need to find, monomorphize,
-            // and add to impls.
+            let impl_ = self.get_blanket_impl(type_, trait_);
 
-            self.impls.insert((type_.clone(), trait_.clone()), None);
+            self.impls
+                .insert((type_.clone(), trait_.clone()), impl_.clone());
 
-            None
+            impl_
         }
     }
 
-    fn eval_term(&mut self, term: &Term) -> Result<Literal, EvalException> {
+    fn get_blanket_impl(&mut self, type_: &Type, trait_: &Trait) -> Option<Impl> {
+        if let Type::Reference { unique, .. } = type_ {
+            if trait_.name == self.intern("Deref") {
+                let self_type = Type::Reference {
+                    unique: true,
+                    type_: Rc::new(type_.clone()),
+                };
+
+                let function = self.intern("deref");
+
+                let abstraction = Abstraction {
+                    parameters: Rc::new([Parameter {
+                        name: self.intern("self"),
+                        mutable: false,
+                        type_: self_type.clone(),
+                    }]),
+                    body: Rc::new(Term::Variable {
+                        index: 0,
+                        type_: self_type,
+                    }),
+                };
+
+                return Some(Impl {
+                    arguments: Rc::new([]),
+                    functions: Rc::new(hashmap![function => abstraction]),
+                });
+            } else if trait_.name == self.intern("DerefMut") {
+                let self_type = Type::Reference {
+                    unique: true,
+                    type_: Rc::new(type_.clone()),
+                };
+
+                let function = self.intern("deref_mut");
+
+                let abstraction = Abstraction {
+                    parameters: Rc::new([Parameter {
+                        name: self.intern("self"),
+                        mutable: false,
+                        type_: self_type.clone(),
+                    }]),
+                    body: Rc::new(Term::Variable {
+                        index: 0,
+                        type_: self_type,
+                    }),
+                };
+
+                return Some(Impl {
+                    arguments: Rc::new([]),
+                    functions: Rc::new(hashmap![function => abstraction]),
+                });
+            }
+        }
+
+        // todo: search for matching blanket impl and, if found, monomophize it and return the result.
+        None
+    }
+
+    fn eval_term(&mut self, term: &Term) -> Result<EvalTerm, EvalException> {
         match term {
             Term::Let {
                 name,
@@ -1154,7 +1285,7 @@ impl Env {
                     };
                 }
 
-                Ok(self.unit.clone())
+                Ok(EvalTerm::Value(self.unit.clone()))
             }
 
             Term::Variable { index, .. } => {
@@ -1203,24 +1334,40 @@ impl Env {
             }
 
             Term::And(left, right) => {
-                if u8::from_ne_bytes(self.eval_term(left)?.value.deref().try_into().unwrap()) != 0 {
+                if u8::from_ne_bytes(
+                    self.eval_term(left)?
+                        .rvalue()
+                        .value
+                        .deref()
+                        .try_into()
+                        .unwrap(),
+                ) != 0
+                {
                     self.eval_term(right)
                 } else {
-                    Ok(Literal {
-                        value: Rc::new([0]),
+                    Ok(EvalTerm::Value(Literal {
+                        value: false.to_rc(),
                         type_: Type::Boolean,
-                    })
+                    }))
                 }
             }
 
             Term::Or(left, right) => {
-                if u8::from_ne_bytes(self.eval_term(left)?.value.deref().try_into().unwrap()) == 0 {
+                if u8::from_ne_bytes(
+                    self.eval_term(left)?
+                        .rvalue()
+                        .value
+                        .deref()
+                        .try_into()
+                        .unwrap(),
+                ) == 0
+                {
                     self.eval_term(right)
                 } else {
-                    Ok(Literal {
-                        value: Rc::new([1]),
+                    Ok(EvalTerm::Value(Literal {
+                        value: true.to_rc(),
                         type_: Type::Boolean,
-                    })
+                    }))
                 }
             }
 
@@ -1232,27 +1379,31 @@ impl Env {
                 let result = self.eval_term(term)?;
 
                 match op {
-                    UnaryOp::Neg => match result.type_ {
-                        Type::Integer(integer_type) => Ok(Literal {
-                            type_: Type::Integer(integer_type),
-                            value: integer_signed_op!(neg, integer_type, &result.value),
-                        }),
+                    UnaryOp::Neg => {
+                        let result = result.rvalue();
 
-                        _ => unreachable!(),
-                    },
+                        match result.type_ {
+                            Type::Integer(integer_type) => Ok(Literal {
+                                type_: Type::Integer(integer_type),
+                                value: integer_signed_op!(neg, integer_type, &result.value),
+                            }),
+
+                            _ => unreachable!(),
+                        }
+                    }
 
                     UnaryOp::Not => Ok(Literal {
                         type_: Type::Boolean,
-                        value: Rc::new([
-                            if u8::from_ne_bytes(result.value.deref().try_into().unwrap()) != 0 {
-                                0
-                            } else {
-                                1
-                            },
-                        ]),
+                        value: (!bool::from_bytes(&result.rvalue().value)).to_rc(),
                     }),
 
-                    UnaryOp::Deref => todo!(),
+                    UnaryOp::Deref => {
+                        if let EvalTerm::Reference(reference) = result {
+                            Ok(EvalTerm::Deref(reference))
+                        } else {
+                            unreachable!()
+                        }
+                    }
                 }
             }
 
@@ -1261,7 +1412,7 @@ impl Env {
                 let right = self.eval_term(right)?;
 
                 match left.type_ {
-                    Type::Integer(integer_type) => Ok(match op {
+                    Type::Integer(integer_type) => Ok(EvalTerm::Value(match op {
                         BinaryOp::Add
                         | BinaryOp::Sub
                         | BinaryOp::Mul
@@ -1277,21 +1428,16 @@ impl Env {
                         | BinaryOp::Le
                         | BinaryOp::Lt => Literal {
                             type_: Type::Boolean,
-                            value: Rc::new([
-                                if integer_comparison_ops!(
-                                    op,
-                                    integer_type,
-                                    &left.value,
-                                    &right.value
-                                ) {
-                                    1
-                                } else {
-                                    0
-                                },
-                            ]),
+                            value: integer_comparison_ops!(
+                                op,
+                                integer_type,
+                                &left.value,
+                                &right.value
+                            )
+                            .to_rc(),
                         },
                         _ => unreachable!(),
-                    }),
+                    })),
                     _ => unreachable!(),
                 }
             }
@@ -1301,11 +1447,16 @@ impl Env {
 
                 for arm in arms.iter() {
                     if self.match_pattern(&arm.pattern, &scrutinee) {
-                        // TODO: push and pop pattern bindings
+                        // todo: push and pop pattern bindings
 
                         let match_guard = if let Some(guard) = &arm.guard {
                             u8::from_ne_bytes(
-                                self.eval_term(guard)?.value.deref().try_into().unwrap(),
+                                self.eval_term(guard)?
+                                    .rvalue()
+                                    .value
+                                    .deref()
+                                    .try_into()
+                                    .unwrap(),
                             ) != 0
                         } else {
                             true
@@ -1323,15 +1474,24 @@ impl Env {
             }
 
             Term::Assignment { left, right } => {
+                let right = BindingTerm {
+                    status: BindingStatus::Evaluated,
+                    term: Term::Literal(self.eval_term(right)?.rvalue()),
+                };
+
                 if let Term::Variable { index, .. } = left.deref() {
-                    let right = self.eval_term(right)?;
+                    let term = &mut self.bindings[*index].term;
 
-                    self.bindings[*index].term = Some(Rc::new(RefCell::new(BindingTerm {
-                        status: BindingStatus::Evaluated,
-                        term: Term::Literal(right),
-                    })));
+                    if let Some(term) = term {
+                        *RefCell::borrow_mut(term) = right;
+                    } else {
+                        *term = Some(Rc::new(RefCell::new(right)));
+                    }
 
-                    Ok(self.unit.clone())
+                    Ok(EvalTerm::Value(self.unit.clone()))
+                } else if let EvalTerm::Deref(Reference { term, .. }) = self.eval_term(left)? {
+                    // todo: use path
+                    *RefCell::borrow_mut(term) = right;
                 } else {
                     todo!("assignment to {left:?}")
                 }
@@ -1459,9 +1619,7 @@ impl Env {
                         },
 
                         _ => Literal {
-                            value: Rc::new(
-                                str::from_utf8(value).unwrap().parse::<i32>()?.to_bytes(),
-                            ),
+                            value: str::from_utf8(value).unwrap().parse::<i32>()?.to_rc(),
                             type_: Type::Integer(Integer::I32),
                         },
                     }
@@ -1481,7 +1639,7 @@ impl Env {
                 let (trait_, function) = match op {
                     UnaryOp::Neg => ("Neg", "neg"),
                     UnaryOp::Not => ("Not", "not"),
-                    UnaryOp::Deref => todo!(),
+                    UnaryOp::Deref => ("Deref", "deref"),
                 };
 
                 let trait_ = self.intern(trait_);
@@ -1497,11 +1655,17 @@ impl Env {
                 let type_ = term.type_();
 
                 Ok(match (op, type_) {
-                    (UnaryOp::Neg, Type::Integer(_)) | (UnaryOp::Not, Type::Boolean) => {
-                        Term::UnaryOp(*op, Rc::new(term))
-                    }
+                    (UnaryOp::Neg, Type::Integer(_))
+                    | (UnaryOp::Not, Type::Boolean)
+                    | (UnaryOp::Deref, Type::Reference { .. }) => Term::UnaryOp(*op, Rc::new(term)),
 
-                    (UnaryOp::Deref, _) => todo!(),
+                    (UnaryOp::Deref, _) => Term::UnaryOp(
+                        *op,
+                        Rc::new(Term::Application {
+                            abstraction: impl_.functions.get(&function).unwrap().clone(),
+                            arguments: Rc::new([self.shared_reference(term)]),
+                        }),
+                    ),
 
                     _ => Term::Application {
                         abstraction: impl_.functions.get(&function).unwrap().clone(),
@@ -1624,13 +1788,7 @@ impl Env {
 
                         Term::Application {
                             abstraction: impl_.functions.get(&function).unwrap().clone(),
-                            arguments: Rc::new([
-                                Term::Reference {
-                                    unique: true,
-                                    term: Rc::new(left),
-                                },
-                                right,
-                            ]),
+                            arguments: Rc::new([self.unique_reference(&left)?, right]),
                         }
                     }
 
@@ -1643,14 +1801,8 @@ impl Env {
                         Term::Application {
                             abstraction: impl_.functions.get(&function).unwrap().clone(),
                             arguments: Rc::new([
-                                Term::Reference {
-                                    unique: false,
-                                    term: Rc::new(left),
-                                },
-                                Term::Reference {
-                                    unique: false,
-                                    term: Rc::new(right),
-                                },
+                                self.shared_reference(&left)?,
+                                self.shared_reference(&right)?,
                             ]),
                         }
                     }
@@ -1677,12 +1829,12 @@ impl Env {
 
                 let mut typed_arms = Vec::with_capacity(arms.len());
 
-                // TODO: exhaustiveness check
+                // todo: exhaustiveness check
 
                 for arm in arms.iter() {
                     self.type_check_pattern(&arm.pattern, &scrutinee_type)?;
 
-                    // TODO: push and pop pattern bindings
+                    // todo: push and pop pattern bindings
 
                     let guard = if let Some(guard) = &arm.guard {
                         let guard = self.type_check(guard, Some(&Type::Boolean))?;
@@ -1727,6 +1879,10 @@ impl Env {
             }
 
             Term::Assignment { left, right } => {
+                let right = self.type_check(right, expected_type.as_ref())?;
+
+                let right_type = right.type_();
+
                 if let Term::Variable { index, .. } = left.deref() {
                     let index = *index;
 
@@ -1736,11 +1892,7 @@ impl Env {
                         return Err(anyhow!("invalid assignment to immutable variable"));
                     }
 
-                    let right = self.type_check(right, expected_type.as_ref())?;
-
-                    let right_type = right.type_();
-
-                    // TODO: check binding type ascription, if present
+                    // todo: check binding type ascription, if present
 
                     if let Some(expected_type) = expected_type {
                         match_types(&expected_type, &right_type)?;
@@ -1758,6 +1910,25 @@ impl Env {
                         }),
                         right: Rc::new(right),
                     })
+                } else if let Term::UnaryOp(UnaryOp::Deref, left) = self.type_check(left, None)? {
+                    if let Type::Reference {
+                        unique,
+                        type_: expected_type,
+                    } = left.type_()
+                    {
+                        if unique {
+                            match_types(&expected_type, &right_type)?;
+
+                            Ok(Term::Assignment {
+                                left: Rc::new(Term::UnaryOp(UnaryOp::Deref, left)),
+                                right: Rc::new(right),
+                            })
+                        } else {
+                            Err(anyhow!("cannot assign to shared reference"))
+                        }
+                    } else {
+                        unreachable!()
+                    }
                 } else {
                     todo!("assignment to {left:?}")
                 }
@@ -1777,7 +1948,7 @@ impl Env {
                     Ok(())
                 };
 
-                // TODO: check for bound values which implement Drop and insert the appropriate calls
+                // todo: check for bound values which implement Drop and insert the appropriate calls
 
                 self.bindings.truncate(binding_count);
 
@@ -1880,8 +2051,78 @@ impl Env {
                 todo!()
             }
 
+            Term::Reference(Reference { unique, term, .. }) => {
+                let term = self.type_check(
+                    term,
+                    expected_type.and_then(|expected| {
+                        if let Type::Reference { type_, .. } = expected {
+                            Some(type_)
+                        } else {
+                            None
+                        }
+                    }),
+                );
+
+                Ok(if unique {
+                    self.unique_reference(&term)
+                } else {
+                    self.shared_reference(&term)
+                })
+            }
+
             _ => Err(anyhow!("type checking not yet supported for term {term:?}")),
         }
+    }
+
+    fn unique_reference(&self, term: &Term) -> Result<Term> {
+        Ok(Term::Reference(Reference {
+            unique: true,
+            path: Rc::new([]),
+            term: match term {
+                Term::Variable { index, .. } => {
+                    let binding = &self.bindings[*index];
+
+                    if let Some(term) = &binding.term {
+                        term.clone()
+                    } else {
+                        return Err(anyhow!(
+                            "attempt to reference uninitialized variable: {}",
+                            self.unintern(binding.name)
+                        ));
+                    }
+                }
+
+                // todo: field, slice, dyn references, etc.
+                _ => return Err(anyhow!("cannot reference {term:?}")),
+            },
+        }))
+    }
+
+    fn shared_reference(&self, term: &Term) -> Result<Term> {
+        Ok(Term::Reference(Reference {
+            unique: false,
+            path: Rc::new([]),
+            term: match term {
+                Term::Variable { index, .. } => {
+                    let binding = &self.bindings[*index];
+
+                    if let Some(term) = &binding.term {
+                        term.clone()
+                    } else {
+                        return Err(anyhow!(
+                            "attempt to reference uninitialized variable: {}",
+                            self.unintern(binding.name)
+                        ));
+                    }
+                }
+
+                // todo: field, slice, dyn references, etc.
+                _ => Rc::new(RefCell::new(BindingTerm {
+                    status: BindingStatus::Typed,
+                    term: term.clone(),
+                })),
+            },
+        }))
     }
 
     fn type_check_phi(
@@ -2067,7 +2308,7 @@ impl Env {
                         },
 
                         Lit::Bool(LitBool { value, .. }) => Ok(Term::Literal(Literal {
-                            value: Rc::new([if *value { 1 } else { 0 }]),
+                            value: (*value).to_rc(),
                             type_: Type::Boolean,
                         })),
 
@@ -2086,6 +2327,7 @@ impl Env {
                         match op {
                             UnOp::Neg(_) => UnaryOp::Neg,
                             UnOp::Not(_) => UnaryOp::Not,
+                            UnOp::Deref(_) => UnaryOp::Deref,
                             _ => return Err(anyhow!("operation not yet supported: {op:?}")),
                         },
                         term,
@@ -2296,6 +2538,25 @@ impl Env {
                 }
             }
 
+            Expr::Reference(ExprReference {
+                mutability,
+                expr,
+                attrs,
+            }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else {
+                    Ok(Term::Reference(Reference {
+                        unique: mutability.is_some(),
+                        path: Rc::new([]),
+                        term: Rc::new(RefCell::new(BindingTerm {
+                            status: BindingStatus::Untyped,
+                            term: self.expr_to_term(expr),
+                        })),
+                    }))
+                }
+            }
+
             _ => Err(anyhow!("expr not yet supported: {expr:?}")),
         }
     }
@@ -2429,6 +2690,19 @@ mod test {
         assert_eq!(
             11_i32,
             eval("{ let mut x = 0; loop { if x > 10 { break } x += 1; } x }").unwrap()
+        )
+    }
+
+    #[test]
+    fn shared_reference() {
+        assert_eq!(4_i32, eval("*&4").unwrap())
+    }
+
+    #[test]
+    fn unique_reference() {
+        assert_eq!(
+            46_i32,
+            eval("let mut x = 0; ({ let y = &mut x; *y = 23; *y }) + x").unwrap()
         )
     }
 }
