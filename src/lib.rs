@@ -6,14 +6,17 @@ use {
     log::info,
     maplit::hashmap,
     std::{
-        any::Any,
+        any,
         cell::RefCell,
         cmp::Ordering,
         collections::HashMap,
-        convert::identity,
-        fmt, mem,
-        ops::{Add, Deref, Div, Mul, Rem, Sub},
+        error,
+        fmt::{self, Display},
+        mem,
+        ops::{Add, Deref, Div, Mul, Neg, Rem, Sub},
         rc::Rc,
+        str,
+        str::FromStr,
     },
     syn::{
         BinOp, Block, Expr, ExprAssign, ExprAssignOp, ExprBinary, ExprBlock, ExprBreak, ExprIf,
@@ -21,6 +24,286 @@ use {
         Path, PathArguments, PathSegment, Stmt, UnOp,
     },
 };
+
+trait FromBytes {
+    fn from_bytes(bytes: &[u8]) -> Self;
+}
+
+impl FromBytes for () {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        assert!(bytes.is_empty());
+    }
+}
+
+macro_rules! integer_from_bytes {
+    ($($type:ident),+) => {
+        $(impl FromBytes for $type {
+            fn from_bytes(bytes: &[u8]) -> Self {
+                Self::from_ne_bytes(bytes.try_into().unwrap())
+            }
+        })+
+    }
+}
+
+integer_from_bytes!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize);
+
+impl FromBytes for bool {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        u8::from_ne_bytes(bytes.try_into().unwrap()) != 0
+    }
+}
+
+trait ToBytes: Sized {
+    type Bytes: AsRef<[u8]>;
+
+    fn to_bytes(self) -> Self::Bytes;
+
+    fn to_rc(self) -> Rc<[u8]> {
+        Rc::from(self.to_bytes().as_ref())
+    }
+}
+
+macro_rules! integer_to_bytes {
+    ($($type:ident),+) => {
+        $(impl ToBytes for $type {
+            type Bytes = [u8; mem::size_of::<Self>()];
+
+            fn to_bytes(self) -> Self::Bytes {
+                self.to_ne_bytes()
+            }
+        })+
+    }
+}
+
+integer_to_bytes!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize);
+
+macro_rules! integer_op_cases {
+    ($fn:ident, $discriminator:expr, $arg:expr, $($pattern:pat, $type:path),+) => {
+        match $discriminator {
+            $($pattern => $fn::<$type>($arg)),+,
+            _ => unreachable!(),
+        }
+    }
+}
+
+macro_rules! integer_op {
+    ($fn:ident, $discriminator:expr, $arg:expr) => {
+        integer_op_cases!(
+            $fn,
+            $discriminator,
+            $arg,
+            Integer::U8,
+            u8,
+            Integer::U16,
+            u16,
+            Integer::U32,
+            u32,
+            Integer::U64,
+            u64,
+            Integer::U128,
+            u128,
+            Integer::Usize,
+            usize,
+            Integer::I8,
+            i8,
+            Integer::I16,
+            i16,
+            Integer::I32,
+            i32,
+            Integer::I64,
+            i64,
+            Integer::I128,
+            i128,
+            Integer::Isize,
+            isize
+        )
+    };
+}
+
+macro_rules! integer_signed_op {
+    ($fn:ident, $discriminator:expr, $arg:expr) => {
+        integer_op_cases!(
+            $fn,
+            $discriminator,
+            $arg,
+            Integer::I8,
+            i8,
+            Integer::I16,
+            i16,
+            Integer::I32,
+            i32,
+            Integer::I64,
+            i64,
+            Integer::I128,
+            i128,
+            Integer::Isize,
+            isize
+        )
+    };
+}
+
+fn add<T: FromBytes + ToBytes + Add<T, Output = T>>((a, b): (&[u8], &[u8])) -> Rc<[u8]> {
+    T::from_bytes(a).add(T::from_bytes(b)).to_rc()
+}
+
+fn sub<T: FromBytes + ToBytes + Sub<T, Output = T>>((a, b): (&[u8], &[u8])) -> Rc<[u8]> {
+    T::from_bytes(a).sub(T::from_bytes(b)).to_rc()
+}
+
+fn mul<T: FromBytes + ToBytes + Mul<T, Output = T>>((a, b): (&[u8], &[u8])) -> Rc<[u8]> {
+    T::from_bytes(a).mul(T::from_bytes(b)).to_rc()
+}
+
+fn div<T: FromBytes + ToBytes + Div<T, Output = T>>((a, b): (&[u8], &[u8])) -> Rc<[u8]> {
+    T::from_bytes(a).div(T::from_bytes(b)).to_rc()
+}
+
+fn rem<T: FromBytes + ToBytes + Rem<T, Output = T>>((a, b): (&[u8], &[u8])) -> Rc<[u8]> {
+    T::from_bytes(a).rem(T::from_bytes(b)).to_rc()
+}
+
+macro_rules! integer_binary_ops_cases {
+    ($op_discriminator:expr, $type_discriminator:expr, $left:expr, $right:expr, $($pattern:pat, $fn:ident),+) => {
+        match $op_discriminator {
+            $($pattern => integer_op!($fn, $type_discriminator, ($left, $right))),+,
+            _ => unreachable!(),
+        }
+    }
+}
+
+macro_rules! integer_binary_ops {
+    ($op_discriminator:expr, $type_discriminator:expr, $left:expr, $right:expr) => {
+        integer_binary_ops_cases!(
+            $op_discriminator,
+            $type_discriminator,
+            $left,
+            $right,
+            BinaryOp::Add,
+            add,
+            BinaryOp::Sub,
+            sub,
+            BinaryOp::Mul,
+            mul,
+            BinaryOp::Div,
+            div,
+            BinaryOp::Rem,
+            rem
+        )
+    };
+}
+
+fn eq<T: FromBytes + ToBytes + PartialEq<T>>((a, b): (&[u8], &[u8])) -> bool {
+    T::from_bytes(a).eq(&T::from_bytes(b))
+}
+
+fn ge<T: FromBytes + ToBytes + PartialOrd<T>>((a, b): (&[u8], &[u8])) -> bool {
+    T::from_bytes(a).ge(&T::from_bytes(b))
+}
+
+fn gt<T: FromBytes + ToBytes + PartialOrd<T>>((a, b): (&[u8], &[u8])) -> bool {
+    T::from_bytes(a).gt(&T::from_bytes(b))
+}
+
+fn le<T: FromBytes + ToBytes + PartialOrd<T>>((a, b): (&[u8], &[u8])) -> bool {
+    T::from_bytes(a).le(&T::from_bytes(b))
+}
+
+fn lt<T: FromBytes + ToBytes + PartialOrd<T>>((a, b): (&[u8], &[u8])) -> bool {
+    T::from_bytes(a).lt(&T::from_bytes(b))
+}
+
+macro_rules! integer_comparison_ops_cases {
+    ($op_discriminator:expr, $type_discriminator:expr, $left:expr, $right:expr, $($pattern:pat, $fn:ident),+) => {
+        match $op_discriminator {
+            $($pattern => integer_op!($fn, $type_discriminator, ($left, $right))),+,
+            _ => unreachable!(),
+        }
+    }
+}
+
+macro_rules! integer_comparison_ops {
+    ($op_discriminator:expr, $type_discriminator:expr, $left:expr, $right:expr) => {
+        integer_comparison_ops_cases!(
+            $op_discriminator,
+            $type_discriminator,
+            $left,
+            $right,
+            BinaryOp::Eq,
+            eq,
+            BinaryOp::Ge,
+            ge,
+            BinaryOp::Gt,
+            gt,
+            BinaryOp::Le,
+            le,
+            BinaryOp::Lt,
+            lt
+        )
+    };
+}
+
+macro_rules! integer_suffix_op_cases {
+    ($fn:ident, $discriminator:expr, $arg:expr, $($pattern:pat, $variant:expr, $type:path),+) => {
+        match $discriminator {
+            $($pattern => $fn::<$type>($arg, $variant)),+,
+            _ => unreachable!(),
+        }
+    }
+}
+
+macro_rules! integer_suffix_op {
+    ($fn:ident, $discriminator:expr, $arg:expr) => {
+        integer_suffix_op_cases!(
+            $fn,
+            $discriminator,
+            $arg,
+            "u8",
+            Integer::U8,
+            u8,
+            "u16",
+            Integer::U16,
+            u16,
+            "u32",
+            Integer::U32,
+            u32,
+            "u64",
+            Integer::U64,
+            u64,
+            "u128",
+            Integer::U128,
+            u128,
+            "usize",
+            Integer::Usize,
+            usize,
+            "i8",
+            Integer::I8,
+            i8,
+            "i16",
+            Integer::I16,
+            i16,
+            "i32",
+            Integer::I32,
+            i32,
+            "i64",
+            Integer::I64,
+            i64,
+            "i128",
+            Integer::I128,
+            i128,
+            "isize",
+            Integer::Isize,
+            isize
+        )
+    };
+}
+
+impl ToBytes for bool {
+    type Bytes = [u8; 1];
+
+    fn to_bytes(self) -> Self::Bytes {
+        [if self { 1 } else { 0 }]
+    }
+}
 
 #[derive(Clone, Hash, Eq, PartialEq, Copy, Debug)]
 enum Integer {
@@ -40,22 +323,15 @@ enum Integer {
 }
 
 impl Integer {
-    fn parse(self, value: &str) -> Result<Rc<dyn Any>> {
-        Ok(match self {
-            Integer::Unknown => unreachable!(),
-            Integer::U8 => Rc::new(value.parse::<u8>()?),
-            Integer::U16 => Rc::new(value.parse::<u16>()?),
-            Integer::U32 => Rc::new(value.parse::<u32>()?),
-            Integer::U64 => Rc::new(value.parse::<u64>()?),
-            Integer::U128 => Rc::new(value.parse::<u128>()?),
-            Integer::Usize => Rc::new(value.parse::<usize>()?),
-            Integer::I8 => Rc::new(value.parse::<i8>()?),
-            Integer::I16 => Rc::new(value.parse::<i16>()?),
-            Integer::I32 => Rc::new(value.parse::<i32>()?),
-            Integer::I64 => Rc::new(value.parse::<i64>()?),
-            Integer::I128 => Rc::new(value.parse::<i128>()?),
-            Integer::Isize => Rc::new(value.parse::<isize>()?),
-        })
+    fn parse(self, value: &str) -> Result<Rc<[u8]>> {
+        fn parse<T: ToBytes + FromStr>(value: &str) -> Result<Rc<[u8]>>
+        where
+            <T as FromStr>::Err: error::Error + Send + Sync + 'static,
+        {
+            Ok(value.parse::<T>()?.to_rc())
+        }
+
+        integer_op!(parse, self, value)
     }
 }
 
@@ -113,7 +389,7 @@ enum Type {
 
 #[derive(Clone)]
 struct Literal {
-    value: Rc<dyn Any>,
+    value: Rc<[u8]>,
     type_: Type,
 }
 
@@ -125,28 +401,23 @@ impl fmt::Debug for Literal {
 
 impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt<T: FromBytes + Display>(
+            (f, value): (&mut fmt::Formatter<'_>, &[u8]),
+        ) -> fmt::Result {
+            write!(f, "{}_{}", T::from_bytes(value), any::type_name::<T>())
+        }
+
         match self.type_ {
             Type::Integer(integer) => match integer {
-                Integer::Unknown => write!(f, "{}", self.value.downcast_ref::<String>().unwrap()),
-                Integer::U8 => write!(f, "{}_u8", self.value.downcast_ref::<u8>().unwrap()),
-                Integer::U16 => write!(f, "{}_u16", self.value.downcast_ref::<u16>().unwrap()),
-                Integer::U32 => write!(f, "{}_u32", self.value.downcast_ref::<u32>().unwrap()),
-                Integer::U64 => write!(f, "{}_u64", self.value.downcast_ref::<u64>().unwrap()),
-                Integer::U128 => write!(f, "{}_u128", self.value.downcast_ref::<u128>().unwrap()),
-                Integer::Usize => {
-                    write!(f, "{}_usize", self.value.downcast_ref::<usize>().unwrap())
-                }
-                Integer::I8 => write!(f, "{}_i8", self.value.downcast_ref::<i8>().unwrap()),
-                Integer::I16 => write!(f, "{}_i16", self.value.downcast_ref::<i16>().unwrap()),
-                Integer::I32 => write!(f, "{}_i32", self.value.downcast_ref::<i32>().unwrap()),
-                Integer::I64 => write!(f, "{}_i64", self.value.downcast_ref::<i64>().unwrap()),
-                Integer::I128 => write!(f, "{}_i128", self.value.downcast_ref::<i128>().unwrap()),
-                Integer::Isize => {
-                    write!(f, "{}_isize", self.value.downcast_ref::<isize>().unwrap())
-                }
+                Integer::Unknown => write!(f, "{}", str::from_utf8(&self.value).unwrap()),
+                _ => integer_op!(fmt, integer, (f, &self.value)),
             },
 
-            Type::Boolean => write!(f, "{}", self.value.downcast_ref::<bool>().unwrap()),
+            Type::Boolean => write!(
+                f,
+                "{}",
+                u8::from_ne_bytes(self.value.deref().try_into().unwrap()) != 0
+            ),
 
             Type::Unit => write!(f, "()"),
 
@@ -217,6 +488,7 @@ enum Term {
     Reference {
         // TODO: add lifetime field
         unique: bool,
+        // TODO: this should be something like a Weak<RefCell<BindingTerm>> plus a usize offset
         term: Rc<Term>,
     },
     Let {
@@ -401,98 +673,6 @@ enum EvalException {
     },
 }
 
-macro_rules! integer_binary_op {
-    ($op:ident, $type:ident, $left:ident, $right:ident, $wrap:path) => {
-        match $type {
-            Integer::U8 => $wrap(
-                $left
-                    .value
-                    .downcast_ref::<u8>()
-                    .unwrap()
-                    .$op($right.value.downcast_ref::<u8>().unwrap()),
-            ),
-            Integer::U16 => $wrap(
-                $left
-                    .value
-                    .downcast_ref::<u16>()
-                    .unwrap()
-                    .$op($right.value.downcast_ref::<u16>().unwrap()),
-            ),
-            Integer::U32 => $wrap(
-                $left
-                    .value
-                    .downcast_ref::<u32>()
-                    .unwrap()
-                    .$op($right.value.downcast_ref::<u32>().unwrap()),
-            ),
-            Integer::U64 => $wrap(
-                $left
-                    .value
-                    .downcast_ref::<u64>()
-                    .unwrap()
-                    .$op($right.value.downcast_ref::<u64>().unwrap()),
-            ),
-            Integer::U128 => $wrap(
-                $left
-                    .value
-                    .downcast_ref::<u128>()
-                    .unwrap()
-                    .$op($right.value.downcast_ref::<u128>().unwrap()),
-            ),
-            Integer::Usize => $wrap(
-                $left
-                    .value
-                    .downcast_ref::<usize>()
-                    .unwrap()
-                    .$op($right.value.downcast_ref::<usize>().unwrap()),
-            ),
-            Integer::I8 => $wrap(
-                $left
-                    .value
-                    .downcast_ref::<i8>()
-                    .unwrap()
-                    .$op($right.value.downcast_ref::<i8>().unwrap()),
-            ),
-            Integer::I16 => $wrap(
-                $left
-                    .value
-                    .downcast_ref::<i16>()
-                    .unwrap()
-                    .$op($right.value.downcast_ref::<i16>().unwrap()),
-            ),
-            Integer::I32 => $wrap(
-                $left
-                    .value
-                    .downcast_ref::<i32>()
-                    .unwrap()
-                    .$op($right.value.downcast_ref::<i32>().unwrap()),
-            ),
-            Integer::I64 => $wrap(
-                $left
-                    .value
-                    .downcast_ref::<i64>()
-                    .unwrap()
-                    .$op($right.value.downcast_ref::<i64>().unwrap()),
-            ),
-            Integer::I128 => $wrap(
-                $left
-                    .value
-                    .downcast_ref::<i128>()
-                    .unwrap()
-                    .$op($right.value.downcast_ref::<i128>().unwrap()),
-            ),
-            Integer::Isize => $wrap(
-                $left
-                    .value
-                    .downcast_ref::<isize>()
-                    .unwrap()
-                    .$op($right.value.downcast_ref::<isize>().unwrap()),
-            ),
-            _ => unreachable!(),
-        }
-    };
-}
-
 pub struct Eval {
     value: Literal,
     new_term_bindings: HashMap<Rc<str>, Option<Term>>,
@@ -510,7 +690,7 @@ impl fmt::Display for Eval {
 
         for (symbol, term) in &self.new_term_bindings {
             if need_newline {
-                write!(f, "\n")?;
+                writeln!(f)?;
             }
 
             write!(f, "{symbol}")?;
@@ -551,6 +731,12 @@ pub struct Env {
     false_: Literal,
 }
 
+impl Default for Env {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Env {
     pub fn new() -> Self {
         let mut env = Self {
@@ -561,15 +747,15 @@ impl Env {
             traits: HashMap::new(),
             impls: HashMap::new(),
             unit: Literal {
-                value: Rc::new(()),
+                value: Rc::new([]),
                 type_: Type::Unit,
             },
             true_: Literal {
-                value: Rc::new(true),
+                value: Rc::new([1]),
                 type_: Type::Boolean,
             },
             false_: Literal {
-                value: Rc::new(false),
+                value: Rc::new([0]),
                 type_: Type::Boolean,
             },
         };
@@ -897,7 +1083,7 @@ impl Env {
                 .iter()
                 .map(|binding| {
                     (
-                        self.unintern(binding.name).clone(),
+                        self.unintern(binding.name),
                         binding
                             .term
                             .as_ref()
@@ -1017,55 +1203,39 @@ impl Env {
             }
 
             Term::And(left, right) => {
-                if *self.eval_term(left)?.value.downcast_ref::<bool>().unwrap() {
+                if u8::from_ne_bytes(self.eval_term(left)?.value.deref().try_into().unwrap()) != 0 {
                     self.eval_term(right)
                 } else {
                     Ok(Literal {
-                        value: Rc::new(false),
+                        value: Rc::new([0]),
                         type_: Type::Boolean,
                     })
                 }
             }
 
             Term::Or(left, right) => {
-                if !*self.eval_term(left)?.value.downcast_ref::<bool>().unwrap() {
+                if u8::from_ne_bytes(self.eval_term(left)?.value.deref().try_into().unwrap()) == 0 {
                     self.eval_term(right)
                 } else {
                     Ok(Literal {
-                        value: Rc::new(true),
+                        value: Rc::new([1]),
                         type_: Type::Boolean,
                     })
                 }
             }
 
             Term::UnaryOp(op, term) => {
+                fn neg<T: FromBytes + ToBytes + Neg<Output = T>>(n: &[u8]) -> Rc<[u8]> {
+                    T::from_bytes(n).neg().to_rc()
+                }
+
                 let result = self.eval_term(term)?;
 
                 match op {
                     UnaryOp::Neg => match result.type_ {
                         Type::Integer(integer_type) => Ok(Literal {
                             type_: Type::Integer(integer_type),
-                            value: match integer_type {
-                                Integer::I8 => {
-                                    Rc::new(-*result.value.downcast_ref::<i8>().unwrap())
-                                }
-                                Integer::I16 => {
-                                    Rc::new(-*result.value.downcast_ref::<i16>().unwrap())
-                                }
-                                Integer::I32 => {
-                                    Rc::new(-*result.value.downcast_ref::<i32>().unwrap())
-                                }
-                                Integer::I64 => {
-                                    Rc::new(-*result.value.downcast_ref::<i64>().unwrap())
-                                }
-                                Integer::I128 => {
-                                    Rc::new(-*result.value.downcast_ref::<i128>().unwrap())
-                                }
-                                Integer::Isize => {
-                                    Rc::new(-*result.value.downcast_ref::<isize>().unwrap())
-                                }
-                                _ => unreachable!(),
-                            },
+                            value: integer_signed_op!(neg, integer_type, &result.value),
                         }),
 
                         _ => unreachable!(),
@@ -1073,7 +1243,13 @@ impl Env {
 
                     UnaryOp::Not => Ok(Literal {
                         type_: Type::Boolean,
-                        value: Rc::new(!*result.value.downcast_ref::<bool>().unwrap()),
+                        value: Rc::new([
+                            if u8::from_ne_bytes(result.value.deref().try_into().unwrap()) != 0 {
+                                0
+                            } else {
+                                1
+                            },
+                        ]),
                     }),
 
                     UnaryOp::Deref => todo!(),
@@ -1092,24 +1268,7 @@ impl Env {
                         | BinaryOp::Div
                         | BinaryOp::Rem => Literal {
                             type_: Type::Integer(integer_type),
-                            value: match op {
-                                BinaryOp::Add => {
-                                    integer_binary_op!(add, integer_type, left, right, Rc::new)
-                                }
-                                BinaryOp::Sub => {
-                                    integer_binary_op!(sub, integer_type, left, right, Rc::new)
-                                }
-                                BinaryOp::Mul => {
-                                    integer_binary_op!(mul, integer_type, left, right, Rc::new)
-                                }
-                                BinaryOp::Div => {
-                                    integer_binary_op!(div, integer_type, left, right, Rc::new)
-                                }
-                                BinaryOp::Rem => {
-                                    integer_binary_op!(rem, integer_type, left, right, Rc::new)
-                                }
-                                _ => unreachable!(),
-                            },
+                            value: integer_binary_ops!(op, integer_type, &left.value, &right.value),
                         },
 
                         BinaryOp::Eq
@@ -1118,24 +1277,18 @@ impl Env {
                         | BinaryOp::Le
                         | BinaryOp::Lt => Literal {
                             type_: Type::Boolean,
-                            value: Rc::new(match op {
-                                BinaryOp::Eq => {
-                                    integer_binary_op!(eq, integer_type, left, right, identity)
-                                }
-                                BinaryOp::Ge => {
-                                    integer_binary_op!(ge, integer_type, left, right, identity)
-                                }
-                                BinaryOp::Gt => {
-                                    integer_binary_op!(gt, integer_type, left, right, identity)
-                                }
-                                BinaryOp::Le => {
-                                    integer_binary_op!(le, integer_type, left, right, identity)
-                                }
-                                BinaryOp::Lt => {
-                                    integer_binary_op!(lt, integer_type, left, right, identity)
-                                }
-                                _ => unreachable!(),
-                            }),
+                            value: Rc::new([
+                                if integer_comparison_ops!(
+                                    op,
+                                    integer_type,
+                                    &left.value,
+                                    &right.value
+                                ) {
+                                    1
+                                } else {
+                                    0
+                                },
+                            ]),
                         },
                         _ => unreachable!(),
                     }),
@@ -1151,11 +1304,9 @@ impl Env {
                         // TODO: push and pop pattern bindings
 
                         let match_guard = if let Some(guard) = &arm.guard {
-                            *self
-                                .eval_term(&guard)?
-                                .value
-                                .downcast_ref::<bool>()
-                                .unwrap()
+                            u8::from_ne_bytes(
+                                self.eval_term(guard)?.value.deref().try_into().unwrap(),
+                            ) != 0
                         } else {
                             true
                         };
@@ -1230,12 +1381,12 @@ impl Env {
         match pattern {
             Pattern::Literal(literal) => match &scrutinee.type_ {
                 Type::Boolean => {
-                    *literal.value.downcast_ref::<bool>().unwrap()
-                        == *scrutinee.value.downcast_ref::<bool>().unwrap()
+                    u8::from_ne_bytes(literal.value.deref().try_into().unwrap())
+                        == u8::from_ne_bytes(scrutinee.value.deref().try_into().unwrap())
                 }
 
                 Type::Integer(integer_type) => {
-                    integer_binary_op!(eq, integer_type, literal, scrutinee, identity)
+                    integer_op!(eq, integer_type, (&literal.value, &scrutinee.value))
                 }
 
                 _ => todo!("literal match for {:?}", scrutinee.type_),
@@ -1303,12 +1454,14 @@ impl Env {
                         .unwrap_or(Type::Integer(Integer::I32))
                     {
                         Type::Integer(integer_type) => Literal {
-                            value: integer_type.parse(value.downcast_ref::<String>().unwrap())?,
+                            value: integer_type.parse(str::from_utf8(value).unwrap())?,
                             type_: Type::Integer(integer_type),
                         },
 
                         _ => Literal {
-                            value: Rc::new(value.downcast_ref::<String>().unwrap().parse::<i32>()?),
+                            value: Rc::new(
+                                str::from_utf8(value).unwrap().parse::<i32>()?.to_bytes(),
+                            ),
                             type_: Type::Integer(Integer::I32),
                         },
                     }
@@ -1323,7 +1476,7 @@ impl Env {
             }
 
             Term::UnaryOp(op, term) => {
-                let term = self.type_check(&term, expected_type)?;
+                let term = self.type_check(term, expected_type)?;
 
                 let (trait_, function) = match op {
                     UnaryOp::Neg => ("Neg", "neg"),
@@ -1663,7 +1816,7 @@ impl Env {
                         .iter()
                         .find_map(|term| match term.type_() {
                             Type::Never => None,
-                            type_ => Some(type_.clone()),
+                            type_ => Some(type_),
                         })
                         .unwrap_or(Type::Never),
                 })
@@ -1699,7 +1852,7 @@ impl Env {
                             .iter()
                             .find_map(|term| match term.type_() {
                                 Type::Never => None,
-                                type_ => Some(type_.clone()),
+                                type_ => Some(type_),
                             })
                     {
                         match_types(&expected_type, &term.type_())?;
@@ -1790,6 +1943,7 @@ impl Env {
         Ok(type_)
     }
 
+    #[allow(clippy::needless_collect)]
     fn type_check_bindings(&mut self, offset: usize) -> Result<()> {
         let indexes = self
             .bindings
@@ -1798,7 +1952,7 @@ impl Env {
             .skip(offset)
             .filter_map(|(index, binding)| {
                 binding.term.as_ref().and_then(|term| {
-                    if let BindingStatus::Untyped = term.borrow().status {
+                    if let BindingStatus::Untyped = RefCell::borrow(term).status {
                         Some(index)
                     } else {
                         None
@@ -1807,19 +1961,16 @@ impl Env {
             })
             .collect::<Vec<_>>();
 
-        indexes
-            .into_iter()
-            .map(|index| {
-                self.type_check(
-                    &Term::Variable {
-                        index,
-                        type_: Type::Never,
-                    },
-                    None,
-                )
-                .map(drop)
-            })
-            .collect::<Result<()>>()
+        indexes.into_iter().try_for_each(|index| {
+            self.type_check(
+                &Term::Variable {
+                    index,
+                    type_: Type::Never,
+                },
+                None,
+            )
+            .map(drop)
+        })
     }
 
     // Does this need to be a method of Env, or can we move it to Pattern?
@@ -1890,93 +2041,38 @@ impl Env {
     }
 
     fn expr_to_term(&mut self, expr: &Expr) -> Result<Term> {
+        fn parse<T: ToBytes + FromStr>(value: &str, variant: Integer) -> Result<Term>
+        where
+            <T as FromStr>::Err: error::Error + Send + Sync + 'static,
+        {
+            Ok(Term::Literal(Literal {
+                value: value.parse::<T>()?.to_rc(),
+                type_: Type::Integer(variant),
+            }))
+        }
+
         match expr {
             Expr::Lit(ExprLit { lit, attrs }) => {
                 if !attrs.is_empty() {
                     Err(anyhow!("attributes not yet supported"))
                 } else {
-                    Ok(Term::Literal(match lit {
+                    match lit {
                         Lit::Int(lit) => match lit.suffix() {
-                            "" => Literal {
-                                value: Rc::new(lit.base10_digits().to_owned()),
+                            "" => Ok(Term::Literal(Literal {
+                                value: Rc::from(lit.base10_digits().as_bytes()),
                                 type_: Type::Integer(Integer::Unknown),
-                            },
+                            })),
 
-                            "u8" => Literal {
-                                value: Rc::new(lit.base10_digits().parse::<u8>()?),
-                                type_: Type::Integer(Integer::U8),
-                            },
-
-                            "u16" => Literal {
-                                value: Rc::new(lit.base10_digits().parse::<u16>()?),
-                                type_: Type::Integer(Integer::U16),
-                            },
-
-                            "u32" => Literal {
-                                value: Rc::new(lit.base10_digits().parse::<u32>()?),
-                                type_: Type::Integer(Integer::U32),
-                            },
-
-                            "u64" => Literal {
-                                value: Rc::new(lit.base10_digits().parse::<u64>()?),
-                                type_: Type::Integer(Integer::U64),
-                            },
-
-                            "u128" => Literal {
-                                value: Rc::new(lit.base10_digits().parse::<u128>()?),
-                                type_: Type::Integer(Integer::U128),
-                            },
-
-                            "usize" => Literal {
-                                value: Rc::new(lit.base10_digits().parse::<usize>()?),
-                                type_: Type::Integer(Integer::Usize),
-                            },
-
-                            "i8" => Literal {
-                                value: Rc::new(lit.base10_digits().parse::<i8>()?),
-                                type_: Type::Integer(Integer::I8),
-                            },
-
-                            "i16" => Literal {
-                                value: Rc::new(lit.base10_digits().parse::<i16>()?),
-                                type_: Type::Integer(Integer::I16),
-                            },
-
-                            "i32" => Literal {
-                                value: Rc::new(lit.base10_digits().parse::<i32>()?),
-                                type_: Type::Integer(Integer::I32),
-                            },
-
-                            "i64" => Literal {
-                                value: Rc::new(lit.base10_digits().parse::<i64>()?),
-                                type_: Type::Integer(Integer::I64),
-                            },
-
-                            "i128" => Literal {
-                                value: Rc::new(lit.base10_digits().parse::<i128>()?),
-                                type_: Type::Integer(Integer::I128),
-                            },
-
-                            "isize" => Literal {
-                                value: Rc::new(lit.base10_digits().parse::<isize>()?),
-                                type_: Type::Integer(Integer::Isize),
-                            },
-
-                            _ => {
-                                return Err(anyhow!(
-                                    "unexpected integer literal suffix: {}",
-                                    lit.suffix()
-                                ))
-                            }
+                            suffix => integer_suffix_op!(parse, suffix, lit.base10_digits()),
                         },
 
-                        Lit::Bool(LitBool { value, .. }) => Literal {
-                            value: Rc::new(*value),
+                        Lit::Bool(LitBool { value, .. }) => Ok(Term::Literal(Literal {
+                            value: Rc::new([if *value { 1 } else { 0 }]),
                             type_: Type::Boolean,
-                        },
+                        })),
 
-                        _ => return Err(anyhow!("literal not yet supported: {lit:?}")),
-                    }))
+                        _ => Err(anyhow!("literal not yet supported: {lit:?}")),
+                    }
                 }
             }
 
@@ -2098,7 +2194,7 @@ impl Env {
                         guard: None,
                         body: else_branch
                             .as_ref()
-                            .map(|(_, expr)| self.expr_to_term(&expr))
+                            .map(|(_, expr)| self.expr_to_term(expr))
                             .transpose()?
                             .unwrap_or_else(|| Term::Literal(self.unit.clone())),
                     };
@@ -2192,7 +2288,7 @@ impl Env {
                             .map(|label| self.intern(&label.ident.to_string())),
                         term: Rc::new(
                             expr.as_ref()
-                                .map(|expr| self.expr_to_term(&expr))
+                                .map(|expr| self.expr_to_term(expr))
                                 .transpose()?
                                 .unwrap_or_else(|| Term::Literal(self.unit.clone())),
                         ),
@@ -2231,19 +2327,14 @@ impl Env {
 mod test {
     use {super::*, std::sync::Once};
 
-    fn eval<T: Copy + 'static>(line: &str) -> Result<T> {
+    fn eval<T: FromBytes>(line: &str) -> Result<T> {
         {
             static ONCE: Once = Once::new();
 
             ONCE.call_once(pretty_env_logger::init_timed);
         }
 
-        Ok(*Env::new()
-            .eval_line(line)?
-            .value
-            .value
-            .downcast_ref::<T>()
-            .unwrap())
+        Ok(T::from_bytes(&Env::new().eval_line(line)?.value.value))
     }
 
     #[test]
