@@ -510,6 +510,19 @@ struct Reference {
     term: Rc<RefCell<BindingTerm>>,
 }
 
+impl Reference {
+    fn deref_type(&self) -> Type {
+        RefCell::borrow(&self.term).type_().at(&self.path)
+    }
+
+    fn type_(&self) -> Type {
+        Type::Reference {
+            unique: self.unique,
+            type_: Rc::new(self.deref_type()),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Term {
     Block(Rc<[Term]>),
@@ -576,13 +589,10 @@ impl Term {
             Self::And { .. } | Self::Or { .. } => Type::Boolean,
             Self::UnaryOp(op, term) => match op {
                 UnaryOp::Neg | UnaryOp::Not => term.type_(),
-                UnaryOp::Deref => {
-                    if let Term::Reference(Reference { path, term, .. }) = term.deref() {
-                        RefCell::borrow(term).term.type_().at(path)
-                    } else {
-                        unreachable!()
-                    }
-                }
+                UnaryOp::Deref => match term.type_() {
+                    Type::Reference { type_, .. } => type_.deref().clone(),
+                    type_ => unreachable!("expected reference to deref, got {:?}", type_),
+                },
             },
             Self::BinaryOp(op, term, _) => match op {
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
@@ -598,14 +608,9 @@ impl Term {
             Self::Match { arms, .. } => arms[0].body.type_(),
             Self::Break { .. } | Self::Return { .. } => Type::Never,
             Self::Phi(terms) => {
-                RefCell::borrow(terms.iter().find_map(|term| term.as_ref()).unwrap())
-                    .term
-                    .type_()
+                RefCell::borrow(terms.iter().find_map(|term| term.as_ref()).unwrap()).type_()
             }
-            Self::Reference(Reference { path, term, unique }) => Type::Reference {
-                unique: *unique,
-                type_: Rc::new(RefCell::borrow(term).term.type_().at(path)),
-            },
+            Self::Reference(reference) => reference.type_(),
             _ => todo!("Term::type_ for {self:?}"),
         }
     }
@@ -618,17 +623,21 @@ struct Loop {
     branch_context: BranchContext,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum BindingStatus {
-    Untyped,
-    Typed,
-    Evaluated,
+#[derive(Clone, Debug)]
+enum BindingTerm {
+    Untyped(Term),
+    Typed(Term),
+    Evaluated(EvalTerm),
 }
 
-#[derive(Clone, Debug)]
-struct BindingTerm {
-    status: BindingStatus,
-    term: Term,
+impl BindingTerm {
+    fn type_(&self) -> Type {
+        match self {
+            Self::Untyped(_) => unreachable!(),
+            Self::Typed(term) => term.type_(),
+            Self::Evaluated(term) => term.type_(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -690,29 +699,70 @@ impl BranchContext {
             bindings[binding_index].term = if terms.iter().all(|term| term.is_none()) {
                 None
             } else {
-                Some(Rc::new(RefCell::new(BindingTerm {
-                    status: BindingStatus::Untyped,
-                    term: Term::Phi(terms),
-                })))
+                Some(Rc::new(RefCell::new(BindingTerm::Untyped(Term::Phi(
+                    terms,
+                )))))
             }
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum EvalTerm {
     Value(Literal),
     Reference(Reference),
     Deref(Reference),
 }
 
+impl fmt::Debug for EvalTerm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for EvalTerm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Value(literal) => literal.fmt(f),
+            Self::Reference(Reference { unique, term, .. }) => {
+                // todo: use path
+                if let BindingTerm::Evaluated(term) = RefCell::borrow(term).deref() {
+                    write!(f, "{}{}", if *unique { "&mut " } else { "&" }, term)
+                } else {
+                    unreachable!()
+                }
+            }
+            Self::Deref(Reference { term, .. }) => {
+                // todo: use path
+                if let BindingTerm::Evaluated(EvalTerm::Value(literal)) =
+                    RefCell::borrow(term).deref()
+                {
+                    literal.fmt(f)
+                } else {
+                    unreachable!()
+                }
+            }
+        }
+    }
+}
+
 impl EvalTerm {
+    fn type_(&self) -> Type {
+        match self {
+            Self::Value(literal) => literal.type_.clone(),
+            Self::Reference(reference) => reference.type_(),
+            Self::Deref(reference) => reference.deref_type(),
+        }
+    }
+
     fn rvalue(&self) -> Literal {
         match self {
             Self::Value(literal) => literal.clone(),
             Self::Deref(Reference { term, .. }) => {
                 // todo: use path
-                if let Term::Literal(literal) = &RefCell::borrow(term).term {
+                if let BindingTerm::Evaluated(EvalTerm::Value(literal)) =
+                    RefCell::borrow(term).deref()
+                {
                     literal.clone()
                 } else {
                     unreachable!()
@@ -735,16 +785,16 @@ enum EvalException {
 }
 
 pub struct Eval {
-    value: Literal,
-    new_term_bindings: HashMap<Rc<str>, Option<Term>>,
+    value: EvalTerm,
+    new_term_bindings: HashMap<Rc<str>, Option<Rc<RefCell<BindingTerm>>>>,
 }
 
 impl fmt::Display for Eval {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut need_newline = match &self.value.type_ {
+        let mut need_newline = match &self.value.type_() {
             Type::Unit => false,
             _ => {
-                write!(f, "{}", self.value)?;
+                self.value.fmt(f)?;
                 true
             }
         };
@@ -754,10 +804,15 @@ impl fmt::Display for Eval {
                 writeln!(f)?;
             }
 
-            write!(f, "{symbol}")?;
+            symbol.fmt(f)?;
 
             if let Some(term) = term {
-                write!(f, " = {term:?}")?;
+                match RefCell::borrow(term).deref() {
+                    BindingTerm::Evaluated(term) => write!(f, " = {term}"),
+                    BindingTerm::Typed(term) | BindingTerm::Untyped(term) => {
+                        write!(f, " = {term:?}")
+                    }
+                }?;
             }
 
             need_newline = true;
@@ -1153,18 +1208,10 @@ impl Env {
         };
 
         Ok(Eval {
-            value: value.rvalue(), // todo: handle references gracefully
+            value,
             new_term_bindings: self.bindings[binding_count..]
                 .iter()
-                .map(|binding| {
-                    (
-                        self.unintern(binding.name),
-                        binding
-                            .term
-                            .as_ref()
-                            .map(|term| RefCell::borrow(term).term.clone()),
-                    )
-                })
+                .map(|binding| (self.unintern(binding.name), binding.term.clone()))
                 .collect(),
         })
     }
@@ -1202,7 +1249,7 @@ impl Env {
         if let Type::Reference { unique, .. } = type_ {
             if trait_.name == self.intern("Deref") {
                 let self_type = Type::Reference {
-                    unique: true,
+                    unique: false,
                     type_: Rc::new(type_.clone()),
                 };
 
@@ -1224,7 +1271,7 @@ impl Env {
                     arguments: Rc::new([]),
                     functions: Rc::new(hashmap![function => abstraction]),
                 });
-            } else if trait_.name == self.intern("DerefMut") {
+            } else if *unique && trait_.name == self.intern("DerefMut") {
                 let self_type = Type::Reference {
                     unique: true,
                     type_: Rc::new(type_.clone()),
@@ -1276,13 +1323,10 @@ impl Env {
                 if let Some(term) = term {
                     let mut term = RefCell::borrow_mut(term);
 
-                    *term = BindingTerm {
-                        status: BindingStatus::Evaluated,
-                        term: Term::Literal(match term.status {
-                            BindingStatus::Typed => self.eval_term(&term.term)?,
-                            _ => unreachable!(),
-                        }),
-                    };
+                    *term = BindingTerm::Evaluated(match term.deref() {
+                        BindingTerm::Typed(term) => self.eval_term(term)?,
+                        _ => unreachable!(),
+                    });
                 }
 
                 Ok(EvalTerm::Value(self.unit.clone()))
@@ -1291,16 +1335,14 @@ impl Env {
             Term::Variable { index, .. } => {
                 let term = RefCell::borrow(self.bindings[*index].term.as_ref().unwrap());
 
-                if let (BindingStatus::Evaluated, Term::Literal(literal)) =
-                    (term.status, &term.term)
-                {
-                    Ok(literal.clone())
+                if let BindingTerm::Evaluated(term) = term.deref() {
+                    Ok(term.clone())
                 } else {
-                    panic!("unexpected binding status: {term:?}")
+                    panic!("unexpected binding term variant: {term:?}")
                 }
             }
 
-            Term::Literal(literal) => Ok(literal.clone()),
+            Term::Literal(literal) => Ok(EvalTerm::Value(literal.clone())),
 
             Term::Application {
                 abstraction:
@@ -1316,10 +1358,9 @@ impl Env {
                         Ok(Binding {
                             name: *name,
                             mutable: *mutable,
-                            term: Some(Rc::new(RefCell::new(BindingTerm {
-                                status: BindingStatus::Evaluated,
-                                term: Term::Literal(self.eval_term(term)?),
-                            }))),
+                            term: Some(Rc::new(RefCell::new(BindingTerm::Evaluated(
+                                self.eval_term(term)?,
+                            )))),
                         })
                     })
                     .collect::<Result<Vec<_>, EvalException>>()?;
@@ -1383,19 +1424,19 @@ impl Env {
                         let result = result.rvalue();
 
                         match result.type_ {
-                            Type::Integer(integer_type) => Ok(Literal {
+                            Type::Integer(integer_type) => Ok(EvalTerm::Value(Literal {
                                 type_: Type::Integer(integer_type),
                                 value: integer_signed_op!(neg, integer_type, &result.value),
-                            }),
+                            })),
 
                             _ => unreachable!(),
                         }
                     }
 
-                    UnaryOp::Not => Ok(Literal {
+                    UnaryOp::Not => Ok(EvalTerm::Value(Literal {
                         type_: Type::Boolean,
                         value: (!bool::from_bytes(&result.rvalue().value)).to_rc(),
-                    }),
+                    })),
 
                     UnaryOp::Deref => {
                         if let EvalTerm::Reference(reference) = result {
@@ -1408,8 +1449,8 @@ impl Env {
             }
 
             Term::BinaryOp(op, left, right) => {
-                let left = self.eval_term(left)?;
-                let right = self.eval_term(right)?;
+                let left = self.eval_term(left)?.rvalue();
+                let right = self.eval_term(right)?.rvalue();
 
                 match left.type_ {
                     Type::Integer(integer_type) => Ok(EvalTerm::Value(match op {
@@ -1474,10 +1515,7 @@ impl Env {
             }
 
             Term::Assignment { left, right } => {
-                let right = BindingTerm {
-                    status: BindingStatus::Evaluated,
-                    term: Term::Literal(self.eval_term(right)?.rvalue()),
-                };
+                let right = BindingTerm::Evaluated(self.eval_term(right)?);
 
                 if let Term::Variable { index, .. } = left.deref() {
                     let term = &mut self.bindings[*index].term;
@@ -1487,14 +1525,14 @@ impl Env {
                     } else {
                         *term = Some(Rc::new(RefCell::new(right)));
                     }
-
-                    Ok(EvalTerm::Value(self.unit.clone()))
                 } else if let EvalTerm::Deref(Reference { term, .. }) = self.eval_term(left)? {
                     // todo: use path
-                    *RefCell::borrow_mut(term) = right;
+                    *RefCell::borrow_mut(&term) = right;
                 } else {
                     todo!("assignment to {left:?}")
                 }
+
+                Ok(EvalTerm::Value(self.unit.clone()))
             }
 
             Term::Block(terms) => {
@@ -1532,25 +1570,47 @@ impl Env {
                 result: self.eval_term(term)?,
             }),
 
+            Term::Reference(Reference { unique, term, path }) => {
+                {
+                    let mut term = RefCell::borrow_mut(term);
+
+                    *term = BindingTerm::Evaluated(match term.deref() {
+                        BindingTerm::Typed(term) => self.eval_term(term)?,
+                        BindingTerm::Evaluated(term) => term.clone(),
+                        _ => unreachable!(),
+                    });
+                }
+
+                Ok(EvalTerm::Reference(Reference {
+                    unique: *unique,
+                    term: term.clone(),
+                    path: path.clone(),
+                }))
+            }
+
             _ => todo!("evaluation not yet supported for term {term:?}"),
         }
     }
 
     // Does this need to be a method of Env, or can we move it to Pattern?
-    fn match_pattern(&mut self, pattern: &Pattern, scrutinee: &Literal) -> bool {
-        match pattern {
-            Pattern::Literal(literal) => match &scrutinee.type_ {
-                Type::Boolean => {
-                    u8::from_ne_bytes(literal.value.deref().try_into().unwrap())
-                        == u8::from_ne_bytes(scrutinee.value.deref().try_into().unwrap())
-                }
+    fn match_pattern(&mut self, pattern: &Pattern, scrutinee: &EvalTerm) -> bool {
+        match scrutinee {
+            EvalTerm::Value(scrutinee) => match pattern {
+                Pattern::Literal(literal) => match &scrutinee.type_ {
+                    Type::Boolean => {
+                        u8::from_ne_bytes(literal.value.deref().try_into().unwrap())
+                            == u8::from_ne_bytes(scrutinee.value.deref().try_into().unwrap())
+                    }
 
-                Type::Integer(integer_type) => {
-                    integer_op!(eq, integer_type, (&literal.value, &scrutinee.value))
-                }
+                    Type::Integer(integer_type) => {
+                        integer_op!(eq, integer_type, (&literal.value, &scrutinee.value))
+                    }
 
-                _ => todo!("literal match for {:?}", scrutinee.type_),
+                    _ => todo!("literal match for {:?}", scrutinee.type_),
+                },
             },
+
+            _ => todo!("match for {:?}", scrutinee),
         }
     }
 
@@ -1589,7 +1649,8 @@ impl Env {
                     };
 
                     if let Some(term) = &binding.term {
-                        if let Term::Phi(terms) = &RefCell::borrow(term).term {
+                        if let BindingTerm::Typed(Term::Phi(terms)) = RefCell::borrow(term).deref()
+                        {
                             if terms.iter().any(|term| term.is_none()) {
                                 return error();
                             }
@@ -1603,7 +1664,7 @@ impl Env {
 
                 Ok(Term::Variable {
                     index,
-                    type_: self.type_check_binding(&term, expected_type)?,
+                    type_: self.type_check_binding(&term, expected_type)?.type_(),
                 })
             }
 
@@ -1663,7 +1724,7 @@ impl Env {
                         *op,
                         Rc::new(Term::Application {
                             abstraction: impl_.functions.get(&function).unwrap().clone(),
-                            arguments: Rc::new([self.shared_reference(term)]),
+                            arguments: Rc::new([self.shared_reference(&term)?]),
                         }),
                     ),
 
@@ -1879,7 +1940,7 @@ impl Env {
             }
 
             Term::Assignment { left, right } => {
-                let right = self.type_check(right, expected_type.as_ref())?;
+                let right = self.type_check(right, expected_type)?;
 
                 let right_type = right.type_();
 
@@ -1898,10 +1959,8 @@ impl Env {
                         match_types(&expected_type, &right_type)?;
                     }
 
-                    self.bindings[index].term = Some(Rc::new(RefCell::new(BindingTerm {
-                        status: BindingStatus::Typed,
-                        term: right.clone(),
-                    })));
+                    self.bindings[index].term =
+                        Some(Rc::new(RefCell::new(BindingTerm::Typed(right.clone()))));
 
                     Ok(Term::Assignment {
                         left: Rc::new(Term::Variable {
@@ -2052,22 +2111,22 @@ impl Env {
             }
 
             Term::Reference(Reference { unique, term, .. }) => {
-                let term = self.type_check(
+                let term = self.type_check_binding(
                     term,
                     expected_type.and_then(|expected| {
                         if let Type::Reference { type_, .. } = expected {
-                            Some(type_)
+                            Some(type_.deref())
                         } else {
                             None
                         }
                     }),
-                );
+                )?;
 
-                Ok(if unique {
+                if *unique {
                     self.unique_reference(&term)
                 } else {
                     self.shared_reference(&term)
-                })
+                }
             }
 
             _ => Err(anyhow!("type checking not yet supported for term {term:?}")),
@@ -2117,10 +2176,7 @@ impl Env {
                 }
 
                 // todo: field, slice, dyn references, etc.
-                _ => Rc::new(RefCell::new(BindingTerm {
-                    status: BindingStatus::Typed,
-                    term: term.clone(),
-                })),
+                _ => Rc::new(RefCell::new(BindingTerm::Typed(term.clone()))),
             },
         }))
     }
@@ -2133,8 +2189,9 @@ impl Env {
         let mut my_expected_type = None;
 
         for term in terms.iter().filter_map(|term| term.as_ref()) {
-            let type_ =
-                self.type_check_binding(term, my_expected_type.as_ref().or(expected_type))?;
+            let type_ = self
+                .type_check_binding(term, my_expected_type.as_ref().or(expected_type))?
+                .type_();
 
             if let Some(expected_type) = my_expected_type.as_ref() {
                 match_types(expected_type, &type_)?;
@@ -2152,7 +2209,7 @@ impl Env {
         expected_type: Option<&Type>,
     ) -> Result<Option<Type>> {
         Ok(if let Some(term) = self.bindings[index].term.clone() {
-            Some(self.type_check_binding(&term, expected_type)?)
+            Some(self.type_check_binding(&term, expected_type)?.type_())
         } else {
             None
         })
@@ -2162,26 +2219,18 @@ impl Env {
         &mut self,
         term: &RefCell<BindingTerm>,
         expected_type: Option<&Type>,
-    ) -> Result<Type> {
-        {
-            let term = RefCell::borrow(term);
-
-            match term.status {
-                BindingStatus::Untyped => (),
-                BindingStatus::Typed | BindingStatus::Evaluated => return Ok(term.term.type_()),
-            }
-        }
-
-        let typed = self.type_check(&RefCell::borrow(term).term, expected_type)?;
-
-        let type_ = typed.type_();
-
-        *RefCell::borrow_mut(term) = BindingTerm {
-            status: BindingStatus::Typed,
-            term: typed,
+    ) -> Result<Term> {
+        let untyped = match RefCell::borrow(term).deref() {
+            BindingTerm::Untyped(term) => term.clone(),
+            BindingTerm::Typed(term) => return Ok(term.clone()),
+            BindingTerm::Evaluated(_) => unreachable!(),
         };
 
-        Ok(type_)
+        let typed = self.type_check(&untyped, expected_type)?;
+
+        *RefCell::borrow_mut(term) = BindingTerm::Typed(typed.clone());
+
+        Ok(typed)
     }
 
     #[allow(clippy::needless_collect)]
@@ -2193,7 +2242,7 @@ impl Env {
             .skip(offset)
             .filter_map(|(index, binding)| {
                 binding.term.as_ref().and_then(|term| {
-                    if let BindingStatus::Untyped = RefCell::borrow(term).status {
+                    if let BindingTerm::Untyped(_) = RefCell::borrow(term).deref() {
                         Some(index)
                     } else {
                         None
@@ -2248,12 +2297,7 @@ impl Env {
                                     .as_ref()
                                     .map(|(_, expr)| self.expr_to_term(expr))
                                     .transpose()?
-                                    .map(|term| {
-                                        Rc::new(RefCell::new(BindingTerm {
-                                            status: BindingStatus::Untyped,
-                                            term,
-                                        }))
-                                    });
+                                    .map(|term| Rc::new(RefCell::new(BindingTerm::Untyped(term))));
 
                                 self.bindings.push(Binding {
                                     name,
@@ -2328,7 +2372,6 @@ impl Env {
                             UnOp::Neg(_) => UnaryOp::Neg,
                             UnOp::Not(_) => UnaryOp::Not,
                             UnOp::Deref(_) => UnaryOp::Deref,
-                            _ => return Err(anyhow!("operation not yet supported: {op:?}")),
                         },
                         term,
                     ))
@@ -2542,6 +2585,7 @@ impl Env {
                 mutability,
                 expr,
                 attrs,
+                ..
             }) => {
                 if !attrs.is_empty() {
                     Err(anyhow!("attributes not yet supported"))
@@ -2549,10 +2593,7 @@ impl Env {
                     Ok(Term::Reference(Reference {
                         unique: mutability.is_some(),
                         path: Rc::new([]),
-                        term: Rc::new(RefCell::new(BindingTerm {
-                            status: BindingStatus::Untyped,
-                            term: self.expr_to_term(expr),
-                        })),
+                        term: Rc::new(RefCell::new(BindingTerm::Untyped(self.expr_to_term(expr)?))),
                     }))
                 }
             }
@@ -2595,7 +2636,9 @@ mod test {
             ONCE.call_once(pretty_env_logger::init_timed);
         }
 
-        Ok(T::from_bytes(&Env::new().eval_line(line)?.value.value))
+        Ok(T::from_bytes(
+            &Env::new().eval_line(line)?.value.rvalue().value,
+        ))
     }
 
     #[test]
@@ -2702,7 +2745,7 @@ mod test {
     fn unique_reference() {
         assert_eq!(
             46_i32,
-            eval("let mut x = 0; ({ let y = &mut x; *y = 23; *y }) + x").unwrap()
+            eval("{ let mut x = 0; ({ let y = &mut x; *y = 23; *y }) + x }").unwrap()
         )
     }
 }
