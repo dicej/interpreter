@@ -396,6 +396,7 @@ enum Type {
         ret: Rc<Type>,
     },
     Nominal(Identifier, Rc<[Type]>, Rc<[Lifetime]>),
+    Unresolved(Identifier),
 }
 
 impl Type {
@@ -525,7 +526,10 @@ impl Reference {
 
 #[derive(Clone, Debug)]
 enum Term {
-    Block(Rc<[Term]>),
+    Block {
+        scope: Rc<RefCell<Scope>>,
+        terms: Rc<[Term]>,
+    },
     Literal(Literal),
     Reference(Reference),
     Let {
@@ -835,9 +839,22 @@ fn match_types(expected: &Type, actual: &Type) -> Result<()> {
     }
 }
 
+enum Item {
+    Struct {
+        parameters: Rc<[Type]>,
+        fields: Rc<[Field]>,
+        methods: Rc<[Abstraction]>,
+    },
+}
+
+struct Scope {
+    items: HashMap<Identifier, Item>,
+}
+
 pub struct Env {
     ids_to_names: Vec<Rc<str>>,
     names_to_ids: HashMap<Rc<str>, usize>,
+    scopes: Vec<Rc<RefCell<Scope>>>,
     bindings: Vec<Binding>,
     loops: Vec<Loop>,
     traits: HashMap<Identifier, Trait>,
@@ -855,9 +872,20 @@ impl Default for Env {
 
 impl Env {
     pub fn new() -> Self {
+        let mut items = hashmap! {
+            self.intern("u8") => Type::Integer(Integer::U8),
+            // todo: etc
+        };
+
         let mut env = Self {
             ids_to_names: Vec::new(),
             names_to_ids: HashMap::new(),
+            scopes: vec![
+                Rc::new(RefCell::new(Scope { items })),
+                Rc::new(RefCell::new(Scope {
+                    items: HashMap::new(),
+                })),
+            ],
             bindings: Vec::new(),
             loops: Vec::new(),
             traits: HashMap::new(),
@@ -1193,6 +1221,8 @@ impl Env {
         let binding_count = self.bindings.len();
 
         let term = &self.stmt_to_term(&stmt)?;
+
+        self.type_check_scope(0)?;
 
         let term = &self.type_check(term, None)?;
 
@@ -1993,27 +2023,42 @@ impl Env {
                 }
             }
 
-            Term::Block(terms) => {
+            Term::Block { scope, terms } => {
                 let binding_count = self.bindings.len();
+                let scope_count = self.scopes.len();
 
-                let terms = terms
-                    .iter()
-                    .map(|term| self.type_check(term, None))
-                    .collect::<Result<_>>();
+                self.scopes.push(scope.clone());
 
-                let binding_check = if terms.is_ok() {
+                let scope_check = self.type_check_scope(scope_count);
+
+                let terms = if scope_check.is_ok() {
+                    terms
+                        .iter()
+                        .map(|term| self.type_check(term, None))
+                        .collect::<Result<_>>()
+                } else {
+                    Ok(Rc::new([]))
+                };
+
+                let binding_check = if scope_check.is_ok() && terms.is_ok() {
                     self.type_check_bindings(binding_count)
                 } else {
                     Ok(())
                 };
 
+                self.scopes.pop();
+
                 // todo: check for bound values which implement Drop and insert the appropriate calls
 
                 self.bindings.truncate(binding_count);
 
+                scope_check?;
                 binding_check?;
 
-                Ok(Term::Block(terms?))
+                Ok(Term::Block {
+                    scope,
+                    terms: terms?,
+                })
             }
 
             Term::Phi(terms) => {
@@ -2263,6 +2308,47 @@ impl Env {
         })
     }
 
+    fn type_check_scope(&mut self, index: usize) -> Result<()> {
+        // todo: resolve unresolved types and type check method bodies
+        let scope = RefCell::borrow_mut(&self.scopes[index]);
+
+        for item in scope.items.values_mut() {
+            match item {
+                Item::Struct { fields, .. } => {
+                    for Field { type_, .. } in fields {
+                        // todo: this will try to borrow the scope again and fail
+                        self.resolve_type(type_)?;
+                    }
+                }
+            }
+        }
+    }
+
+    fn resolve_type(&mut self, type_: &mut Type) -> Result<()> {
+        if let Type::Unresolved(name) = type_ {
+            if let Some(found) = self
+                .scopes
+                .iter()
+                .rev()
+                .find_map(|scope| {
+                    RefCell::borrow(scope)
+                        .items
+                        .get(name)
+                        .map(|item| match item {
+                            Item::Struct { .. } => todo!(),
+                        })
+                })
+                .transpose()?
+            {
+                *type_ = found;
+            } else {
+                return Err(anyhow!("type not found: {}", self.unintern(name)));
+            }
+        }
+
+        Ok(())
+    }
+
     // Does this need to be a method of Env, or can we move it to Pattern?
     fn type_check_pattern(&mut self, pattern: &Pattern, expected_type: &Type) -> Result<()> {
         match_types(
@@ -2314,14 +2400,87 @@ impl Env {
                             }
                         }
 
-                        _ => Err(anyhow!("pattern not yet supported: {pat:?}")),
+                        _ => Err(anyhow!("pattern not yet supported: {pat:#?}")),
                     }
                 }
             }
 
             Stmt::Semi(expr, _) | Stmt::Expr(expr) => self.expr_to_term(expr),
 
-            _ => Err(anyhow!("stmt not yet supported: {stmt:?}")),
+            Stmt::Item(syn::Item::Struct(ItemStruct {
+                ident,
+                generics:
+                    Generics {
+                        params,
+                        where_clause,
+                        ..
+                    },
+                fields: Fields::Named(FieldsNamed { fields, .. }),
+                vis,
+                attrs,
+                ..
+            })) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else if !params.is_empty() {
+                    Err(anyhow!("generic parameters not yet supported"))
+                } else if where_clause.is_some() {
+                    Err(anyhow!("where clauses not yet supported"))
+                } else if vis != Visibility::Inherited {
+                    Err(anyhow!("visibility not yet supported"))
+                } else {
+                    let name = self.intern(&ident.to_string());
+
+                    let fields = fields
+                        .iter()
+                        .map(
+                            |syn::Field {
+                                 ident,
+                                 ty,
+                                 vis,
+                                 attrs,
+                                 ..
+                             }| {
+                                if !attrs.is_empty() {
+                                    Err(anyhow!("attributes not yet supported"))
+                                } else if vis != Visibility::Inherited {
+                                    Err(anyhow!("visibility not yet supported"))
+                                } else {
+                                    Ok(Field {
+                                        name: self.intern(
+                                            &ident
+                                                .ok_or_else(|| {
+                                                    anyhow!("missing field name in struct")
+                                                })?
+                                                .to_string(),
+                                        ),
+                                        type_: self.type_to_type(ty)?,
+                                    })
+                                }
+                            },
+                        )
+                        .collect::<Result<_>>();
+
+                    let scope = RefCell::borrow_mut(self.scopes.last().unwrap());
+
+                    if scope.items.contains_key(&name) {
+                        Err(anyhow!("duplicate item identifier: {}", ident.to_string()))
+                    } else {
+                        scope.items.insert(
+                            name,
+                            Item::Struct {
+                                parameters: Rc::new([]),
+                                fields,
+                                methods: Rc::new([]),
+                            },
+                        );
+
+                        Ok(Term::Literal(self.unit.clone()))
+                    }
+                }
+            }
+
+            _ => Err(anyhow!("stmt not yet supported: {stmt:#?}")),
         }
     }
 
@@ -2598,12 +2757,15 @@ impl Env {
                 }
             }
 
-            _ => Err(anyhow!("expr not yet supported: {expr:?}")),
+            _ => Err(anyhow!("expr not yet supported: {expr:#?}")),
         }
     }
 
     fn block_to_term(&mut self, stmts: &[Stmt]) -> Result<Term> {
         let binding_count = self.bindings.len();
+
+        let scope = Rc::new(RefCell::new(Scope));
+        self.scopes.push(scope.clone());
 
         let result = stmts
             .iter()
@@ -2612,12 +2774,48 @@ impl Env {
             .map(|terms| match &terms[..] {
                 [] => Term::Literal(self.unit.clone()),
 
-                terms => Term::Block(Rc::from(terms)),
+                terms => Term::Block {
+                    scope,
+                    terms: Rc::from(terms),
+                },
             });
+
+        self.scopes.pop();
 
         self.bindings.truncate(binding_count);
 
         result
+    }
+
+    fn type_to_type(&mut self, type_: &syn::Type) -> Result<Type> {
+        match type_ {
+            syn::Type::Path(TypePath {
+                path:
+                    Path {
+                        leading_colon,
+                        segments,
+                    },
+                qself,
+            }) => {
+                if qself.is_some() {
+                    Err(anyhow!("qualified paths not yet supported"))
+                } else if leading_colon.is_some() {
+                    Err(anyhow!("absolute paths not yet supported"))
+                } else if segments.len() != 1 {
+                    Err(anyhow!("qualified paths not yet supported"))
+                } else if let Some(PathSegment { ident, arguments }) = segments.last() {
+                    if let PathArguments::None = arguments {
+                        Ok(Type::Unresolved(self.intern(ident.to_string())))
+                    } else {
+                        Err(anyhow!("path arguments not yet supported"))
+                    }
+                } else {
+                    Err(anyhow!("unexpected empty path"))
+                }
+            }
+
+            _ => Err(anyhow!("type_ not yet supported: {type_:#?}")),
+        }
     }
 
     pub fn eval_file(&mut self, _file: &str) -> Result<Eval> {
@@ -2746,6 +2944,46 @@ mod test {
         assert_eq!(
             46_i32,
             eval("{ let mut x = 0; ({ let y = &mut x; *y = 23; *y }) + x }").unwrap()
+        )
+    }
+
+    #[test]
+    fn struct_field_access() {
+        assert_eq!(
+            7_i64,
+            eval("{ struct Foo { x: i64, y: i64 } let f = Foo { x: 7, y: 14 }; f.x }").unwrap()
+        )
+    }
+
+    #[test]
+    fn struct_field_mutation() {
+        assert_eq!(
+            56_i64,
+            eval("{ struct Foo { x: i64, y: i64 } let mut f = Foo { x: 7, y: 14 }; f.y = 49; f.x + f.y }").unwrap()
+        )
+    }
+
+    #[test]
+    fn struct_field_shared_reference() {
+        assert_eq!(
+            14_i64,
+            eval("{ struct Foo { x: i64, y: i64 } let f = Foo { x: 7, y: 14 }; let y = &f.y; *y }")
+                .unwrap()
+        )
+    }
+
+    #[test]
+    fn struct_field_unique_reference() {
+        assert_eq!(
+            44_i64,
+            eval(
+                "{ struct Foo { x: i64, y: i64 } \
+                  let mut f = Foo { x: 7, y: 14 }; \
+                  let y = &mut f.y; \
+                  *y = 22;\
+                  f.y * *y }"
+            )
+            .unwrap()
         )
     }
 }
