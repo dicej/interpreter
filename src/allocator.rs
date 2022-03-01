@@ -1,7 +1,12 @@
+use {
+    maplit::btreemap,
+    std::{cmp::Ordering, collections::BTreeMap},
+};
+
 pub struct Allocator {
     capacity: usize,
     by_offset: BTreeMap<usize, usize>,
-    by_size: HashMap<usize, Vec<usize>>,
+    by_size: BTreeMap<usize, Vec<usize>>,
 }
 
 impl Allocator {
@@ -9,22 +14,22 @@ impl Allocator {
         Self {
             capacity,
             by_offset: btreemap![0 => capacity],
-            by_size: hashmap![capacity => vec![0]],
+            by_size: btreemap![capacity => vec![0]],
         }
     }
 
     fn remove(&mut self, offset: usize, size: usize) {
         let empty = {
-            let offsets = self.by_size.get_mut(size).unwrap();
+            let offsets = self.by_size.get_mut(&size).unwrap();
             offsets.retain(|offset| offset != offset);
             offsets.is_empty()
         };
 
         if empty {
-            self.by_size.remove(size)
+            self.by_size.remove(&size);
         }
 
-        self.by_offset.remove(offset);
+        self.by_offset.remove(&offset);
     }
 
     pub fn allocate(&mut self, size: usize) -> Option<usize> {
@@ -45,10 +50,10 @@ impl Allocator {
             self.by_size.remove(free_size);
         }
 
-        self.by_offset.remove(offset);
+        self.by_offset.remove(&offset);
 
-        if size < free_size {
-            let new_free_size = free_size - size;
+        if size < *free_size {
+            let new_free_size = *free_size - size;
             let new_offset = offset + size;
 
             self.by_offset.insert(new_offset, new_free_size);
@@ -66,41 +71,44 @@ impl Allocator {
             return;
         }
 
-        if offset + size > capacity {
+        if offset + size > self.capacity {
             panic!("invalid free: region exceeds capacity");
         }
 
-        if self.by_offset.range(offset..(offset + size)) {
+        if self
+            .by_offset
+            .range(offset..(offset + size))
+            .next()
+            .is_some()
+        {
             panic!("invalid free: region overlaps already-free region");
         }
 
-        let merge_previous =
-            self.by_offset(..offset)
-                .rev()
-                .next()
-                .filter(|(previous_offset, previous_size)| {
-                    match offset.cmp(&(previous_offset + previous_size)) {
-                        Ordering::Less => {
-                            panic!("invalid free: region overlaps already-free region");
-                        }
-                        Ordering::Equal => true,
-                        Ordering::Greater => false,
-                    }
-                });
+        let merge_previous = self.by_offset.range(..offset).rev().next().filter(
+            |(previous_offset, previous_size)| match offset
+                .cmp(&(**previous_offset + **previous_size))
+            {
+                Ordering::Less => {
+                    panic!("invalid free: region overlaps already-free region");
+                }
+                Ordering::Equal => true,
+                Ordering::Greater => false,
+            },
+        );
 
         if let Some((previous_offset, previous_size)) = merge_previous {
-            offset = previous_offset;
-            size += previous_size;
+            offset = *previous_offset;
+            size += *previous_size;
 
-            self.remove(previous_offset, previous_size);
+            self.remove(*previous_offset, *previous_size);
         }
 
-        let merge_next = self.by_offset.get(offset + size);
+        let next_offset = offset + size;
 
-        if let Some((next_offset, next_size)) = merge_next {
-            size += next_size;
+        if let Some(next_size) = self.by_offset.get(&next_offset) {
+            size += *next_size;
 
-            self.remove(next_offset, next_size);
+            self.remove(next_offset, *next_size);
         }
 
         self.by_offset.insert(offset, size);
@@ -110,18 +118,23 @@ impl Allocator {
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use {
+        super::*,
+        proptest::{collection, prelude::Just, proptest, strategy::Strategy},
+    };
 
     const MIN_CAPACITY: usize = 32;
     const MAX_CAPACITY: usize = 1024;
     const MAX_ITERATIONS_PER_CASE: usize = 100;
     const MAX_ALLOCATIONS_PER_ITERATION: usize = 100;
 
+    #[derive(Debug)]
     struct Iteration {
         allocations: Vec<usize>,
         frees: Vec<usize>,
     }
 
+    #[derive(Debug)]
     struct Case {
         capacity: usize,
         iterations: Vec<Iteration>,
@@ -135,10 +148,10 @@ mod test {
                 let regions = iteration
                     .allocations
                     .iter()
-                    .map(|size| (allocator.allocate(size), size))
+                    .map(|&size| (allocator.allocate(size), size))
                     .collect::<Vec<_>>();
 
-                for index in &iteration.frees {
+                for &index in &iteration.frees {
                     if let (Some(offset), size) = regions[index] {
                         allocator.free(offset, size)
                     }
@@ -148,19 +161,26 @@ mod test {
     }
 
     fn arb_iteration(capacity: usize) -> impl Strategy<Value = Iteration> {
-        vec(0..capacity, 1..=MAX_ALLOCATIONS_PER_ITERATION).prop_flat_map(|allocations| {
-            Just((0..allocations.len()).into_iter().collect::<Vec<_>>())
-                .prop_shuffle()
-                .prop_map(|frees| Iteration { allocations, frees })
-        })
+        collection::vec(0..capacity, 1..=MAX_ALLOCATIONS_PER_ITERATION).prop_flat_map(
+            |allocations| {
+                Just((0..allocations.len()).into_iter().collect::<Vec<_>>())
+                    .prop_shuffle()
+                    .prop_map(move |frees| Iteration {
+                        allocations: allocations.clone(),
+                        frees,
+                    })
+            },
+        )
     }
 
     fn arb_case() -> impl Strategy<Value = Case> {
         (MIN_CAPACITY..=MAX_CAPACITY).prop_flat_map(|capacity| {
-            vec(arb_iteration(capacity), 1..=MAX_ITERATIONS_PER_CASE).prop_map(|iterations| Case {
-                capacity,
-                iteration,
-            })
+            collection::vec(arb_iteration(capacity), 1..=MAX_ITERATIONS_PER_CASE).prop_map(
+                move |iterations| Case {
+                    capacity,
+                    iterations,
+                },
+            )
         })
     }
 
