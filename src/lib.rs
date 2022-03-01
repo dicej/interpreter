@@ -2,6 +2,7 @@
 #![allow(dead_code)] // temporary
 
 use {
+    crate::allocator::Allocator,
     anyhow::{anyhow, Result},
     log::info,
     maplit::hashmap,
@@ -25,6 +26,8 @@ use {
         PatIdent, Path, PathArguments, PathSegment, Stmt, TypePath, UnOp, Visibility,
     },
 };
+
+mod allocator;
 
 trait FromBytes {
     fn from_bytes(bytes: &[u8]) -> Self;
@@ -58,10 +61,6 @@ trait ToBytes: Sized {
     type Bytes: AsRef<[u8]>;
 
     fn to_bytes(self) -> Self::Bytes;
-
-    fn to_rc(self) -> Rc<[u8]> {
-        Rc::from(self.to_bytes().as_ref())
-    }
 }
 
 macro_rules! integer_to_bytes {
@@ -143,24 +142,34 @@ macro_rules! integer_signed_op {
     };
 }
 
-fn add<T: FromBytes + ToBytes + Add<T, Output = T>>((a, b): (&[u8], &[u8])) -> Rc<[u8]> {
-    T::from_bytes(a).add(T::from_bytes(b)).to_rc()
+fn add<T: FromBytes + ToBytes + Add<T, Output = T>>(env: &mut Env) {
+    let b = env.pop::<T>();
+    let a = env.pop::<T>();
+    env.push(a + b);
 }
 
-fn sub<T: FromBytes + ToBytes + Sub<T, Output = T>>((a, b): (&[u8], &[u8])) -> Rc<[u8]> {
-    T::from_bytes(a).sub(T::from_bytes(b)).to_rc()
+fn sub<T: FromBytes + ToBytes + Sub<T, Output = T>>(env: &mut Env) {
+    let b = env.pop::<T>();
+    let a = env.pop::<T>();
+    env.push(a - b);
 }
 
-fn mul<T: FromBytes + ToBytes + Mul<T, Output = T>>((a, b): (&[u8], &[u8])) -> Rc<[u8]> {
-    T::from_bytes(a).mul(T::from_bytes(b)).to_rc()
+fn mul<T: FromBytes + ToBytes + Mul<T, Output = T>>(env: &mut Env) {
+    let b = env.pop::<T>();
+    let a = env.pop::<T>();
+    env.push(a * b);
 }
 
-fn div<T: FromBytes + ToBytes + Div<T, Output = T>>((a, b): (&[u8], &[u8])) -> Rc<[u8]> {
-    T::from_bytes(a).div(T::from_bytes(b)).to_rc()
+fn div<T: FromBytes + ToBytes + Div<T, Output = T>>(env: &mut Env) {
+    let b = env.pop::<T>();
+    let a = env.pop::<T>();
+    env.push(a / b);
 }
 
-fn rem<T: FromBytes + ToBytes + Rem<T, Output = T>>((a, b): (&[u8], &[u8])) -> Rc<[u8]> {
-    T::from_bytes(a).rem(T::from_bytes(b)).to_rc()
+fn rem<T: FromBytes + ToBytes + Rem<T, Output = T>>(env: &mut Env) {
+    let b = env.pop::<T>();
+    let a = env.pop::<T>();
+    env.push(a % b);
 }
 
 macro_rules! integer_binary_ops_cases {
@@ -405,74 +414,41 @@ enum Type {
 }
 
 impl Type {
-    fn at(&self, path: &[Identifier]) -> Type {
-        if path.is_empty() {
-            self.clone()
-        } else {
-            todo!()
-        }
-    }
-
-    fn layout(&self) -> Layout {
-        let (size, alignment) = match self {
-            Type::Unit => (0, 0),
-            Type::Boolean => (1, 1),
+    fn size(&self) -> usize {
+        match self {
+            Type::Unit => 0,
+            Type::Boolean => 1,
             Type::Integer(type_) => match type_ {
-                Integer::U8 | Integer::I8 => (1, 1),
-                Integer::U16 | Integer::I16 => (2, 2),
-                Integer::U32 | Integer::I32 => (4, 4),
-                Integer::U64 | Integer::I64 | Integer::Usize | Integer::Isize => (8, 8),
-                Integer::U128 | Integer::I128 => (16, 16),
+                Integer::U8 | Integer::I8 => 1,
+                Integer::U16 | Integer::I16 => 2,
+                Integer::U32 | Integer::I32 => 4,
+                Integer::U64 | Integer::I64 => 8,
+                Integer::Usize | Integer::Isize => mem::size_of::<usize>(),
+                Integer::U128 | Integer::I128 => 16,
             },
-            _ => todo!("layout for {self:?}"),
-        };
-
-        Layout { size, alignment }
+            Type::Nominal { definition, .. } => {
+                if let Item::Struct { fields, .. } =
+                    RefCell::borrow(&definition.upgrade().unwrap()).deref()
+                {
+                    // todo: precalculate and store this during typechecking (and be sure to detect and flag infinite types)
+                    fields
+                        .values()
+                        .max_by(|a, b| a.offset.cmp(&b.offset))
+                        .map(|max| max.offset + max.type_.size())
+                        .unwrap_or(0)
+                } else {
+                    todo!("size for {self:?}")
+                }
+            }
+            _ => todo!("size for {self:?}"),
+        }
     }
 }
 
-struct Layout {
-    size: usize,
-    alignment: usize,
-}
-
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Literal {
-    value: Rc<[u8]>,
+    offset: usize,
     type_: Type,
-}
-
-impl fmt::Debug for Literal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, f)
-    }
-}
-
-impl fmt::Display for Literal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fn fmt<T: FromBytes + Display>(
-            (f, value): (&mut fmt::Formatter<'_>, &[u8]),
-        ) -> fmt::Result {
-            write!(f, "{}_{}", T::from_bytes(value), any::type_name::<T>())
-        }
-
-        match self.type_ {
-            Type::Integer(integer) => match integer {
-                Integer::Unknown => write!(f, "{}", str::from_utf8(&self.value).unwrap()),
-                _ => integer_op!(fmt, integer, (f, &self.value)),
-            },
-
-            Type::Boolean => write!(
-                f,
-                "{}",
-                u8::from_ne_bytes(self.value.deref().try_into().unwrap()) != 0
-            ),
-
-            Type::Unit => write!(f, "()"),
-
-            _ => write!(f, "todo: Debug for {:?}", self.type_),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -534,13 +510,12 @@ struct MatchArm {
 struct Reference {
     // todo: add lifetime field
     unique: bool,
-    path: Rc<[Identifier]>,
-    term: Rc<RefCell<BindingTerm>>,
+    term: Term,
 }
 
 impl Reference {
     fn deref_type(&self) -> Type {
-        RefCell::borrow(&self.term).type_().at(&self.path)
+        self.term.type_()
     }
 
     fn type_(&self) -> Type {
@@ -558,7 +533,7 @@ enum Term {
         terms: Rc<[Term]>,
     },
     Literal(Literal),
-    Reference(Reference),
+    Reference(Rc<Reference>),
     Let {
         name: Identifier,
         mutable: bool,
@@ -666,19 +641,9 @@ struct Loop {
 
 #[derive(Clone, Debug)]
 enum BindingTerm {
-    Untyped(Term),
+    Reserved(Literal),
     Typed(Term),
-    Evaluated(EvalTerm),
-}
-
-impl BindingTerm {
-    fn type_(&self) -> Type {
-        match self {
-            Self::Untyped(_) => unreachable!(),
-            Self::Typed(term) => term.type_(),
-            Self::Evaluated(term) => term.type_(),
-        }
-    }
+    Untyped(Term),
 }
 
 #[derive(Clone, Debug)]
@@ -748,81 +713,11 @@ impl BranchContext {
     }
 }
 
-#[derive(Clone)]
-enum EvalTerm {
-    Value(Literal),
-    Reference(Reference),
-    Deref(Reference),
-}
-
-impl fmt::Debug for EvalTerm {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, f)
-    }
-}
-
-impl fmt::Display for EvalTerm {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Value(literal) => literal.fmt(f),
-            Self::Reference(Reference { unique, term, .. }) => {
-                // todo: use path
-                if let BindingTerm::Evaluated(term) = RefCell::borrow(term).deref() {
-                    write!(f, "{}{}", if *unique { "&mut " } else { "&" }, term)
-                } else {
-                    unreachable!()
-                }
-            }
-            Self::Deref(Reference { term, .. }) => {
-                // todo: use path
-                if let BindingTerm::Evaluated(EvalTerm::Value(literal)) =
-                    RefCell::borrow(term).deref()
-                {
-                    literal.fmt(f)
-                } else {
-                    unreachable!()
-                }
-            }
-        }
-    }
-}
-
-impl EvalTerm {
-    fn type_(&self) -> Type {
-        match self {
-            Self::Value(literal) => literal.type_.clone(),
-            Self::Reference(reference) => reference.type_(),
-            Self::Deref(reference) => reference.deref_type(),
-        }
-    }
-
-    fn rvalue(&self) -> Literal {
-        match self {
-            Self::Value(literal) => literal.clone(),
-            Self::Deref(Reference { term, .. }) => {
-                // todo: use path
-                if let BindingTerm::Evaluated(EvalTerm::Value(literal)) =
-                    RefCell::borrow(term).deref()
-                {
-                    literal.clone()
-                } else {
-                    unreachable!()
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
 #[derive(Debug)]
 enum EvalException {
-    Break {
-        label: Option<Identifier>,
-        result: EvalTerm,
-    },
-    Return {
-        result: EvalTerm,
-    },
+    Break { label: Option<Identifier> },
+    Return,
+    Overflow,
 }
 
 pub struct Eval {
@@ -908,7 +803,16 @@ impl Default for Scope {
     }
 }
 
+struct StackData {
+    bottom: usize,
+    top: usize,
+    offset: usize,
+}
+
 pub struct Env {
+    heap: Box<[u8]>,
+    allocator: Allocator,
+    stack: StackData,
     ids_to_names: Vec<Rc<str>>,
     names_to_ids: HashMap<Rc<str>, usize>,
     scopes: Vec<Scope>,
@@ -921,15 +825,47 @@ pub struct Env {
     false_: Literal,
 }
 
+const DEFAULT_HEAP_SIZE: usize = 1024 * 1024;
+const DEFAULT_STACK_SIZE: usize = DEFAULT_HEAP_SIZE / 2;
+
 impl Default for Env {
     fn default() -> Self {
-        Self::new()
+        Self::try_new(DEFAULT_HEAP_SIZE, DEFAULT_STACK_SIZE).unwrap()
     }
 }
 
 impl Env {
-    pub fn new() -> Self {
+    pub fn try_new(heap_size: usize, stack_size: usize) -> Result<Self> {
+        let mut allocator = Allocator::new(heap_size);
+
+        // allocate dummy region so that we know no real object will ever be allocated at offset zero
+        let padding = 8;
+
+        allocator
+            .allocate(padding)
+            .ok_or_else(|| anyhow!("heap size must be at least {padding}"));
+
+        let bottom = allocator.allocate(stack_size).ok_or_else(|| {
+            anyhow!("stack size must be less than or equal to heap size + {padding}")
+        });
+
+        let stack = StackData {
+            bottom,
+            top: bottom + stack_size,
+            offset: bottom,
+        };
+
+        let mut heap = vec![0; heap_size].into_boxed_slice();
+
+        let true_offset = 4;
+        heap[true_offset] = 1;
+
+        let false_offset = 5;
+
         let mut env = Self {
+            heap,
+            allocator,
+            stack,
             ids_to_names: Vec::new(),
             names_to_ids: HashMap::new(),
             scopes: vec![Scope::new(), Scope::new()],
@@ -938,15 +874,15 @@ impl Env {
             traits: HashMap::new(),
             impls: HashMap::new(),
             unit: Literal {
-                value: ().to_rc(),
+                offset: allocator.allocate(0),
                 type_: Type::Unit,
             },
             true_: Literal {
-                value: true.to_rc(),
+                true_offset,
                 type_: Type::Boolean,
             },
             false_: Literal {
-                value: false.to_rc(),
+                false_offset,
                 type_: Type::Boolean,
             },
         };
@@ -1255,7 +1191,7 @@ impl Env {
             }
         }
 
-        env
+        Ok(env)
     }
 
     fn find_term(&self, id: Identifier) -> Option<usize> {
@@ -1406,7 +1342,7 @@ impl Env {
         None
     }
 
-    fn eval_term(&mut self, term: &Term) -> Result<EvalTerm, EvalException> {
+    fn eval_term(&mut self, term: &Term) -> Result<(), EvalException> {
         match term {
             Term::Let {
                 name,
@@ -1427,8 +1363,17 @@ impl Env {
                 if let Some(term) = term {
                     let mut term = RefCell::borrow_mut(term);
 
-                    *term = BindingTerm::Evaluated(match term.deref() {
-                        BindingTerm::Typed(term) => self.eval_term(term)?,
+                    *term = BindingTerm::Reserved(match term.deref() {
+                        BindingTerm::Typed(term) => {
+                            let offset = self.stack.offset;
+
+                            self.eval_term(term)?;
+
+                            Literal {
+                                offset,
+                                type_: term.type_(),
+                            }
+                        }
                         _ => unreachable!(),
                     });
                 }
@@ -1437,16 +1382,30 @@ impl Env {
             }
 
             Term::Variable { index, .. } => {
-                let term = RefCell::borrow(self.bindings[*index].term.as_ref().unwrap());
+                if let BindingTerm::Reserved(term) =
+                    RefCell::borrow(self.bindings[*index].term.as_ref().unwrap()).deref()
+                {
+                    let src = term.offset;
+                    let size = term.type_().size();
+                    let dest = self.stack.offset;
 
-                if let BindingTerm::Evaluated(term) = term.deref() {
-                    Ok(term.clone())
+                    self.reserve(size);
+
+                    self.heap.copy_within(src..(src + size), dest);
                 } else {
                     panic!("unexpected binding term variant: {term:?}")
                 }
             }
 
-            Term::Literal(literal) => Ok(EvalTerm::Value(literal.clone())),
+            Term::Literal(term) => {
+                let src = term.offset;
+                let size = term.type_().size();
+                let dest = self.stack.offset;
+
+                self.reserve(size);
+
+                self.heap.copy_within(src..(src + size), dest);
+            }
 
             Term::Application {
                 abstraction:
@@ -1455,19 +1414,26 @@ impl Env {
                     },
                 arguments,
             } => {
+                let offset = self.stack.offset;
+
                 let mut parameters = arguments
                     .iter()
                     .zip(parameters.iter())
                     .map(|(term, Parameter { name, mutable, .. })| {
+                        let offset = self.stack.offset;
+
+                        self.eval_term(term)?;
+
                         Ok(Binding {
                             name: *name,
                             mutable: *mutable,
-                            term: Some(Rc::new(RefCell::new(BindingTerm::Evaluated(
-                                self.eval_term(term)?,
-                            )))),
+                            term: Some(Rc::new(RefCell::new(BindingTerm::Reserved(Literal {
+                                type_: term.type_(),
+                                offset,
+                            })))),
                         })
                     })
-                    .collect::<Result<Vec<_>, EvalException>>()?;
+                    .collect::<Result<Vec<_>, _>>()?;
 
                 mem::swap(&mut parameters, &mut self.bindings);
 
@@ -1475,76 +1441,60 @@ impl Env {
 
                 mem::swap(&mut parameters, &mut self.bindings);
 
-                result
+                self.stack.offset = offset;
+
+                return result;
             }
 
             Term::And(left, right) => {
-                if u8::from_ne_bytes(
-                    self.eval_term(left)?
-                        .rvalue()
-                        .value
-                        .deref()
-                        .try_into()
-                        .unwrap(),
-                ) != 0
-                {
-                    self.eval_term(right)
+                self.eval_term(left)?;
+
+                if !self.pop::<bool>() {
+                    return self.eval_term(right);
                 } else {
-                    Ok(EvalTerm::Value(Literal {
-                        value: false.to_rc(),
-                        type_: Type::Boolean,
-                    }))
+                    self.push(false);
                 }
             }
 
             Term::Or(left, right) => {
-                if u8::from_ne_bytes(
-                    self.eval_term(left)?
-                        .rvalue()
-                        .value
-                        .deref()
-                        .try_into()
-                        .unwrap(),
-                ) == 0
-                {
-                    self.eval_term(right)
+                self.eval_term(left)?;
+
+                if self.pop::<bool>() {
+                    return self.eval_term(right);
                 } else {
-                    Ok(EvalTerm::Value(Literal {
-                        value: true.to_rc(),
-                        type_: Type::Boolean,
-                    }))
+                    self.push(true);
                 }
             }
 
             Term::UnaryOp(op, term) => {
-                fn neg<T: FromBytes + ToBytes + Neg<Output = T>>(n: &[u8]) -> Rc<[u8]> {
-                    T::from_bytes(n).neg().to_rc()
+                fn neg<T: FromBytes + ToBytes + Neg<Output = T>>(env: &mut Env) {
+                    let tmp = env.pop::<T>();
+                    env.push(-tmp);
                 }
 
-                let result = self.eval_term(term)?;
+                self.eval_term(term)?;
 
                 match op {
-                    UnaryOp::Neg => {
-                        let result = result.rvalue();
+                    UnaryOp::Neg => match term.type_() {
+                        Type::Integer(integer_type) => integer_signed_op!(neg, integer_type, self),
 
-                        match result.type_ {
-                            Type::Integer(integer_type) => Ok(EvalTerm::Value(Literal {
-                                type_: Type::Integer(integer_type),
-                                value: integer_signed_op!(neg, integer_type, &result.value),
-                            })),
+                        _ => unreachable!(),
+                    },
 
-                            _ => unreachable!(),
-                        }
+                    UnaryOp::Not => {
+                        let tmp = self.pop::<bool>();
+                        self.push(!tmp);
                     }
 
-                    UnaryOp::Not => Ok(EvalTerm::Value(Literal {
-                        type_: Type::Boolean,
-                        value: (!bool::from_bytes(&result.rvalue().value)).to_rc(),
-                    })),
-
                     UnaryOp::Deref => {
-                        if let EvalTerm::Reference(reference) = result {
-                            Ok(EvalTerm::Deref(reference))
+                        if let Term::Reference(reference) = term {
+                            let src = self.pop::<usize>();
+                            let size = reference.deref_type().size();
+                            let dest = self.stack.offset;
+
+                            self.reserve(size);
+
+                            self.heap.copy_within(src..(src + size), dest);
                         } else {
                             unreachable!()
                         }
@@ -1553,62 +1503,47 @@ impl Env {
             }
 
             Term::BinaryOp(op, left, right) => {
-                let left = self.eval_term(left)?.rvalue();
-                let right = self.eval_term(right)?.rvalue();
+                self.eval_term(left)?;
+                self.eval_term(right)?;
 
                 match left.type_ {
-                    Type::Integer(integer_type) => Ok(EvalTerm::Value(match op {
+                    Type::Integer(integer_type) => match op {
                         BinaryOp::Add
                         | BinaryOp::Sub
                         | BinaryOp::Mul
                         | BinaryOp::Div
-                        | BinaryOp::Rem => Literal {
-                            type_: Type::Integer(integer_type),
-                            value: integer_binary_ops!(op, integer_type, &left.value, &right.value),
-                        },
+                        | BinaryOp::Rem => integer_binary_ops!(op, integer_type, self),
 
                         BinaryOp::Eq
                         | BinaryOp::Ge
                         | BinaryOp::Gt
                         | BinaryOp::Le
-                        | BinaryOp::Lt => Literal {
-                            type_: Type::Boolean,
-                            value: integer_comparison_ops!(
-                                op,
-                                integer_type,
-                                &left.value,
-                                &right.value
-                            )
-                            .to_rc(),
-                        },
+                        | BinaryOp::Lt => integer_comparison_ops!(op, integer_type, self),
                         _ => unreachable!(),
-                    })),
+                    },
                     _ => unreachable!(),
                 }
             }
 
             Term::Match { scrutinee, arms } => {
-                let scrutinee = self.eval_term(scrutinee)?;
+                self.eval_term(scrutinee)?;
 
                 for arm in arms.iter() {
-                    if self.match_pattern(&arm.pattern, &scrutinee) {
+                    if self.match_pattern(&arm.pattern) {
                         // todo: push and pop pattern bindings
 
                         let match_guard = if let Some(guard) = &arm.guard {
-                            u8::from_ne_bytes(
-                                self.eval_term(guard)?
-                                    .rvalue()
-                                    .value
-                                    .deref()
-                                    .try_into()
-                                    .unwrap(),
-                            ) != 0
+                            self.eval_term(guard)?;
+
+                            self.pop::<bool>()
                         } else {
                             true
                         };
 
                         if match_guard {
-                            return self.eval_term(&arm.body);
+                            self.eval_term(&arm.body);
+
+                            return Ok(());
                         }
                     }
                 }
@@ -1619,33 +1554,47 @@ impl Env {
             }
 
             Term::Assignment { left, right } => {
-                let right = BindingTerm::Evaluated(self.eval_term(right)?);
+                let base = self.stack.offset;
 
-                if let Term::Variable { index, .. } = left.deref() {
-                    let term = &mut self.bindings[*index].term;
+                self.eval_term(right)?;
 
-                    if let Some(term) = term {
-                        *RefCell::borrow_mut(term) = right;
-                    } else {
-                        *term = Some(Rc::new(RefCell::new(right)));
+                let offset = match left.deref() {
+                    Term::Variable { index, .. } => {
+                        if let BindingTerm::Reserved(value) =
+                            RefCell::borrow(&self.bindings[*index].term).deref()
+                        {
+                            value.offset
+                        } else {
+                            unreachable!()
+                        }
                     }
-                } else if let EvalTerm::Deref(Reference { term, .. }) = self.eval_term(left)? {
-                    // todo: use path
-                    *RefCell::borrow_mut(&term) = right;
-                } else {
-                    todo!("assignment to {left:?}")
-                }
 
-                Ok(EvalTerm::Value(self.unit.clone()))
+                    Term::UnaryOp(UnaryOp::Deref, left) => self.offset_of(left),
+
+                    _ => todo!("assignment to {left:?}"),
+                };
+
+                let size = right.type_.size();
+
+                self.reserve(size)?;
+
+                self.heap.copy_within(base..(base + size), offset);
+
+                self.stack.offset = limit;
             }
 
             Term::Block { terms, .. } => {
                 let binding_count = self.bindings.len();
 
-                let terms = terms
-                    .iter()
-                    .map(|term| self.eval_term(term))
-                    .collect::<Result<Vec<_>, EvalException>>();
+                let offset = self.stack.offset;
+
+                let terms = terms.iter().try_for_each(|term| {
+                    let result = self.eval_term(term);
+
+                    self.stack.offset = offset;
+
+                    result
+                });
 
                 self.bindings.truncate(binding_count);
 
@@ -1656,40 +1605,31 @@ impl Env {
                 match self.eval_term(body) {
                     Ok(_) => (),
 
-                    Err(EvalException::Break {
-                        label: break_label,
-                        result,
-                    }) if break_label.is_none() || break_label == *label => break Ok(result),
+                    Err(EvalException::Break { label: break_label })
+                        if break_label.is_none() || break_label == *label =>
+                    {
+                        break
+                    }
 
-                    err => break err,
+                    err => return err,
                 }
             },
 
-            Term::Break { label, term } => Err(EvalException::Break {
-                label: *label,
-                result: self.eval_term(term)?,
-            }),
+            Term::Break { label, term } => {
+                return Err(EvalException::Break {
+                    label: *label,
+                    result: self.eval_term(term)?,
+                })
+            }
 
-            Term::Return { term } => Err(EvalException::Return {
-                result: self.eval_term(term)?,
-            }),
+            Term::Return { term } => {
+                return Err(EvalException::Return {
+                    result: self.eval_term(term)?,
+                })
+            }
 
             Term::Reference(Reference { unique, term, path }) => {
-                {
-                    let mut term = RefCell::borrow_mut(term);
-
-                    *term = BindingTerm::Evaluated(match term.deref() {
-                        BindingTerm::Typed(term) => self.eval_term(term)?,
-                        BindingTerm::Evaluated(term) => term.clone(),
-                        _ => unreachable!(),
-                    });
-                }
-
-                Ok(EvalTerm::Reference(Reference {
-                    unique: *unique,
-                    term: term.clone(),
-                    path: path.clone(),
-                }))
+                self.push(self.offset_of(term))?;
             }
 
             Term::Struct { type_, arguments } => {
@@ -1705,25 +1645,26 @@ impl Env {
                     unreachable!()
                 };
 
-                let mut value = vec![
-                    0u8;
-                    fields
-                        .values()
-                        .max_by(|a, b| a.offset.cmp(&b.offset))
-                        .map(|max| max.offset + max.type_.layout().size)
-                        .unwrap_or(0)
-                ];
+                let base = self.stack.offset;
+
+                let size = type_.size();
+
+                self.reserve(size)?;
+
+                let offset = self.stack.offset;
 
                 for (name, term) in arguments.deref() {
-                    // todo: support references
-                    value[fields.get(name).unwrap().offset..]
-                        .copy_from_slice(&self.eval_term(term)?.rvalue().value);
-                }
+                    let field = fields.get(name).unwrap();
 
-                Ok(EvalTerm::Value(Literal {
-                    type_: type_.clone(),
-                    value: Rc::from(&value as &[_]),
-                }))
+                    self.eval_term(term)?;
+
+                    self.heap.copy_within(
+                        offset..offset + field.type_.size(),
+                        base_offset + field.offset,
+                    );
+
+                    self.stack.offset = offset;
+                }
             }
 
             Term::Field { base, name } => {
@@ -1739,18 +1680,23 @@ impl Env {
                     todo!("field access through references, smart pointers, etc.")
                 };
 
-                // todo: support references
-                Ok(EvalTerm::Value(Literal {
-                    type_: field.type_.clone(),
-                    value: Rc::from(
-                        &self.eval_term(base)?.rvalue().value
-                            [field.offset..(field.offset + field.type_.layout().size)],
-                    ),
-                }))
+                self.eval_term(base)?;
+
+                let base_offset = self.stack.offset - base.type_().size();
+
+                let field_offset = base_offset + field.offset;
+
+                self.heap.copy_within(
+                    field_offset..(field_offset + field.type_.size()),
+                    base_offset,
+                );
+                self.stack.offset = base_offset;
             }
 
             _ => todo!("evaluation not yet supported for term {term:?}"),
         }
+
+        Ok(())
     }
 
     // Does this need to be a method of Env, or can we move it to Pattern?
@@ -1829,25 +1775,26 @@ impl Env {
                 })
             }
 
-            Term::Literal(Literal { value, type_ }) => {
+            Term::Literal(Literal { offset, type_ }) => {
+                let offset = *offset;
+
                 let literal = if let Type::Integer(Integer::Unknown) = type_ {
-                    match expected_type
-                        .cloned()
-                        .unwrap_or(Type::Integer(Integer::I32))
-                    {
-                        Type::Integer(integer_type) => Literal {
-                            value: integer_type.parse(str::from_utf8(value).unwrap())?,
+                    let string = str::from_utf8(self.load_slice(offset)).unwrap().to_owned();
+
+                    match expected_type.cloned() {
+                        Some(Type::Integer(integer_type)) => Literal {
+                            value: self.store(integer_type.parse(&string)?),
                             type_: Type::Integer(integer_type),
                         },
 
                         _ => Literal {
-                            value: str::from_utf8(value).unwrap().parse::<i32>()?.to_rc(),
+                            value: self.store(string.parse::<i32>()?),
                             type_: Type::Integer(Integer::I32),
                         },
                     }
                 } else {
                     Literal {
-                        value: value.clone(),
+                        offset,
                         type_: type_.clone(),
                     }
                 };
@@ -2286,8 +2233,11 @@ impl Env {
                 todo!()
             }
 
-            Term::Reference(Reference { unique, term, .. }) => {
-                let term = self.type_check_binding(
+            // todo: convert temporaries to bindings and variables as needed to ensure all references are to either
+            // variables or field access chains to variables.
+            Term::Reference(Reference { unique, term, .. }) => Ok(Term::Reference(Reference {
+                unique: *unique,
+                term: self.type_check(
                     term,
                     expected_type.and_then(|expected| {
                         if let Type::Reference { type_, .. } = expected {
@@ -2296,14 +2246,8 @@ impl Env {
                             None
                         }
                     }),
-                )?;
-
-                if *unique {
-                    self.unique_reference(&term)
-                } else {
-                    self.shared_reference(&term)
-                }
-            }
+                )?,
+            })),
 
             Term::Struct { type_, arguments } => {
                 let mut type_ = type_.clone();
@@ -2384,54 +2328,6 @@ impl Env {
 
             _ => Err(anyhow!("type checking not yet supported for term {term:?}")),
         }
-    }
-
-    fn unique_reference(&self, term: &Term) -> Result<Term> {
-        Ok(Term::Reference(Reference {
-            unique: true,
-            path: Rc::new([]),
-            term: match term {
-                Term::Variable { index, .. } => {
-                    let binding = &self.bindings[*index];
-
-                    if let Some(term) = &binding.term {
-                        term.clone()
-                    } else {
-                        return Err(anyhow!(
-                            "attempt to reference uninitialized variable: {}",
-                            self.unintern(binding.name)
-                        ));
-                    }
-                }
-
-                // todo: field, slice, dyn references, etc.
-                _ => return Err(anyhow!("cannot reference {term:?}")),
-            },
-        }))
-    }
-
-    fn shared_reference(&self, term: &Term) -> Result<Term> {
-        Ok(Term::Reference(Reference {
-            unique: false,
-            path: Rc::new([]),
-            term: match term {
-                Term::Variable { index, .. } => {
-                    let binding = &self.bindings[*index];
-
-                    if let Some(term) = &binding.term {
-                        term.clone()
-                    } else {
-                        return Err(anyhow!(
-                            "attempt to reference uninitialized variable: {}",
-                            self.unintern(binding.name)
-                        ));
-                    }
-                }
-
-                // todo: field, slice, dyn references, etc.
-                _ => Rc::new(RefCell::new(BindingTerm::Typed(term.clone()))),
-            },
-        }))
     }
 
     fn type_check_phi(
@@ -2524,17 +2420,14 @@ impl Env {
                 Item::Struct { fields, .. } => {
                     let mut my_offset = 0;
 
-                    // todo: pack fields in an optimal way instead of using arbitrary HashMap iteration order
+                    // Note that we use the arbitrary HashMap iteration order to order fields, which would not be
+                    // ideal if we cared about alignment and efficiency.
                     for Field { type_, offset } in fields.deref_mut() {
                         self.resolve_type(type_, Some(item))?;
 
-                        let Layout { size, alignment } = type_.layout();
-
-                        my_offset += my_offset % alignment;
-
                         *offset = my_offset;
 
-                        my_offset += size;
+                        my_offset += type_.size();
                     }
                 }
             }
@@ -2729,7 +2622,7 @@ impl Env {
             <T as FromStr>::Err: error::Error + Send + Sync + 'static,
         {
             Ok(Term::Literal(Literal {
-                value: value.parse::<T>()?.to_rc(),
+                offset: self.store(value.parse::<T>()?)?,
                 type_: Type::Integer(variant),
             }))
         }
@@ -2742,7 +2635,7 @@ impl Env {
                     match lit {
                         Lit::Int(lit) => match lit.suffix() {
                             "" => Ok(Term::Literal(Literal {
-                                value: Rc::from(lit.base10_digits().as_bytes()),
+                                offset: self.store(lit.base10_digits().as_bytes())?,
                                 type_: Type::Integer(Integer::Unknown),
                             })),
 
@@ -2750,7 +2643,7 @@ impl Env {
                         },
 
                         Lit::Bool(LitBool { value, .. }) => Ok(Term::Literal(Literal {
-                            value: (*value).to_rc(),
+                            offset: self.store(*value)?,
                             type_: Type::Boolean,
                         })),
 
@@ -2990,8 +2883,7 @@ impl Env {
                 } else {
                     Ok(Term::Reference(Reference {
                         unique: mutability.is_some(),
-                        path: Rc::new([]),
-                        term: Rc::new(RefCell::new(BindingTerm::Untyped(self.expr_to_term(expr)?))),
+                        term: self.expr_to_term(expr)?,
                     }))
                 }
             }
