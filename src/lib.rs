@@ -9,13 +9,12 @@ use {
     std::{
         any,
         cell::RefCell,
-        cmp::Ordering,
         collections::HashMap,
         error,
         fmt::{self, Display},
         mem,
-        ops::{Add, Deref, Div, Mul, Neg, Rem, Sub},
-        rc::{Rc, Weak},
+        ops::{Add, Deref, DerefMut, Div, Mul, Neg, Rem, Sub},
+        rc::Rc,
         str,
         str::FromStr,
     },
@@ -375,22 +374,25 @@ enum Float {
 }
 
 #[derive(Clone, Hash, Eq, PartialEq, Copy, Debug)]
-struct Identifier(usize);
+struct NameId(usize);
 
 #[derive(Clone, Hash, Eq, PartialEq, Copy, Debug)]
-struct Lifetime(Identifier);
+struct ItemId(usize);
+
+#[derive(Clone, Hash, Eq, PartialEq, Copy, Debug)]
+struct Lifetime(NameId);
 
 // todo: will need more fields here for associated types, functions, etc.
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 struct Trait {
-    name: Identifier,
+    name: NameId,
     parameters: Rc<[Type]>,
 }
 
 #[derive(Clone, Debug)]
 struct Impl {
     arguments: Rc<[Type]>,
-    functions: Rc<HashMap<Identifier, Abstraction>>,
+    functions: Rc<HashMap<NameId, Abstraction>>,
 }
 
 // enum Bound {
@@ -422,10 +424,11 @@ enum Type {
     },
     Nominal {
         // todo: add lifetime arguments
-        definition: Weak<RefCell<Item>>,
+        item: ItemId,
+        size: usize,
         arguments: Rc<[Type]>,
     },
-    Unresolved(Identifier),
+    Unresolved(NameId),
 }
 
 impl Type {
@@ -441,20 +444,7 @@ impl Type {
                 Integer::Usize | Integer::Isize => mem::size_of::<usize>(),
                 Integer::U128 | Integer::I128 => 16,
             },
-            Type::Nominal { definition, .. } => {
-                if let Item::Struct { fields, .. } =
-                    RefCell::borrow(&definition.upgrade().unwrap()).deref()
-                {
-                    // todo: precalculate and store this during typechecking (and be sure to detect and flag infinite types)
-                    fields
-                        .values()
-                        .max_by(|a, b| a.offset.cmp(&b.offset))
-                        .map(|max| max.offset + max.type_.size())
-                        .unwrap_or(0)
-                } else {
-                    todo!("size for {self:?}")
-                }
-            }
+            Type::Nominal { size, .. } => *size,
             _ => todo!("size for {self:?}"),
         }
     }
@@ -496,7 +486,7 @@ enum BinaryOp {
 
 #[derive(Clone, Debug)]
 struct Parameter {
-    name: Identifier,
+    name: NameId,
     mutable: bool,
     type_: Type,
 }
@@ -544,19 +534,18 @@ impl Reference {
 #[derive(Clone, Debug)]
 enum Term {
     Block {
-        scope: Scope,
+        scope: Rc<RefCell<Scope>>,
         terms: Rc<[Term]>,
     },
     Literal(Literal),
     Reference(Rc<Reference>),
     Let {
-        name: Identifier,
+        name: NameId,
         mutable: bool,
         index: usize,
-        type_: Rc<RefCell<Option<Type>>>,
-        term: Option<Rc<RefCell<BindingTerm>>>,
+        term: Rc<RefCell<BindingTerm>>,
     },
-    Phi(Rc<[Option<Rc<RefCell<BindingTerm>>>]>),
+    Phi(Rc<[Rc<RefCell<BindingTerm>>]>),
     Variable {
         index: usize,
         type_: Type,
@@ -580,13 +569,13 @@ enum Term {
         arms: Rc<[MatchArm]>,
     },
     Loop {
-        label: Option<Identifier>,
+        label: Option<NameId>,
         body: Rc<Term>,
         type_: Type,
     },
-    Continue(Option<Identifier>),
+    Continue(Option<NameId>),
     Break {
-        label: Option<Identifier>,
+        label: Option<NameId>,
         term: Rc<Term>,
     },
     Return {
@@ -598,11 +587,11 @@ enum Term {
     },
     Struct {
         type_: Type,
-        arguments: Rc<HashMap<Identifier, Term>>,
+        arguments: Rc<HashMap<NameId, Term>>,
     },
     Field {
         base: Rc<Term>,
-        name: Identifier,
+        name: NameId,
     },
 }
 
@@ -639,9 +628,16 @@ impl Term {
             Self::Assignment { .. } => Type::Unit,
             Self::Match { arms, .. } => arms[0].body.type_(),
             Self::Break { .. } | Self::Return { .. } => Type::Never,
-            Self::Phi(terms) => {
-                RefCell::borrow(terms.iter().find_map(|term| term.as_ref()).unwrap()).type_()
-            }
+            Self::Phi(terms) => terms
+                .iter()
+                .find_map(|term| match term.borrow().deref() {
+                    BindingTerm::Initialized(literal) | BindingTerm::Uninitialized(literal) => {
+                        Some(literal.type_.clone())
+                    }
+                    BindingTerm::Typed(term) => Some(term.type_()),
+                    _ => None,
+                })
+                .unwrap(),
             Self::Reference(reference) => reference.type_(),
             _ => todo!("Term::type_ for {self:?}"),
         }
@@ -649,7 +645,7 @@ impl Term {
 }
 
 struct Loop {
-    label: Option<Identifier>,
+    label: Option<NameId>,
     expected_type: Option<Type>,
     break_terms: Vec<Term>,
     branch_context: BranchContext,
@@ -661,6 +657,7 @@ enum BindingTerm {
     Uninitialized(Literal),
     Typed(Term),
     Untyped(Term),
+    UntypedAndUninitialized,
 }
 
 impl BindingTerm {
@@ -677,26 +674,28 @@ impl BindingTerm {
 
 #[derive(Clone, Debug)]
 struct Binding {
-    name: Identifier,
+    name: NameId,
     mutable: bool,
-    type_: Rc<RefCell<Option<Type>>>,
-    term: Option<Rc<RefCell<BindingTerm>>>,
+    term: Rc<RefCell<BindingTerm>>,
 }
 
 struct BranchContext {
-    indexes: Box<[usize]>,
-    terms: Vec<Option<Rc<RefCell<BindingTerm>>>>,
+    originals: Box<[(usize, Rc<RefCell<BindingTerm>>)]>,
+    terms: Vec<Rc<RefCell<BindingTerm>>>,
 }
 
 impl BranchContext {
     fn new(bindings: &[Binding]) -> Self {
         Self {
-            indexes: bindings
+            originals: bindings
                 .iter()
                 .enumerate()
                 .filter_map(|(index, binding)| {
-                    if binding.term.is_none() {
-                        Some(index)
+                    if matches!(
+                        binding.term.borrow().deref(),
+                        BindingTerm::UntypedAndUninitialized
+                    ) {
+                        Some((index, binding.term.clone()))
                     } else {
                         None
                     }
@@ -707,37 +706,35 @@ impl BranchContext {
     }
 
     fn reset(&self, bindings: &mut [Binding]) {
-        for &index in self.indexes.iter() {
-            bindings[index].term = None;
+        for (index, original) in self.originals.iter() {
+            bindings[*index].term = original.clone();
         }
     }
 
     fn record_and_reset(&mut self, bindings: &mut [Binding]) {
         self.terms.extend(
-            self.indexes
+            self.originals
                 .iter()
-                .map(|&index| bindings[index].term.clone()),
+                .map(|(index, _)| bindings[*index].term.clone()),
         );
 
         self.reset(bindings);
     }
 
     fn make_phi_nodes(&mut self, bindings: &mut [Binding]) {
-        for (my_index, &binding_index) in self.indexes.iter().enumerate() {
-            let terms = self
-                .terms
+        for (my_index, (binding_index, _)) in self.originals.iter().enumerate() {
+            let terms = self.terms[my_index..]
                 .iter()
-                .skip(my_index)
-                .step_by(self.indexes.len())
+                .step_by(self.originals.len())
                 .cloned()
                 .collect::<Rc<[_]>>();
 
-            bindings[binding_index].term = if terms.iter().all(|term| term.is_none()) {
-                None
-            } else {
-                Some(Rc::new(RefCell::new(BindingTerm::Untyped(Term::Phi(
-                    terms,
-                )))))
+            if !terms
+                .iter()
+                .all(|term| matches!(term.borrow().deref(), BindingTerm::UntypedAndUninitialized))
+            {
+                bindings[*binding_index].term =
+                    Rc::new(RefCell::new(BindingTerm::Untyped(Term::Phi(terms))))
             }
         }
     }
@@ -745,7 +742,7 @@ impl BranchContext {
 
 #[derive(Debug)]
 enum EvalException {
-    Break { label: Option<Identifier> },
+    Break { label: Option<NameId> },
     Return,
     Overflow,
 }
@@ -795,39 +792,31 @@ impl fmt::Display for EvalResult {
     }
 }
 
-enum EvalBinding {
+pub enum Eval {
     Result(EvalResult),
-    Type(Type),
-}
-
-pub struct Eval {
-    result: EvalResult,
-    new_term_bindings: HashMap<Rc<str>, EvalBinding>,
+    Bindings(HashMap<Rc<str>, EvalResult>),
 }
 
 impl fmt::Display for Eval {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut need_newline = match &self.result.type_ {
-            Type::Unit => false,
-            _ => {
-                self.result.fmt(f)?;
-                true
+        match self {
+            Self::Result(result) => match result.type_ {
+                Type::Unit => (),
+                _ => result.fmt(f)?,
+            },
+
+            Self::Bindings(bindings) => {
+                let mut need_newline = false;
+                for (symbol, binding) in bindings {
+                    if need_newline {
+                        writeln!(f)?;
+                    }
+
+                    write!(f, "{symbol} = {binding}")?;
+
+                    need_newline = true;
+                }
             }
-        };
-
-        for (symbol, binding) in &self.new_term_bindings {
-            if need_newline {
-                writeln!(f)?;
-            }
-
-            symbol.fmt(f)?;
-
-            match binding {
-                EvalBinding::Result(term) => write!(f, " = {term}")?,
-                EvalBinding::Type(type_) => write!(f, ": {type_:?}")?,
-            }
-
-            need_newline = true;
         }
 
         Ok(())
@@ -847,22 +836,25 @@ fn match_types(expected: &Type, actual: &Type) -> Result<()> {
     }
 }
 
+#[derive(Clone, Debug)]
 struct Field {
     type_: Type,
     offset: usize,
 }
 
+#[derive(Clone, Debug)]
 enum Item {
     Struct {
         parameters: Rc<[Type]>,
-        fields: Rc<HashMap<Identifier, Field>>,
+        fields: Rc<HashMap<NameId, Field>>,
         methods: Rc<[Abstraction]>,
     },
     Type(Type),
 }
 
+#[derive(Debug)]
 struct Scope {
-    items: HashMap<Identifier, Rc<RefCell<Item>>>,
+    items: HashMap<NameId, ItemId>,
 }
 
 impl Scope {
@@ -891,10 +883,11 @@ pub struct Env {
     stack: StackData,
     ids_to_names: Vec<Rc<str>>,
     names_to_ids: HashMap<Rc<str>, usize>,
-    scopes: Vec<Scope>,
+    items: Vec<Item>,
+    scopes: Vec<Rc<RefCell<Scope>>>,
     bindings: Vec<Binding>,
     loops: Vec<Loop>,
-    traits: HashMap<Identifier, Trait>,
+    traits: HashMap<NameId, Trait>,
     impls: HashMap<(Type, Trait), Option<Impl>>,
     unit: Literal,
     true_: Literal,
@@ -944,7 +937,11 @@ impl Env {
             stack,
             ids_to_names: Vec::new(),
             names_to_ids: HashMap::new(),
-            scopes: vec![Scope::new(), Scope::new()],
+            items: Vec::new(),
+            scopes: vec![
+                Rc::new(RefCell::new(Scope::new())),
+                Rc::new(RefCell::new(Scope::new())),
+            ],
             bindings: Vec::new(),
             loops: Vec::new(),
             traits: HashMap::new(),
@@ -965,7 +962,7 @@ impl Env {
 
         // todo: should load types, traits and impls from core/std source files (lazily if appropriate)
 
-        env.scopes[0].items = [
+        env.scopes[0].borrow_mut().items = [
             ("()", Type::Unit),
             ("bool", Type::Boolean),
             ("u8", Type::Integer(Integer::U8)),
@@ -982,7 +979,7 @@ impl Env {
             ("isize", Type::Integer(Integer::Isize)),
         ]
         .into_iter()
-        .map(|(name, type_)| (env.intern(name), Rc::new(RefCell::new(Item::Type(type_)))))
+        .map(|(name, type_)| (env.intern(name), env.add_item(Item::Type(type_))))
         .collect();
 
         let self_ = env.intern("self");
@@ -1270,7 +1267,7 @@ impl Env {
         Ok(env)
     }
 
-    fn find_term(&self, id: Identifier) -> Option<usize> {
+    fn find_term(&self, id: NameId) -> Option<usize> {
         self.bindings
             .iter()
             .enumerate()
@@ -1299,13 +1296,32 @@ impl Env {
 
         let binding_count = self.bindings.len();
 
+        let item_count = self.items.len();
+
         let term = &self.stmt_to_term(&stmt)?;
 
-        self.type_check_scope(0)?;
+        let uninitialized_bindings = self.bindings[binding_count..].iter().any(|binding| {
+            matches!(
+                binding.term.borrow().deref(),
+                BindingTerm::UntypedAndUninitialized
+            )
+        });
+
+        self.bindings.truncate(binding_count);
+
+        if uninitialized_bindings {
+            return Err(anyhow!("top-level let bindings must be initialized"));
+        }
+
+        self.type_check_bindings(binding_count)?;
+
+        self.bindings.truncate(binding_count);
+
+        self.resolve_items(item_count)?;
 
         let term = self.type_check(term, None)?;
 
-        self.type_check_bindings(0)?;
+        self.bindings.truncate(binding_count);
 
         match self.eval_term(&term) {
             Ok(_) => (),
@@ -1316,59 +1332,60 @@ impl Env {
             },
         };
 
-        assert_eq!(self.stack.offset, self.stack.bottom + term.type_().size());
+        let type_ = term.type_();
 
-        self.stack.offset = self.stack.bottom;
+        self.stack.offset -= type_.size();
 
-        Ok(Eval {
-            result: self.into_result(&Literal {
-                type_: term.type_(),
-                offset: self.stack.offset,
-            }),
-            new_term_bindings: self.bindings[binding_count..]
-                .iter()
-                .map(|binding| {
-                    (
-                        self.unintern(binding.name),
-                        binding
-                            .term
-                            .map(|term| match RefCell::borrow(&term).deref() {
-                                BindingTerm::Initialized(term) => {
-                                    EvalBinding::Result(self.into_result(term))
-                                }
-                                BindingTerm::Typed(term) => EvalBinding::Type(term.type_()),
+        Ok(if self.bindings.len() > binding_count {
+            Eval::Bindings(
+                self.bindings[binding_count..]
+                    .iter()
+                    .map(|binding| {
+                        (
+                            self.unintern(binding.name),
+                            match binding.term.borrow().deref() {
+                                BindingTerm::Initialized(literal) => self.into_result(literal),
                                 _ => unreachable!(),
-                            })
-                            .unwrap_or_else(|| {
-                                EvalBinding::Type(RefCell::borrow(&binding.type_).unwrap())
-                            }),
-                    )
-                })
-                .collect(),
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+        } else {
+            Eval::Result(self.into_result(&Literal {
+                type_,
+                offset: self.stack.offset,
+            }))
         })
     }
 
-    fn intern(&mut self, name: &str) -> Identifier {
+    fn intern(&mut self, name: &str) -> NameId {
         if let Some(&id) = self.names_to_ids.get(name) {
-            Identifier(id)
+            NameId(id)
         } else {
             let name = Rc::<str>::from(name);
             let id = self.ids_to_names.len();
             self.ids_to_names.push(name.clone());
             self.names_to_ids.insert(name, id);
-            Identifier(id)
+            NameId(id)
         }
     }
 
-    fn intern_member(&mut self, member: &Member) -> Identifier {
+    fn intern_member(&mut self, member: &Member) -> NameId {
         self.intern(&match member {
             Member::Named(ident) => ident.to_string(),
             Member::Unnamed(index) => index.index.to_string(),
         })
     }
 
-    fn unintern(&self, Identifier(id): Identifier) -> Rc<str> {
+    fn unintern(&self, NameId(id): NameId) -> Rc<str> {
         self.ids_to_names[id].clone()
+    }
+
+    fn add_item(&mut self, item: Item) -> ItemId {
+        self.items.push(item);
+
+        ItemId(self.items.len() - 1)
     }
 
     fn get_impl(&mut self, type_: &Type, trait_: &Trait) -> Option<Impl> {
@@ -1447,51 +1464,45 @@ impl Env {
                 name,
                 mutable,
                 index,
-                type_,
                 term,
             } => {
-                let term = if let Some(term_rc) = term {
-                    let mut term = RefCell::borrow_mut(term_rc);
+                {
+                    let mut term = term.borrow_mut();
 
-                    *term = BindingTerm::Initialized(match term.deref() {
+                    *term = match term.deref() {
                         BindingTerm::Typed(term) => {
                             let offset = self.stack.offset;
 
                             self.eval_term(term)?;
 
-                            Literal {
+                            BindingTerm::Initialized(Literal {
                                 offset,
                                 type_: term.type_(),
-                            }
+                            })
                         }
+
+                        BindingTerm::Uninitialized(Literal { type_, .. }) => {
+                            BindingTerm::Uninitialized(Literal {
+                                offset: self.push_uninitialized(type_.size())?,
+                                type_: type_.clone(),
+                            })
+                        }
+
                         _ => unreachable!(),
-                    });
-
-                    Some(term_rc.clone())
-                } else {
-                    let type_ = RefCell::borrow(type_).as_ref().unwrap().clone();
-
-                    Some(Rc::new(RefCell::new(BindingTerm::Uninitialized(Literal {
-                        offset: self.push_uninitialized(type_.size())?,
-                        type_,
-                    }))))
-                };
-
-                match index.cmp(&self.bindings.len()) {
-                    Ordering::Less => todo!("when does this happen?"),
-                    Ordering::Equal => self.bindings.push(Binding {
-                        name: *name,
-                        mutable: *mutable,
-                        type_: Rc::new(RefCell::new(None)),
-                        term,
-                    }),
-                    Ordering::Greater => unreachable!(),
+                    };
                 }
+
+                assert_eq!(*index, self.bindings.len());
+
+                self.bindings.push(Binding {
+                    name: *name,
+                    mutable: *mutable,
+                    term: term.clone(),
+                });
             }
 
             Term::Variable { index, .. } => {
-                if let BindingTerm::Initialized(term) =
-                    RefCell::borrow(self.bindings[*index].term.as_ref().unwrap()).deref()
+                if let BindingTerm::Initialized(term) = self.bindings[*index].term.borrow().deref()
                 {
                     self.push_term(term)?;
                 } else {
@@ -1521,11 +1532,10 @@ impl Env {
                         Ok(Binding {
                             name: *name,
                             mutable: *mutable,
-                            type_: Rc::new(RefCell::new(None)),
-                            term: Some(Rc::new(RefCell::new(BindingTerm::Initialized(Literal {
+                            term: Rc::new(RefCell::new(BindingTerm::Initialized(Literal {
                                 type_: term.type_(),
                                 offset,
-                            })))),
+                            }))),
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -1649,8 +1659,7 @@ impl Env {
 
                 let offset = match left.deref() {
                     Term::Variable { index, .. } => {
-                        match RefCell::borrow(self.bindings[*index].term.as_ref().unwrap()).deref()
-                        {
+                        match self.bindings[*index].term.as_ref().borrow().deref() {
                             BindingTerm::Initialized(literal)
                             | BindingTerm::Uninitialized(literal) => literal.offset,
                             _ => unreachable!(),
@@ -1717,10 +1726,8 @@ impl Env {
             }
 
             Term::Struct { type_, arguments } => {
-                let fields = if let Type::Nominal { definition, .. } = &type_ {
-                    if let Item::Struct { fields, .. } =
-                        RefCell::borrow(&definition.upgrade().unwrap()).deref()
-                    {
+                let fields = if let Type::Nominal { item, .. } = &type_ {
+                    if let Item::Struct { fields, .. } = &self.items[item.0] {
                         fields
                     } else {
                         unreachable!()
@@ -1748,10 +1755,8 @@ impl Env {
             }
 
             Term::Field { base, name } => {
-                let field = if let Type::Nominal { definition, .. } = &base.type_() {
-                    if let Item::Struct { fields, .. } =
-                        RefCell::borrow(&definition.upgrade().unwrap()).deref()
-                    {
+                let field = if let Type::Nominal { item, .. } = &base.type_() {
+                    if let Item::Struct { fields, .. } = &self.items[item.0] {
                         fields.get(name).unwrap()
                     } else {
                         unreachable!()
@@ -1883,7 +1888,7 @@ impl Env {
     fn offset_of(&self, term: &Term) -> usize {
         match term {
             Term::Variable { index, .. } => {
-                match RefCell::borrow(self.bindings[*index].term.as_ref().unwrap()).deref() {
+                match self.bindings[*index].term.as_ref().borrow().deref() {
                     BindingTerm::Initialized(literal) | BindingTerm::Uninitialized(literal) => {
                         literal.offset
                     }
@@ -1892,10 +1897,8 @@ impl Env {
             }
 
             Term::Field { base, name } => {
-                let field = if let Type::Nominal { definition, .. } = &base.type_() {
-                    if let Item::Struct { fields, .. } =
-                        RefCell::borrow(&definition.upgrade().unwrap()).deref()
-                    {
+                let field = if let Type::Nominal { item, .. } = &base.type_() {
+                    if let Item::Struct { fields, .. } = &self.items[item.0] {
                         fields.get(name).unwrap()
                     } else {
                         unreachable!()
@@ -1934,19 +1937,15 @@ impl Env {
                 name,
                 mutable,
                 index,
-                type_,
                 term: binding_term,
             } => {
-                match index.cmp(&self.bindings.len()) {
-                    Ordering::Less => (),
-                    Ordering::Equal => self.bindings.push(Binding {
-                        name: *name,
-                        mutable: *mutable,
-                        type_: type_.clone(),
-                        term: binding_term.clone(),
-                    }),
-                    Ordering::Greater => unreachable!(),
-                }
+                assert_eq!(*index, self.bindings.len());
+
+                self.bindings.push(Binding {
+                    name: *name,
+                    mutable: *mutable,
+                    term: binding_term.clone(),
+                });
 
                 Ok(term.clone())
             }
@@ -1954,31 +1953,38 @@ impl Env {
             Term::Variable { index, .. } => {
                 let index = *index;
 
-                let type_ = {
-                    let binding = &self.bindings[index];
+                let binding = &self.bindings[index];
 
-                    let error = || {
-                        Err(anyhow!(
-                            "use of uninitialized variable: {}",
-                            self.unintern(binding.name)
-                        ))
-                    };
-
-                    if let Some(term) = &binding.term {
-                        if let BindingTerm::Typed(Term::Phi(terms)) = RefCell::borrow(term).deref()
-                        {
-                            if terms.iter().any(|term| term.is_none()) {
-                                return error();
-                            }
-                        }
-
-                        self.type_check_binding(term, expected_type)?.type_()
-                    } else {
-                        return error();
-                    }
+                let error = || {
+                    Err(anyhow!(
+                        "use of uninitialized variable: {}",
+                        self.unintern(binding.name)
+                    ))
                 };
 
-                *RefCell::borrow_mut(&self.bindings[index].type_) = Some(type_);
+                match binding.term.borrow().deref() {
+                    BindingTerm::Typed(Term::Phi(terms)) => {
+                        if terms.iter().any(|term| {
+                            matches!(
+                                term.borrow().deref(),
+                                BindingTerm::Uninitialized(_)
+                                    | BindingTerm::UntypedAndUninitialized
+                            )
+                        }) {
+                            return error();
+                        }
+                    }
+
+                    BindingTerm::Uninitialized(_) | BindingTerm::UntypedAndUninitialized => {
+                        return error()
+                    }
+
+                    _ => (),
+                }
+
+                let type_ = self
+                    .type_check_binding(&binding.term, expected_type)?
+                    .type_();
 
                 Ok(Term::Variable { index, type_ })
             }
@@ -2278,20 +2284,22 @@ impl Env {
                 if let Term::Variable { index, .. } = left.deref() {
                     let index = *index;
 
-                    let expected_type = self.type_check_binding_index(index, None)?;
+                    // todo: check binding type ascription, if present
 
-                    if expected_type.is_some() && !self.bindings[index].mutable {
+                    match_types(&self.type_check_binding_index(index, None)?, &right_type)?;
+
+                    if let BindingTerm::Uninitialized(literal) =
+                        self.bindings[index].term.borrow_mut().deref_mut()
+                    {
+                        if right_type != Type::Never {
+                            literal.type_ = right_type.clone();
+                        }
+                    } else if !self.bindings[index].mutable {
                         return Err(anyhow!("invalid assignment to immutable variable"));
                     }
 
-                    // todo: check binding type ascription, if present
-
-                    if let Some(expected_type) = expected_type {
-                        match_types(&expected_type, &right_type)?;
-                    }
-
                     self.bindings[index].term =
-                        Some(Rc::new(RefCell::new(BindingTerm::Typed(right.clone()))));
+                        Rc::new(RefCell::new(BindingTerm::Typed(right.clone())));
 
                     Ok(Term::Assignment {
                         left: Rc::new(Term::Variable {
@@ -2328,20 +2336,14 @@ impl Env {
                 let binding_count = self.bindings.len();
                 let scope_count = self.scopes.len();
 
-                self.scopes.push(scope);
+                self.scopes.push(scope.clone());
 
-                let scope_check = self.type_check_scope(scope_count);
+                let terms = terms
+                    .iter()
+                    .map(|term| self.type_check(term, None))
+                    .collect::<Result<_>>();
 
-                let terms = if scope_check.is_ok() {
-                    terms
-                        .iter()
-                        .map(|term| self.type_check(term, None))
-                        .collect::<Result<_>>()
-                } else {
-                    Ok(Rc::from(&[] as &[_]))
-                };
-
-                let binding_check = if scope_check.is_ok() && terms.is_ok() {
+                let binding_check = if terms.is_ok() {
                     self.type_check_bindings(binding_count)
                 } else {
                     Ok(())
@@ -2353,7 +2355,6 @@ impl Env {
 
                 self.bindings.truncate(binding_count);
 
-                scope_check?;
                 binding_check?;
 
                 Ok(Term::Block {
@@ -2481,12 +2482,10 @@ impl Env {
                     unreachable!()
                 };
 
-                self.resolve_type(&mut type_, None)?;
+                self.resolve_type(&mut type_)?;
 
-                if let Type::Nominal { definition, .. } = &type_ {
-                    if let Item::Struct { fields, .. } =
-                        RefCell::borrow(&definition.upgrade().unwrap()).deref()
-                    {
+                if let Type::Nominal { item, .. } = &type_ {
+                    if let Item::Struct { fields, .. } = &self.items[item.0] {
                         return if !fields.keys().all(|name| arguments.contains_key(name)) {
                             Err(anyhow!("fields missing in struct initializer"))
                         } else {
@@ -2530,10 +2529,8 @@ impl Env {
             Term::Field { base, name } => {
                 let base = self.type_check(base, None)?;
 
-                if let Type::Nominal { definition, .. } = &base.type_() {
-                    if let Item::Struct { fields, .. } =
-                        RefCell::borrow(&definition.upgrade().unwrap()).deref()
-                    {
+                if let Type::Nominal { item, .. } = &base.type_() {
+                    if let Item::Struct { fields, .. } = &self.items[item.0] {
                         return if fields.contains_key(name) {
                             Ok(Term::Field {
                                 base: Rc::new(base),
@@ -2555,12 +2552,12 @@ impl Env {
 
     fn type_check_phi(
         &mut self,
-        terms: &[Option<Rc<RefCell<BindingTerm>>>],
+        terms: &[Rc<RefCell<BindingTerm>>],
         expected_type: Option<&Type>,
     ) -> Result<Option<Type>> {
         let mut my_expected_type = None;
 
-        for term in terms.iter().filter_map(|term| term.as_ref()) {
+        for term in terms.iter() {
             let type_ = self
                 .type_check_binding(term, my_expected_type.as_ref().or(expected_type))?
                 .type_();
@@ -2579,12 +2576,10 @@ impl Env {
         &mut self,
         index: usize,
         expected_type: Option<&Type>,
-    ) -> Result<Option<Type>> {
-        Ok(if let Some(term) = self.bindings[index].term.clone() {
-            Some(self.type_check_binding(&term, expected_type)?.type_())
-        } else {
-            None
-        })
+    ) -> Result<Type> {
+        let term = self.bindings[index].term.clone();
+
+        Ok(self.type_check_binding(&term, expected_type)?.type_())
     }
 
     fn type_check_binding(
@@ -2592,7 +2587,8 @@ impl Env {
         term: &RefCell<BindingTerm>,
         expected_type: Option<&Type>,
     ) -> Result<Term> {
-        let untyped = match RefCell::borrow(term).deref() {
+        let untyped = match term.borrow().deref() {
+            BindingTerm::Uninitialized(literal) => return Ok(Term::Literal(literal.clone())),
             BindingTerm::Untyped(term) => term.clone(),
             BindingTerm::Typed(term) => return Ok(term.clone()),
             _ => unreachable!(),
@@ -2600,26 +2596,19 @@ impl Env {
 
         let typed = self.type_check(&untyped, expected_type)?;
 
-        *RefCell::borrow_mut(term) = BindingTerm::Typed(typed.clone());
+        *term.borrow_mut() = BindingTerm::Typed(typed.clone());
 
         Ok(typed)
     }
 
     #[allow(clippy::needless_collect)]
     fn type_check_bindings(&mut self, offset: usize) -> Result<()> {
-        let indexes = self
-            .bindings
+        let indexes = self.bindings[offset..]
             .iter()
             .enumerate()
-            .skip(offset)
-            .filter_map(|(index, binding)| {
-                binding.term.as_ref().and_then(|term| {
-                    if let BindingTerm::Untyped(_) = RefCell::borrow(term).deref() {
-                        Some(index)
-                    } else {
-                        None
-                    }
-                })
+            .filter_map(|(index, binding)| match binding.term.borrow().deref() {
+                BindingTerm::Untyped(_) | BindingTerm::UntypedAndUninitialized => Some(index),
+                _ => None,
             })
             .collect::<Vec<_>>();
 
@@ -2635,51 +2624,83 @@ impl Env {
         })
     }
 
-    fn type_check_scope(&mut self, index: usize) -> Result<()> {
-        // todo: type check method bodies
+    fn resolve_items(&mut self, start: usize) -> Result<()> {
+        let resolved = self.items[start..]
+            .iter()
+            .map(|item| self.resolve_item(&item))
+            .collect::<Result<Vec<_>>>()?;
 
-        for item in self.scopes[index].items.values() {
-            match RefCell::borrow_mut(item).deref() {
-                Item::Struct { fields, .. } => {
-                    let mut my_offset = 0;
+        self.items.truncate(start);
+
+        self.items.extend(resolved);
+
+        Ok(())
+    }
+
+    fn resolve_item(&self, item: &Item) -> Result<Item> {
+        // todo: type check method bodies (or else do that lazily elsewhere, e.g. on first invocation)
+
+        Ok(match item {
+            Item::Struct {
+                parameters,
+                fields,
+                methods,
+            } => Item::Struct {
+                parameters: parameters.clone(),
+                methods: methods.clone(),
+                fields: {
+                    let mut next_offset = 0;
 
                     // Note that we use the arbitrary HashMap iteration order to order fields, which would not be
                     // ideal if we cared about alignment and efficiency.
-                    for Field { type_, offset } in fields.deref_mut() {
-                        self.resolve_type(type_, Some(item))?;
+                    Rc::new(
+                        fields
+                            .iter()
+                            .map(|(name, Field { type_, .. })| {
+                                let mut type_ = type_.clone();
 
-                        *offset = my_offset;
+                                self.resolve_type(&mut type_)?;
 
-                        my_offset += type_.size();
-                    }
-                }
-            }
-        }
+                                let offset = next_offset;
+
+                                next_offset += type_.size();
+
+                                Ok((*name, Field { type_, offset }))
+                            })
+                            .collect::<Result<_>>()?,
+                    )
+                },
+            },
+
+            _ => item.clone(),
+        })
     }
 
-    fn resolve_type(&self, type_: &mut Type, self_item: Option<&Rc<RefCell<Item>>>) -> Result<()> {
+    fn resolve_type(&self, type_: &mut Type) -> Result<()> {
+        // todo: recursively resolve type parameters
+
+        // todo: detect infinite types and return error
+
         if let Type::Unresolved(name) = type_ {
             if let Some(found) = self.scopes.iter().rev().find_map(|scope| {
-                scope.items.get(name).map(|item| {
-                    if let Ok(borrowed) = RefCell::try_borrow(item) {
-                        Some(match borrowed.deref() {
-                            Item::Type(type_) => type_.clone(),
-                            Item::Struct { .. } => Type::Nominal {
-                                definition: Rc::downgrade(item),
-                                arguments: Rc::new([]),
-                            },
-                        })
-                    } else {
-                        assert!(Rc::ptr_eq(self_item.unwrap(), item));
-
-                        None
-                    }
-                })
+                scope
+                    .borrow()
+                    .items
+                    .get(name)
+                    .map(|&item| match &self.items[item.0] {
+                        Item::Type(type_) => type_.clone(),
+                        Item::Struct { fields, .. } => Type::Nominal {
+                            item,
+                            size: fields
+                                .values()
+                                .max_by(|a, b| a.offset.cmp(&b.offset))
+                                .map(|max| max.offset + max.type_.size())
+                                .unwrap_or(0),
+                            arguments: Rc::new([]),
+                        },
+                    })
             }) {
-                *type_ = found.unwrap_or_else(|| Type::Nominal {
-                    definition: Rc::downgrade(self_item.unwrap()),
-                    arguments: Rc::new([]),
-                });
+                *type_ = found;
             } else {
                 return Err(anyhow!("type not found: {}", self.unintern(*name)));
             }
@@ -2718,16 +2739,17 @@ impl Env {
                             } else {
                                 let name = self.intern(&ident.to_string());
 
-                                let term = init
-                                    .as_ref()
-                                    .map(|(_, expr)| self.expr_to_term(expr))
-                                    .transpose()?
-                                    .map(|term| Rc::new(RefCell::new(BindingTerm::Untyped(term))));
+                                let term = Rc::new(RefCell::new(
+                                    init.as_ref()
+                                        .map(|(_, expr)| self.expr_to_term(expr))
+                                        .transpose()?
+                                        .map(|term| BindingTerm::Untyped(term))
+                                        .unwrap_or(BindingTerm::UntypedAndUninitialized),
+                                ));
 
                                 self.bindings.push(Binding {
                                     name,
                                     mutable: mutability.is_some(),
-                                    type_: Rc::new(RefCell::new(None)),
                                     term: term.clone(),
                                 });
 
@@ -2735,7 +2757,6 @@ impl Env {
                                     name,
                                     mutable: mutability.is_some(),
                                     index: self.bindings.len() - 1,
-                                    type_: Rc::new(RefCell::new(None)),
                                     term,
                                 })
                             }
@@ -2812,19 +2833,18 @@ impl Env {
                         )
                         .collect::<Result<_>>()?;
 
-                    let items = &mut self.scopes.last_mut().unwrap().items;
+                    let item = self.add_item(Item::Struct {
+                        parameters: Rc::new([]),
+                        fields: Rc::new(fields),
+                        methods: Rc::new([]),
+                    });
+
+                    let items = &mut self.scopes.last().unwrap().borrow_mut().items;
 
                     if items.contains_key(&name) {
                         Err(anyhow!("duplicate item identifier: {}", ident.to_string()))
                     } else {
-                        items.insert(
-                            name,
-                            Rc::new(RefCell::new(Item::Struct {
-                                parameters: Rc::new([]),
-                                fields: Rc::new(fields),
-                                methods: Rc::new([]),
-                            })),
-                        );
+                        items.insert(name, item);
 
                         Ok(Term::Literal(self.unit.clone()))
                     }
@@ -3190,7 +3210,7 @@ impl Env {
     fn block_to_term(&mut self, stmts: &[Stmt]) -> Result<Term> {
         let binding_count = self.bindings.len();
 
-        self.scopes.push(Scope::new());
+        self.scopes.push(Rc::new(RefCell::new(Scope::new())));
 
         let result = stmts
             .iter()

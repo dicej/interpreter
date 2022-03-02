@@ -1,12 +1,15 @@
 use {
-    maplit::btreemap,
-    std::{cmp::Ordering, collections::BTreeMap},
+    maplit::{btreemap, hashset},
+    std::{
+        cmp::Ordering,
+        collections::{BTreeMap, HashSet},
+    },
 };
 
 pub struct Allocator {
     capacity: usize,
     by_offset: BTreeMap<usize, usize>,
-    by_size: BTreeMap<usize, Vec<usize>>,
+    by_size: BTreeMap<usize, HashSet<usize>>,
 }
 
 impl Allocator {
@@ -14,14 +17,16 @@ impl Allocator {
         Self {
             capacity,
             by_offset: btreemap![0 => capacity],
-            by_size: btreemap![capacity => vec![0]],
+            by_size: btreemap![capacity => hashset![0]],
         }
     }
 
     fn remove(&mut self, offset: usize, size: usize) {
         let empty = {
             let offsets = self.by_size.get_mut(&size).unwrap();
-            offsets.retain(|offset| offset != offset);
+
+            offsets.remove(&offset);
+
             offsets.is_empty()
         };
 
@@ -39,7 +44,9 @@ impl Allocator {
 
         let (free_size, offset, empty) =
             if let Some((free_size, offsets)) = self.by_size.range_mut(size..).next() {
-                let offset = offsets.pop().unwrap();
+                let offset = offsets.iter().next().copied().unwrap();
+
+                offsets.remove(&offset);
 
                 (free_size, offset, offsets.is_empty())
             } else {
@@ -60,7 +67,7 @@ impl Allocator {
             self.by_size
                 .entry(new_free_size)
                 .or_default()
-                .push(new_offset);
+                .insert(new_offset);
         }
 
         Some(offset)
@@ -112,7 +119,7 @@ impl Allocator {
         }
 
         self.by_offset.insert(offset, size);
-        self.by_size.entry(size).or_default().push(offset);
+        self.by_size.entry(size).or_default().insert(offset);
     }
 }
 
