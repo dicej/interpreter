@@ -48,19 +48,19 @@ impl Allocator {
 
                 offsets.remove(&offset);
 
-                (free_size, offset, offsets.is_empty())
+                (*free_size, offset, offsets.is_empty())
             } else {
                 return None;
             };
 
         if empty {
-            self.by_size.remove(free_size);
+            self.by_size.remove(&free_size);
         }
 
         self.by_offset.remove(&offset);
 
-        if size < *free_size {
-            let new_free_size = *free_size - size;
+        if size < free_size {
+            let new_free_size = free_size - size;
             let new_offset = offset + size;
 
             self.by_offset.insert(new_offset, new_free_size);
@@ -91,31 +91,31 @@ impl Allocator {
             panic!("invalid free: region overlaps already-free region");
         }
 
-        let merge_previous = self.by_offset.range(..offset).rev().next().filter(
+        let merge_previous = self.by_offset.range(..offset).rev().next().and_then(
             |(previous_offset, previous_size)| match offset
-                .cmp(&(**previous_offset + **previous_size))
+                .cmp(&(*previous_offset + *previous_size))
             {
                 Ordering::Less => {
                     panic!("invalid free: region overlaps already-free region");
                 }
-                Ordering::Equal => true,
-                Ordering::Greater => false,
+                Ordering::Equal => Some((*previous_offset, *previous_size)),
+                Ordering::Greater => None,
             },
         );
 
         if let Some((previous_offset, previous_size)) = merge_previous {
-            offset = *previous_offset;
-            size += *previous_size;
+            offset = previous_offset;
+            size += previous_size;
 
-            self.remove(*previous_offset, *previous_size);
+            self.remove(previous_offset, previous_size);
         }
 
         let next_offset = offset + size;
 
-        if let Some(next_size) = self.by_offset.get(&next_offset) {
-            size += *next_size;
+        if let Some(next_size) = self.by_offset.get(&next_offset).copied() {
+            size += next_size;
 
-            self.remove(next_offset, *next_size);
+            self.remove(next_offset, next_size);
         }
 
         self.by_offset.insert(offset, size);
@@ -149,7 +149,7 @@ mod test {
 
     impl Case {
         fn run(&self) {
-            let allocator = Allocator::new(self.capacity);
+            let mut allocator = Allocator::new(self.capacity);
 
             for iteration in &self.iterations {
                 let regions = iteration

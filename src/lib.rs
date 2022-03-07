@@ -9,7 +9,7 @@ use {
     std::{
         any,
         cell::RefCell,
-        collections::HashMap,
+        collections::{hash_map::Entry, BTreeMap, HashMap},
         error,
         fmt::{self, Display},
         mem,
@@ -19,10 +19,12 @@ use {
         str::FromStr,
     },
     syn::{
-        BinOp, Block, Expr, ExprAssign, ExprAssignOp, ExprBinary, ExprBlock, ExprBreak, ExprField,
-        ExprIf, ExprLit, ExprLoop, ExprParen, ExprPath, ExprReference, ExprStruct, ExprUnary,
-        Fields, FieldsNamed, FieldsUnnamed, Generics, ItemStruct, Lit, LitBool, Local, Member, Pat,
-        PatIdent, Path, PathArguments, PathSegment, Stmt, TypePath, UnOp, Visibility,
+        punctuated::Punctuated, AngleBracketedGenericArguments, BinOp, Block, Expr, ExprAssign,
+        ExprAssignOp, ExprBinary, ExprBlock, ExprBreak, ExprField, ExprIf, ExprLit, ExprLoop,
+        ExprParen, ExprPath, ExprReference, ExprStruct, ExprUnary, Fields, FieldsNamed,
+        FieldsUnnamed, GenericArgument, GenericParam, Generics, ItemStruct, Lit, LitBool, Local,
+        Member, Pat, PatIdent, Path, PathArguments, PathSegment, Stmt, TypePath, TypeReference,
+        UnOp, Visibility,
     },
 };
 
@@ -141,34 +143,34 @@ macro_rules! integer_signed_op {
     };
 }
 
-fn add<T: FromBytes + ToBytes + Add<T, Output = T>>(env: &mut Env) {
+fn add<T: FromBytes + ToBytes + Add<T, Output = T>>(env: &mut Env) -> Result<(), EvalException> {
     let b = env.pop::<T>();
     let a = env.pop::<T>();
-    env.push(a + b);
+    env.push(a + b)
 }
 
-fn sub<T: FromBytes + ToBytes + Sub<T, Output = T>>(env: &mut Env) {
+fn sub<T: FromBytes + ToBytes + Sub<T, Output = T>>(env: &mut Env) -> Result<(), EvalException> {
     let b = env.pop::<T>();
     let a = env.pop::<T>();
-    env.push(a - b);
+    env.push(a - b)
 }
 
-fn mul<T: FromBytes + ToBytes + Mul<T, Output = T>>(env: &mut Env) {
+fn mul<T: FromBytes + ToBytes + Mul<T, Output = T>>(env: &mut Env) -> Result<(), EvalException> {
     let b = env.pop::<T>();
     let a = env.pop::<T>();
-    env.push(a * b);
+    env.push(a * b)
 }
 
-fn div<T: FromBytes + ToBytes + Div<T, Output = T>>(env: &mut Env) {
+fn div<T: FromBytes + ToBytes + Div<T, Output = T>>(env: &mut Env) -> Result<(), EvalException> {
     let b = env.pop::<T>();
     let a = env.pop::<T>();
-    env.push(a / b);
+    env.push(a / b)
 }
 
-fn rem<T: FromBytes + ToBytes + Rem<T, Output = T>>(env: &mut Env) {
+fn rem<T: FromBytes + ToBytes + Rem<T, Output = T>>(env: &mut Env) -> Result<(), EvalException> {
     let b = env.pop::<T>();
     let a = env.pop::<T>();
-    env.push(a % b);
+    env.push(a % b)
 }
 
 macro_rules! integer_binary_ops_cases {
@@ -206,34 +208,34 @@ fn pattern_eq<T: FromBytes + ToBytes + PartialEq<T>>((env, offset): (&mut Env, u
     a == b
 }
 
-fn eq<T: FromBytes + ToBytes + PartialEq<T>>(env: &mut Env) {
+fn eq<T: FromBytes + ToBytes + PartialEq<T>>(env: &mut Env) -> Result<(), EvalException> {
     let b = env.pop::<T>();
     let a = env.pop::<T>();
-    env.push(a == b);
+    env.push(a == b)
 }
 
-fn ge<T: FromBytes + ToBytes + PartialOrd<T>>(env: &mut Env) {
+fn ge<T: FromBytes + ToBytes + PartialOrd<T>>(env: &mut Env) -> Result<(), EvalException> {
     let b = env.pop::<T>();
     let a = env.pop::<T>();
-    env.push(a >= b);
+    env.push(a >= b)
 }
 
-fn gt<T: FromBytes + ToBytes + PartialOrd<T>>(env: &mut Env) {
+fn gt<T: FromBytes + ToBytes + PartialOrd<T>>(env: &mut Env) -> Result<(), EvalException> {
     let b = env.pop::<T>();
     let a = env.pop::<T>();
-    env.push(a > b);
+    env.push(a > b)
 }
 
-fn le<T: FromBytes + ToBytes + PartialOrd<T>>(env: &mut Env) {
+fn le<T: FromBytes + ToBytes + PartialOrd<T>>(env: &mut Env) -> Result<(), EvalException> {
     let b = env.pop::<T>();
     let a = env.pop::<T>();
-    env.push(a <= b);
+    env.push(a <= b)
 }
 
-fn lt<T: FromBytes + ToBytes + PartialOrd<T>>(env: &mut Env) {
+fn lt<T: FromBytes + ToBytes + PartialOrd<T>>(env: &mut Env) -> Result<(), EvalException> {
     let b = env.pop::<T>();
     let a = env.pop::<T>();
-    env.push(a < b);
+    env.push(a < b)
 }
 
 macro_rules! integer_comparison_ops_cases {
@@ -373,7 +375,7 @@ enum Float {
     F64,
 }
 
-#[derive(Clone, Hash, Eq, PartialEq, Copy, Debug)]
+#[derive(Clone, Hash, Eq, PartialEq, Copy, Debug, Ord, PartialOrd)]
 struct NameId(usize);
 
 #[derive(Clone, Hash, Eq, PartialEq, Copy, Debug)]
@@ -443,8 +445,10 @@ impl Type {
                 Integer::U64 | Integer::I64 => 8,
                 Integer::Usize | Integer::Isize => mem::size_of::<usize>(),
                 Integer::U128 | Integer::I128 => 16,
+                Integer::Unknown => unreachable!(),
             },
             Type::Nominal { size, .. } => *size,
+            Type::Reference { .. } => mem::size_of::<usize>(),
             _ => todo!("size for {self:?}"),
         }
     }
@@ -532,6 +536,23 @@ impl Reference {
 }
 
 #[derive(Clone, Debug)]
+enum Lens {
+    Unresolved,
+    Field(Field),
+    Reference(Rc<Lens>),
+}
+
+impl Lens {
+    fn type_(&self) -> Type {
+        match self {
+            Self::Unresolved => unreachable!(),
+            Self::Field(Field { type_, .. }) => type_.clone(),
+            Self::Reference(lens) => lens.type_(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 enum Term {
     Block {
         scope: Rc<RefCell<Scope>>,
@@ -592,6 +613,7 @@ enum Term {
     Field {
         base: Rc<Term>,
         name: NameId,
+        lens: Lens,
     },
 }
 
@@ -639,6 +661,9 @@ impl Term {
                 })
                 .unwrap(),
             Self::Reference(reference) => reference.type_(),
+            Self::Loop { type_, .. } => type_.clone(),
+            Self::Struct { type_, .. } => type_.clone(),
+            Self::Field { lens, .. } => lens.type_(),
             _ => todo!("Term::type_ for {self:?}"),
         }
     }
@@ -722,19 +747,27 @@ impl BranchContext {
     }
 
     fn make_phi_nodes(&mut self, bindings: &mut [Binding]) {
-        for (my_index, (binding_index, _)) in self.originals.iter().enumerate() {
+        for (my_index, (binding_index, original)) in self.originals.iter().enumerate() {
             let terms = self.terms[my_index..]
                 .iter()
                 .step_by(self.originals.len())
                 .cloned()
                 .collect::<Rc<[_]>>();
 
-            if !terms
+            if terms
                 .iter()
                 .all(|term| matches!(term.borrow().deref(), BindingTerm::UntypedAndUninitialized))
             {
-                bindings[*binding_index].term =
-                    Rc::new(RefCell::new(BindingTerm::Untyped(Term::Phi(terms))))
+                bindings[*binding_index].term = original.clone();
+            } else {
+                let phi = Term::Phi(terms);
+
+                *original.borrow_mut() = BindingTerm::Uninitialized(Literal {
+                    offset: 0,
+                    type_: phi.type_(),
+                });
+
+                bindings[*binding_index].term = Rc::new(RefCell::new(BindingTerm::Untyped(phi)))
             }
         }
     }
@@ -742,13 +775,13 @@ impl BranchContext {
 
 #[derive(Debug)]
 enum EvalException {
-    Break { label: Option<NameId> },
-    Return,
+    Break { label: Option<NameId>, term: Term },
+    Return { term: Term },
     Overflow,
 }
 
 #[derive(Clone)]
-struct EvalResult {
+pub struct EvalResult {
     value: Rc<[u8]>,
     type_: Type,
 }
@@ -767,7 +800,7 @@ impl fmt::Display for EvalResult {
             write!(f, "{}_{}", T::from_bytes(value), any::type_name::<T>())
         }
 
-        match self.type_ {
+        match &self.type_ {
             Type::Integer(integer) => match integer {
                 Integer::Unknown => str::from_utf8(&self.value).unwrap().fmt(f),
                 _ => integer_op!(fmt, integer, (f, &self.value)),
@@ -780,7 +813,7 @@ impl fmt::Display for EvalResult {
             Type::Reference { type_, unique } => write!(
                 f,
                 "&{}{}",
-                if unique { "mut " } else { "" },
+                if *unique { "mut " } else { "" },
                 EvalResult {
                     value: self.value.clone(),
                     type_: type_.deref().clone()
@@ -840,6 +873,12 @@ fn match_types(expected: &Type, actual: &Type) -> Result<()> {
 struct Field {
     type_: Type,
     offset: usize,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum ItemState {
+    Resolving,
+    Resolved,
 }
 
 #[derive(Clone, Debug)]
@@ -931,6 +970,8 @@ impl Env {
 
         let false_offset = 5;
 
+        let unit_offset = allocator.allocate(0).unwrap();
+
         let mut env = Self {
             heap,
             allocator,
@@ -947,7 +988,7 @@ impl Env {
             traits: HashMap::new(),
             impls: HashMap::new(),
             unit: Literal {
-                offset: allocator.allocate(0).unwrap(),
+                offset: unit_offset,
                 type_: Type::Unit,
             },
             true_: Literal {
@@ -1296,8 +1337,6 @@ impl Env {
 
         let binding_count = self.bindings.len();
 
-        let item_count = self.items.len();
-
         let term = &self.stmt_to_term(&stmt)?;
 
         let uninitialized_bindings = self.bindings[binding_count..].iter().any(|binding| {
@@ -1307,26 +1346,26 @@ impl Env {
             )
         });
 
-        self.bindings.truncate(binding_count);
-
         if uninitialized_bindings {
             return Err(anyhow!("top-level let bindings must be initialized"));
         }
+
+        self.resolve_scope()?;
 
         self.type_check_bindings(binding_count)?;
 
         self.bindings.truncate(binding_count);
 
-        self.resolve_items(item_count)?;
-
         let term = self.type_check(term, None)?;
 
         self.bindings.truncate(binding_count);
 
+        info!("{term:#?}");
+
         match self.eval_term(&term) {
             Ok(_) => (),
             Err(exception) => match exception {
-                EvalException::Return => (),
+                EvalException::Return { .. } => todo!(),
                 EvalException::Overflow => return Err(anyhow!("stack overflow")),
                 _ => unreachable!(),
             },
@@ -1344,7 +1383,7 @@ impl Env {
                         (
                             self.unintern(binding.name),
                             match binding.term.borrow().deref() {
-                                BindingTerm::Initialized(literal) => self.into_result(literal),
+                                BindingTerm::Initialized(literal) => self.to_result(literal),
                                 _ => unreachable!(),
                             },
                         )
@@ -1352,7 +1391,7 @@ impl Env {
                     .collect(),
             )
         } else {
-            Eval::Result(self.into_result(&Literal {
+            Eval::Result(self.to_result(&Literal {
                 type_,
                 offset: self.stack.offset,
             }))
@@ -1488,7 +1527,7 @@ impl Env {
                             })
                         }
 
-                        _ => unreachable!(),
+                        _ => unreachable!("{:?}", term.deref()),
                     };
                 }
 
@@ -1502,15 +1541,21 @@ impl Env {
             }
 
             Term::Variable { index, .. } => {
-                if let BindingTerm::Initialized(term) = self.bindings[*index].term.borrow().deref()
+                let literal = if let BindingTerm::Initialized(literal) =
+                    self.bindings[*index].term.borrow().deref()
                 {
-                    self.push_term(term)?;
+                    literal.clone()
                 } else {
-                    panic!("unexpected binding term variant: {term:?}")
-                }
+                    panic!(
+                        "unexpected binding term variant: {:?}",
+                        self.bindings[*index].term.borrow().deref()
+                    )
+                };
+
+                self.push_literal(&literal)?;
             }
 
-            Term::Literal(term) => self.push_term(term)?,
+            Term::Literal(literal) => self.push_literal(literal)?,
 
             Term::Application {
                 abstraction:
@@ -1557,7 +1602,7 @@ impl Env {
                 if !self.pop::<bool>() {
                     self.eval_term(right)?;
                 } else {
-                    self.push(false);
+                    self.push(false)?;
                 }
             }
 
@@ -1567,35 +1612,38 @@ impl Env {
                 if self.pop::<bool>() {
                     self.eval_term(right)?;
                 } else {
-                    self.push(true);
+                    self.push(true)?;
                 }
             }
 
             Term::UnaryOp(op, term) => {
-                fn neg<T: FromBytes + ToBytes + Neg<Output = T>>(env: &mut Env) {
+                fn neg<T: FromBytes + ToBytes + Neg<Output = T>>(
+                    env: &mut Env,
+                ) -> Result<(), EvalException> {
                     let tmp = env.pop::<T>();
-                    env.push(-tmp);
+                    env.push(-tmp)
                 }
 
                 self.eval_term(term)?;
 
                 match op {
                     UnaryOp::Neg => match term.type_() {
-                        Type::Integer(integer_type) => integer_signed_op!(neg, integer_type, self),
+                        Type::Integer(integer_type) => integer_signed_op!(neg, integer_type, self)?,
 
                         _ => unreachable!(),
                     },
 
                     UnaryOp::Not => {
                         let tmp = self.pop::<bool>();
-                        self.push(!tmp);
+                        self.push(!tmp)?;
                     }
 
                     UnaryOp::Deref => {
-                        if let Term::Reference(reference) = term.deref() {
-                            self.push_copy(&reference.deref_type(), self.pop::<usize>());
+                        if let Type::Reference { type_, .. } = &term.type_() {
+                            let offset = self.pop::<usize>();
+                            self.push_copy(type_, offset)?;
                         } else {
-                            unreachable!()
+                            unreachable!("{:?}", term.type_())
                         }
                     }
                 }
@@ -1611,13 +1659,13 @@ impl Env {
                         | BinaryOp::Sub
                         | BinaryOp::Mul
                         | BinaryOp::Div
-                        | BinaryOp::Rem => integer_binary_ops!(op, integer_type, self),
+                        | BinaryOp::Rem => integer_binary_ops!(op, integer_type, self)?,
 
                         BinaryOp::Eq
                         | BinaryOp::Ge
                         | BinaryOp::Gt
                         | BinaryOp::Le
-                        | BinaryOp::Lt => integer_comparison_ops!(op, integer_type, self),
+                        | BinaryOp::Lt => integer_comparison_ops!(op, integer_type, self)?,
                         _ => unreachable!(),
                     },
                     _ => unreachable!(),
@@ -1640,7 +1688,7 @@ impl Env {
                         };
 
                         if match_guard {
-                            self.eval_term(&arm.body);
+                            self.eval_term(&arm.body)?;
 
                             return Ok(());
                         }
@@ -1653,28 +1701,43 @@ impl Env {
             }
 
             Term::Assignment { left, right } => {
-                let base = self.stack.offset;
+                let src = self.stack.offset;
 
                 self.eval_term(right)?;
 
-                let offset = match left.deref() {
+                let dst = match left.deref() {
                     Term::Variable { index, .. } => {
-                        match self.bindings[*index].term.as_ref().borrow().deref() {
+                        let literal = match self.bindings[*index].term.borrow().deref() {
                             BindingTerm::Initialized(literal)
-                            | BindingTerm::Uninitialized(literal) => literal.offset,
+                            | BindingTerm::Uninitialized(literal) => literal.clone(),
                             _ => unreachable!(),
-                        }
+                        };
+
+                        let offset = literal.offset;
+
+                        self.bindings[*index].term =
+                            Rc::new(RefCell::new(BindingTerm::Initialized(literal)));
+
+                        offset
                     }
 
-                    Term::UnaryOp(UnaryOp::Deref, left) => self.offset_of(left),
+                    Term::UnaryOp(UnaryOp::Deref, left) => {
+                        self.eval_term(left)?;
+
+                        self.pop()
+                    }
+
+                    Term::Field { base, lens, .. } => {
+                        self.offset_of_lens(lens, self.offset_of(base))
+                    }
 
                     _ => todo!("assignment to {left:?}"),
                 };
 
                 self.heap
-                    .copy_within(base..(base + right.type_().size()), offset);
+                    .copy_within(src..(src + right.type_().size()), dst);
 
-                self.stack.offset = base;
+                self.stack.offset = src;
             }
 
             Term::Block { terms, .. } => {
@@ -1682,43 +1745,65 @@ impl Env {
 
                 let offset = self.stack.offset;
 
-                let result = terms.iter().try_for_each(|term| {
-                    let result = self.eval_term(term);
+                let result = terms.iter().try_for_each(|term| self.eval_term(term));
 
-                    self.stack.offset = offset;
+                if result.is_ok() {
+                    let size = terms.last().unwrap().type_().size();
 
-                    result
-                });
+                    self.heap
+                        .copy_within((self.stack.offset - size)..self.stack.offset, offset);
+
+                    self.stack.offset = offset + size;
+                }
 
                 self.bindings.truncate(binding_count);
 
                 return result;
             }
 
-            Term::Loop { label, body, .. } => loop {
-                match self.eval_term(body) {
-                    Ok(_) => (),
+            Term::Loop { label, body, .. } => {
+                let offset = self.stack.offset;
 
-                    Err(EvalException::Break { label: break_label })
-                        if break_label.is_none() || break_label == *label =>
-                    {
-                        break
+                loop {
+                    match self.eval_term(body) {
+                        Ok(_) => {
+                            self.stack.offset = offset;
+                        }
+
+                        Err(EvalException::Break {
+                            label: break_label,
+                            term,
+                        }) if break_label.is_none() || break_label == *label => {
+                            let size = term.type_().size();
+
+                            self.heap
+                                .copy_within((self.stack.offset - size)..self.stack.offset, offset);
+
+                            self.stack.offset = offset + size;
+
+                            break;
+                        }
+
+                        err => return err,
                     }
-
-                    err => return err,
                 }
-            },
+            }
 
             Term::Break { label, term } => {
                 self.eval_term(term)?;
 
-                return Err(EvalException::Break { label: *label });
+                return Err(EvalException::Break {
+                    label: *label,
+                    term: term.deref().clone(),
+                });
             }
 
             Term::Return { term } => {
                 self.eval_term(term)?;
 
-                return Err(EvalException::Return);
+                return Err(EvalException::Return {
+                    term: term.deref().clone(),
+                });
             }
 
             Term::Reference(reference) => {
@@ -1728,7 +1813,7 @@ impl Env {
             Term::Struct { type_, arguments } => {
                 let fields = if let Type::Nominal { item, .. } = &type_ {
                     if let Item::Struct { fields, .. } = &self.items[item.0] {
-                        fields
+                        fields.clone()
                     } else {
                         unreachable!()
                     }
@@ -1754,28 +1839,18 @@ impl Env {
                 }
             }
 
-            Term::Field { base, name } => {
-                let field = if let Type::Nominal { item, .. } = &base.type_() {
-                    if let Item::Struct { fields, .. } = &self.items[item.0] {
-                        fields.get(name).unwrap()
-                    } else {
-                        unreachable!()
-                    }
-                } else {
-                    todo!("field access through references, smart pointers, etc.")
-                };
-
+            Term::Field { base, lens, .. } => {
                 self.eval_term(base)?;
 
-                let base_offset = self.stack.offset - base.type_().size();
+                let dst = self.stack.offset - base.type_().size();
 
-                let field_offset = base_offset + field.offset;
+                let src = self.offset_of_lens(lens, dst);
 
-                self.heap.copy_within(
-                    field_offset..(field_offset + field.type_.size()),
-                    base_offset,
-                );
-                self.stack.offset = base_offset;
+                let type_ = lens.type_();
+
+                self.heap.copy_within(src..(src + type_.size()), dst);
+
+                self.stack.offset = dst + type_.size();
             }
 
             _ => todo!("evaluation not yet supported for term {term:?}"),
@@ -1784,7 +1859,7 @@ impl Env {
         Ok(())
     }
 
-    fn into_result(&mut self, literal: &Literal) -> EvalResult {
+    fn to_result(&self, literal: &Literal) -> EvalResult {
         let mut type_ = &literal.type_;
         let mut offset = literal.offset;
         while let Type::Reference {
@@ -1847,7 +1922,7 @@ impl Env {
         }
     }
 
-    fn push_term(&mut self, term: &Literal) -> Result<(), EvalException> {
+    fn push_literal(&mut self, term: &Literal) -> Result<(), EvalException> {
         self.push_copy(&term.type_, term.offset)
     }
 
@@ -1887,32 +1962,28 @@ impl Env {
 
     fn offset_of(&self, term: &Term) -> usize {
         match term {
-            Term::Variable { index, .. } => {
-                match self.bindings[*index].term.as_ref().borrow().deref() {
-                    BindingTerm::Initialized(literal) | BindingTerm::Uninitialized(literal) => {
-                        literal.offset
-                    }
-                    _ => unreachable!(),
+            Term::Variable { index, .. } => match self.bindings[*index].term.borrow().deref() {
+                BindingTerm::Initialized(literal) | BindingTerm::Uninitialized(literal) => {
+                    literal.offset
                 }
-            }
+                _ => unreachable!(),
+            },
 
-            Term::Field { base, name } => {
-                let field = if let Type::Nominal { item, .. } = &base.type_() {
-                    if let Item::Struct { fields, .. } = &self.items[item.0] {
-                        fields.get(name).unwrap()
-                    } else {
-                        unreachable!()
-                    }
-                } else {
-                    todo!("field access through references, smart pointers, etc.")
-                };
+            Term::Field { base, lens, .. } => self.offset_of_lens(lens, self.offset_of(base)),
 
-                self.offset_of(base) + field.offset
-            }
+            Term::Literal(Literal { offset, .. }) => *offset,
 
             // At this point any references to temporaries should have been transformed into references to
             // variables or fields of (fields of ...) variables
-            _ => unreachable!(),
+            _ => unreachable!("{:?}", term),
+        }
+    }
+
+    fn offset_of_lens(&self, lens: &Lens, base: usize) -> usize {
+        match lens {
+            Lens::Unresolved => unreachable!(),
+            Lens::Field(field) => base + field.offset,
+            Lens::Reference(lens) => self.offset_of_lens(lens, self.load::<usize>(base)),
         }
     }
 
@@ -1953,38 +2024,40 @@ impl Env {
             Term::Variable { index, .. } => {
                 let index = *index;
 
-                let binding = &self.bindings[index];
+                let term = {
+                    let binding = &self.bindings[index];
 
-                let error = || {
-                    Err(anyhow!(
-                        "use of uninitialized variable: {}",
-                        self.unintern(binding.name)
-                    ))
+                    let error = || {
+                        Err(anyhow!(
+                            "use of or assignment to possibly-uninitialized variable: {}",
+                            self.unintern(binding.name)
+                        ))
+                    };
+
+                    match binding.term.borrow().deref() {
+                        BindingTerm::Typed(Term::Phi(terms)) => {
+                            if terms.iter().any(|term| {
+                                matches!(
+                                    term.borrow().deref(),
+                                    BindingTerm::Uninitialized(_)
+                                        | BindingTerm::UntypedAndUninitialized
+                                )
+                            }) {
+                                return error();
+                            }
+                        }
+
+                        BindingTerm::Uninitialized(_) | BindingTerm::UntypedAndUninitialized => {
+                            return error()
+                        }
+
+                        _ => (),
+                    }
+
+                    binding.term.clone()
                 };
 
-                match binding.term.borrow().deref() {
-                    BindingTerm::Typed(Term::Phi(terms)) => {
-                        if terms.iter().any(|term| {
-                            matches!(
-                                term.borrow().deref(),
-                                BindingTerm::Uninitialized(_)
-                                    | BindingTerm::UntypedAndUninitialized
-                            )
-                        }) {
-                            return error();
-                        }
-                    }
-
-                    BindingTerm::Uninitialized(_) | BindingTerm::UntypedAndUninitialized => {
-                        return error()
-                    }
-
-                    _ => (),
-                }
-
-                let type_ = self
-                    .type_check_binding(&binding.term, expected_type)?
-                    .type_();
+                let type_ = self.type_check_binding(&term, expected_type)?.type_();
 
                 Ok(Term::Variable { index, type_ })
             }
@@ -2277,25 +2350,36 @@ impl Env {
             }
 
             Term::Assignment { left, right } => {
-                let right = self.type_check(right, expected_type)?;
-
-                let right_type = right.type_();
-
                 if let Term::Variable { index, .. } = left.deref() {
                     let index = *index;
 
                     // todo: check binding type ascription, if present
 
+                    let expected_type = match self.bindings[index].term.borrow().deref() {
+                        BindingTerm::Typed(term) => Some(term.type_()),
+                        _ => None,
+                    };
+
+                    let right = self.type_check(right, expected_type.as_ref())?;
+
+                    let right_type = right.type_();
+
                     match_types(&self.type_check_binding_index(index, None)?, &right_type)?;
 
-                    if let BindingTerm::Uninitialized(literal) =
-                        self.bindings[index].term.borrow_mut().deref_mut()
-                    {
-                        if right_type != Type::Never {
-                            literal.type_ = right_type.clone();
+                    match self.bindings[index].term.borrow_mut().deref_mut() {
+                        BindingTerm::Uninitialized(literal) => {
+                            if right_type != Type::Never {
+                                literal.type_ = right_type.clone();
+                            }
                         }
-                    } else if !self.bindings[index].mutable {
-                        return Err(anyhow!("invalid assignment to immutable variable"));
+
+                        BindingTerm::UntypedAndUninitialized => (),
+
+                        _ => {
+                            if !self.bindings[index].mutable {
+                                return Err(anyhow!("invalid assignment to immutable variable"));
+                            }
+                        }
                     }
 
                     self.bindings[index].term =
@@ -2308,27 +2392,25 @@ impl Env {
                         }),
                         right: Rc::new(right),
                     })
-                } else if let Term::UnaryOp(UnaryOp::Deref, left) = self.type_check(left, None)? {
-                    if let Type::Reference {
-                        unique,
-                        type_: expected_type,
-                    } = left.type_()
-                    {
-                        if unique {
-                            match_types(&expected_type, &right_type)?;
-
-                            Ok(Term::Assignment {
-                                left: Rc::new(Term::UnaryOp(UnaryOp::Deref, left)),
-                                right: Rc::new(right),
-                            })
-                        } else {
-                            Err(anyhow!("cannot assign to shared reference"))
-                        }
-                    } else {
-                        unreachable!()
-                    }
                 } else {
-                    todo!("assignment to {left:?}")
+                    let left = self.type_check(left, None)?;
+
+                    if !self.is_mutable(&left) {
+                        return Err(anyhow!("invalid assignment to immutable term"));
+                    }
+
+                    let left_type = left.type_();
+
+                    let right = self.type_check(right, Some(&left_type))?;
+
+                    let right_type = right.type_();
+
+                    match_types(&left_type, &right_type)?;
+
+                    Ok(Term::Assignment {
+                        left: Rc::new(left),
+                        right: Rc::new(right),
+                    })
                 }
             }
 
@@ -2338,18 +2420,26 @@ impl Env {
 
                 self.scopes.push(scope.clone());
 
-                let terms = terms
-                    .iter()
-                    .map(|term| self.type_check(term, None))
-                    .collect::<Result<_>>();
+                let scope_check = self.resolve_scope();
 
-                let binding_check = if terms.is_ok() {
+                let terms = if scope_check.is_ok() {
+                    terms
+                        .iter()
+                        .map(|term| self.type_check(term, None))
+                        .collect::<Result<_>>()
+                } else {
+                    Ok(Rc::new([]) as Rc<[_]>)
+                };
+
+                let binding_check = if scope_check.is_ok() && terms.is_ok() {
                     self.type_check_bindings(binding_count)
                 } else {
                     Ok(())
                 };
 
                 let scope = self.scopes.pop().unwrap();
+
+                assert_eq!(scope_count, self.scopes.len());
 
                 // todo: check for bound values which implement Drop and insert the appropriate calls
 
@@ -2474,79 +2564,113 @@ impl Env {
             }))),
 
             Term::Struct { type_, arguments } => {
-                let mut type_ = type_.clone();
-
                 let name = if let Type::Unresolved(name) = &type_ {
                     *name
                 } else {
                     unreachable!()
                 };
 
-                self.resolve_type(&mut type_)?;
+                let type_ = self.resolve_type(type_, &mut HashMap::new())?;
 
-                if let Type::Nominal { item, .. } = &type_ {
+                let error = || {
+                    Err(anyhow!(
+                        "attempt to initialize non-struct {} as a struct",
+                        self.unintern(name)
+                    ))
+                };
+
+                let fields = if let Type::Nominal { item, .. } = &type_ {
                     if let Item::Struct { fields, .. } = &self.items[item.0] {
-                        return if !fields.keys().all(|name| arguments.contains_key(name)) {
-                            Err(anyhow!("fields missing in struct initializer"))
+                        if !fields.keys().all(|name| arguments.contains_key(name)) {
+                            return Err(anyhow!("fields missing in struct initializer"));
                         } else {
-                            Ok(Term::Struct {
-                                type_,
-                                arguments: Rc::new(
-                                    arguments
-                                        .iter()
-                                        .map(|(name, term)| {
-                                            if let Some(Field {
-                                                type_: expected_type,
-                                                ..
-                                            }) = fields.get(name)
-                                            {
-                                                let term =
-                                                    self.type_check(term, Some(expected_type))?;
-
-                                                match_types(expected_type, &term.type_())?;
-
-                                                Ok((*name, term))
-                                            } else {
-                                                Err(anyhow!(
-                                                    "no such field: {}",
-                                                    self.unintern(*name)
-                                                ))
-                                            }
-                                        })
-                                        .collect::<Result<_>>()?,
-                                ),
-                            })
-                        };
+                            fields.clone()
+                        }
+                    } else {
+                        return error();
                     }
-                }
+                } else {
+                    return error();
+                };
 
-                Err(anyhow!(
-                    "attempt to initialize non-struct {} as a struct",
-                    self.unintern(name)
-                ))
+                Ok(Term::Struct {
+                    type_,
+                    arguments: Rc::new(
+                        arguments
+                            .iter()
+                            .map(|(name, term)| {
+                                if let Some(Field {
+                                    type_: expected_type,
+                                    ..
+                                }) = fields.get(name)
+                                {
+                                    let term = self.type_check(term, Some(expected_type))?;
+
+                                    match_types(expected_type, &term.type_())?;
+
+                                    Ok((*name, term))
+                                } else {
+                                    Err(anyhow!("no such field: {}", self.unintern(*name)))
+                                }
+                            })
+                            .collect::<Result<_>>()?,
+                    ),
+                })
             }
 
-            Term::Field { base, name } => {
+            Term::Field { base, name, .. } => {
                 let base = self.type_check(base, None)?;
 
-                if let Type::Nominal { item, .. } = &base.type_() {
-                    if let Item::Struct { fields, .. } = &self.items[item.0] {
-                        return if fields.contains_key(name) {
-                            Ok(Term::Field {
-                                base: Rc::new(base),
-                                name: *name,
-                            })
-                        } else {
-                            Err(anyhow!("no such field: {}", self.unintern(*name)))
-                        };
-                    }
-                }
-
-                // todo: field access through references, smart pointers, etc.
-                Err(anyhow!("attempt to resolve a field of non-struct value"))
+                self.resolve_field(&base.type_(), *name)
+                    .map(|lens| Term::Field {
+                        base: Rc::new(base),
+                        name: *name,
+                        lens,
+                    })
             }
 
             _ => Err(anyhow!("type checking not yet supported for term {term:?}")),
+        }
+    }
+
+    fn resolve_field(&self, type_: &Type, name: NameId) -> Result<Lens> {
+        match type_ {
+            Type::Nominal { item, .. } => {
+                if let Item::Struct { fields, .. } = &self.items[item.0] {
+                    if let Some(field) = fields.get(&name) {
+                        Ok(Lens::Field(field.clone()))
+                    } else {
+                        Err(anyhow!("no such field: {}", self.unintern(name)))
+                    }
+                } else {
+                    Err(anyhow!("attempt to resolve a field of non-struct value"))
+                }
+            }
+
+            Type::Reference { type_, .. } => self
+                .resolve_field(type_, name)
+                .map(|lens| Lens::Reference(Rc::new(lens))),
+
+            // todo: field access through smart pointers, etc.
+            _ => Err(anyhow!("attempt to resolve a field of non-struct value")),
+        }
+    }
+
+    fn is_mutable(&self, term: &Term) -> bool {
+        match term {
+            Term::UnaryOp(UnaryOp::Deref, term) => {
+                if let Type::Reference { unique, .. } = term.type_() {
+                    unique
+                } else {
+                    unreachable!()
+                }
+            }
+
+            Term::Field { base, .. } => self.is_mutable(base),
+
+            Term::Variable { index, .. } => self.bindings[*index].mutable,
+
+            _ => todo!("mutability of {term:?}"),
         }
     }
 
@@ -2589,6 +2713,12 @@ impl Env {
     ) -> Result<Term> {
         let untyped = match term.borrow().deref() {
             BindingTerm::Uninitialized(literal) => return Ok(Term::Literal(literal.clone())),
+            BindingTerm::UntypedAndUninitialized => {
+                return Ok(Term::Literal(Literal {
+                    offset: 0,
+                    type_: Type::Never,
+                }))
+            }
             BindingTerm::Untyped(term) => term.clone(),
             BindingTerm::Typed(term) => return Ok(term.clone()),
             _ => unreachable!(),
@@ -2624,70 +2754,97 @@ impl Env {
         })
     }
 
-    fn resolve_items(&mut self, start: usize) -> Result<()> {
-        let resolved = self.items[start..]
-            .iter()
-            .map(|item| self.resolve_item(&item))
-            .collect::<Result<Vec<_>>>()?;
+    fn resolve_scope(&mut self) -> Result<()> {
+        let scope = self.scopes.last().unwrap().clone();
+        let mut states = HashMap::new();
 
-        self.items.truncate(start);
-
-        self.items.extend(resolved);
+        for ItemId(item) in scope.borrow().items.values() {
+            self.resolve_item(*item, &mut states)?;
+        }
 
         Ok(())
     }
 
-    fn resolve_item(&self, item: &Item) -> Result<Item> {
-        // todo: type check method bodies (or else do that lazily elsewhere, e.g. on first invocation)
+    fn resolve_item(&mut self, item: usize, states: &mut HashMap<usize, ItemState>) -> Result<()> {
+        match states.entry(item) {
+            Entry::Vacant(e) => {
+                e.insert(ItemState::Resolving);
+            }
+            Entry::Occupied(e) => {
+                return if let ItemState::Resolved = e.get() {
+                    Ok(())
+                } else {
+                    // todo: if this generates false positives, we might be calling `resolve_item` when we don't need to
+                    Err(anyhow!("infinite type detected"))
+                };
+            }
+        }
 
-        Ok(match item {
+        // todo: type check method bodies (or else do that lazily elsewhere, e.g. on first invocation)
+        #[allow(clippy::single_match)]
+        match self.items[item].clone() {
             Item::Struct {
                 parameters,
                 fields,
                 methods,
-            } => Item::Struct {
-                parameters: parameters.clone(),
-                methods: methods.clone(),
-                fields: {
-                    let mut next_offset = 0;
+            } => {
+                self.items[item] = Item::Struct {
+                    parameters,
+                    methods,
+                    fields: {
+                        let mut next_offset = 0;
 
-                    // Note that we use the arbitrary HashMap iteration order to order fields, which would not be
-                    // ideal if we cared about alignment and efficiency.
-                    Rc::new(
-                        fields
-                            .iter()
-                            .map(|(name, Field { type_, .. })| {
-                                let mut type_ = type_.clone();
+                        // Note that we use the IDs of names to order fields, which would not be ideal if we cared
+                        // about alignment and efficiency.
+                        Rc::new(
+                            fields
+                                .iter()
+                                .map(|(name, field)| (*name, field.clone()))
+                                .collect::<BTreeMap<_, _>>()
+                                .into_iter()
+                                .map(|(name, mut field)| {
+                                    field.type_ = self.resolve_type(&field.type_, states)?;
 
-                                self.resolve_type(&mut type_)?;
+                                    field.offset = next_offset;
 
-                                let offset = next_offset;
+                                    next_offset += field.type_.size();
 
-                                next_offset += type_.size();
+                                    Ok((name, field))
+                                })
+                                .collect::<Result<_>>()?,
+                        )
+                    },
+                }
+            }
 
-                                Ok((*name, Field { type_, offset }))
-                            })
-                            .collect::<Result<_>>()?,
-                    )
-                },
-            },
+            _ => (),
+        }
 
-            _ => item.clone(),
-        })
+        states.insert(item, ItemState::Resolved);
+
+        Ok(())
     }
 
-    fn resolve_type(&self, type_: &mut Type) -> Result<()> {
+    fn resolve_type(
+        &mut self,
+        type_: &Type,
+        states: &mut HashMap<usize, ItemState>,
+    ) -> Result<Type> {
         // todo: recursively resolve type parameters
 
         // todo: detect infinite types and return error
 
-        if let Type::Unresolved(name) = type_ {
-            if let Some(found) = self.scopes.iter().rev().find_map(|scope| {
-                scope
-                    .borrow()
-                    .items
-                    .get(name)
-                    .map(|&item| match &self.items[item.0] {
+        match type_ {
+            Type::Unresolved(name) => {
+                if let Some(item) = self
+                    .scopes
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.borrow().items.get(name).copied())
+                {
+                    self.resolve_item(item.0, states)?;
+
+                    Ok(match &self.items[item.0] {
                         Item::Type(type_) => type_.clone(),
                         Item::Struct { fields, .. } => Type::Nominal {
                             item,
@@ -2699,14 +2856,18 @@ impl Env {
                             arguments: Rc::new([]),
                         },
                     })
-            }) {
-                *type_ = found;
-            } else {
-                return Err(anyhow!("type not found: {}", self.unintern(*name)));
+                } else {
+                    Err(anyhow!("type not found: {}", self.unintern(*name)))
+                }
             }
-        }
 
-        Ok(())
+            Type::Reference { type_, unique } => Ok(Type::Reference {
+                type_: Rc::new(self.resolve_type(type_, states)?),
+                unique: *unique,
+            }),
+
+            _ => Ok(type_.clone()),
+        }
     }
 
     // Does this need to be a method of Env, or can we move it to Pattern?
@@ -2743,7 +2904,7 @@ impl Env {
                                     init.as_ref()
                                         .map(|(_, expr)| self.expr_to_term(expr))
                                         .transpose()?
-                                        .map(|term| BindingTerm::Untyped(term))
+                                        .map(BindingTerm::Untyped)
                                         .unwrap_or(BindingTerm::UntypedAndUninitialized),
                                 ));
 
@@ -2784,7 +2945,11 @@ impl Env {
             })) => {
                 if !attrs.is_empty() {
                     Err(anyhow!("attributes not yet supported"))
-                } else if !params.is_empty() {
+                } else if !params
+                    .iter()
+                    .all(|param| matches!(param, GenericParam::Lifetime(_)))
+                {
+                    // todo: handle lifetimes
                     Err(anyhow!("generic parameters not yet supported"))
                 } else if where_clause.is_some() {
                     Err(anyhow!("where clauses not yet supported"))
@@ -2793,9 +2958,12 @@ impl Env {
                 } else {
                     let name = self.intern(&ident.to_string());
 
+                    let empty = Punctuated::new();
+
                     let fields = match fields {
                         Fields::Named(FieldsNamed { named, .. }) => named,
                         Fields::Unnamed(FieldsUnnamed { unnamed, .. }) => unnamed,
+                        Fields::Unit => &empty,
                     };
 
                     let fields = fields
@@ -2820,6 +2988,7 @@ impl Env {
                                     Ok((
                                         self.intern(
                                             &ident
+                                                .as_ref()
                                                 .map(|ident| ident.to_string())
                                                 .unwrap_or_else(|| index.to_string()),
                                         ),
@@ -2841,12 +3010,12 @@ impl Env {
 
                     let items = &mut self.scopes.last().unwrap().borrow_mut().items;
 
-                    if items.contains_key(&name) {
-                        Err(anyhow!("duplicate item identifier: {}", ident.to_string()))
-                    } else {
-                        items.insert(name, item);
+                    if let Entry::Vacant(e) = items.entry(name) {
+                        e.insert(item);
 
                         Ok(Term::Literal(self.unit.clone()))
+                    } else {
+                        Err(anyhow!("duplicate item identifier: {}", ident.to_string()))
                     }
                 }
             }
@@ -3164,13 +3333,13 @@ impl Env {
                             } else {
                                 let name = self.intern_member(member);
 
-                                if arguments.contains_key(&name) {
+                                if let Entry::Vacant(e) = arguments.entry(name) {
+                                    e.insert(self.expr_to_term(expr)?);
+                                } else {
                                     return Err(anyhow!(
                                         "duplicate field in struct initializer: {}",
                                         self.unintern(name)
                                     ));
-                                } else {
-                                    arguments.insert(name, self.expr_to_term(expr)?);
                                 }
                             }
                         }
@@ -3199,6 +3368,7 @@ impl Env {
                     Ok(Term::Field {
                         base: Rc::new(self.expr_to_term(base)?),
                         name: self.intern_member(member),
+                        lens: Lens::Unresolved,
                     })
                 }
             }
@@ -3254,14 +3424,35 @@ impl Env {
                 } else if segments.len() != 1 {
                     Err(anyhow!("qualified paths not yet supported"))
                 } else if let Some(PathSegment { ident, arguments }) = segments.last() {
-                    if let PathArguments::None = arguments {
-                        Ok(Type::Unresolved(self.intern(&ident.to_string())))
-                    } else {
-                        Err(anyhow!("path arguments not yet supported"))
+                    match arguments {
+                        PathArguments::None => {
+                            Ok(Type::Unresolved(self.intern(&ident.to_string())))
+                        }
+                        PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+                            args,
+                            ..
+                        }) if args
+                            .iter()
+                            .all(|arg| matches!(arg, GenericArgument::Lifetime(_))) =>
+                        {
+                            // todo: handle lifetimes
+                            Ok(Type::Unresolved(self.intern(&ident.to_string())))
+                        }
+                        _ => Err(anyhow!("path arguments not yet supported")),
                     }
                 } else {
                     Err(anyhow!("unexpected empty path"))
                 }
+            }
+
+            syn::Type::Reference(TypeReference {
+                mutability, elem, ..
+            }) => {
+                // todo: handle lifetime
+                self.type_to_type(elem).map(|type_| Type::Reference {
+                    unique: mutability.is_some(),
+                    type_: Rc::new(type_),
+                })
             }
 
             _ => Err(anyhow!("type_ not yet supported: {type_:#?}")),
@@ -3284,9 +3475,10 @@ mod test {
             ONCE.call_once(pretty_env_logger::init_timed);
         }
 
-        Ok(T::from_bytes(
-            &Env::new().eval_line(line)?.value.rvalue().value,
-        ))
+        Ok(match Env::default().eval_line(line)? {
+            Eval::Result(result) => T::from_bytes(&result.value),
+            eval => return Err(anyhow!("expected Eval::Result, got {eval}")),
+        })
     }
 
     #[test]
@@ -3406,10 +3598,34 @@ mod test {
     }
 
     #[test]
+    fn bad_struct_field_access() {
+        assert_eq!(
+            7_i64,
+            eval("{ struct Foo { x: i64, y: i64 } let f: Foo; f.x }").unwrap()
+        )
+    }
+
+    #[test]
     fn struct_field_mutation() {
         assert_eq!(
             56_i64,
             eval("{ struct Foo { x: i64, y: i64 } let mut f = Foo { x: 7, y: 14 }; f.y = 49; f.x + f.y }").unwrap()
+        )
+    }
+
+    #[test]
+    fn bad_immutable_struct_field_mutation() {
+        assert!(eval::<()>(
+            "{ struct Foo { x: i64, y: i64 } let f = Foo { x: 7, y: 14 }; f.y = 49; f.x + f.y }"
+        )
+        .is_err())
+    }
+
+    #[test]
+    fn bad_uninitialized_struct_field_mutation() {
+        assert!(
+            eval::<()>("{ struct Foo { x: i64, y: i64 } let f: Foo; f.y = 49; f.x + f.y }")
+                .is_err()
         )
     }
 
@@ -3425,15 +3641,50 @@ mod test {
     #[test]
     fn struct_field_unique_reference() {
         assert_eq!(
-            44_i64,
+            484_i64,
             eval(
                 "{ struct Foo { x: i64, y: i64 } \
-                  let mut f = Foo { x: 7, y: 14 }; \
-                  let y = &mut f.y; \
-                  *y = 22;\
-                  f.y * *y }"
+                 let mut f = Foo { x: 7, y: 14 }; \
+                 let y = &mut f.y; \
+                 *y = 22;\
+                 f.y * *y }"
             )
             .unwrap()
         )
+    }
+
+    #[test]
+    fn bad_struct_field_unique_reference() {
+        assert!(eval::<()>(
+            "{ struct Foo { x: i64, y: i64 } \
+             let f = Foo { x: 7, y: 14 }; \
+             let y = &mut f.y; \
+             *y = 22;\
+             f.y * *y }"
+        )
+        .is_err())
+    }
+
+    #[test]
+    fn struct_field_reference_chain() {
+        assert_eq!(
+            160034_i64,
+            eval(
+                "{ struct Foo<'a> { w: i64, x: &'a i64 } \
+                 struct Bar<'a, 'b> { a: &'a Foo<'b> } \
+                 struct Baz<'a, 'b> { w: i64, z: Bar<'a, 'b> } \
+                 let y = 71; \
+                 let f = Foo { w: 98, x: &y }; \
+                 let b = Bar { a: &f }; \
+                 let z = Baz { w: 23, z: b }; \
+                 z.w * z.z.a.w * *z.z.a.x }"
+            )
+            .unwrap()
+        )
+    }
+
+    #[test]
+    fn reference_temporary() {
+        assert_eq!(40_i32, eval("*&(33 + 7)").unwrap())
     }
 }
