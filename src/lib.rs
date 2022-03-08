@@ -875,14 +875,10 @@ struct Field {
     offset: usize,
 }
 
-#[derive(Copy, Clone, Debug)]
-enum ItemState {
-    Resolving,
-    Resolved,
-}
-
 #[derive(Clone, Debug)]
 enum Item {
+    Unavailable,
+    Unresolved(Rc<Item>),
     Struct {
         parameters: Rc<[Type]>,
         fields: Rc<HashMap<NameId, Field>>,
@@ -1422,9 +1418,11 @@ impl Env {
     }
 
     fn add_item(&mut self, item: Item) -> ItemId {
+        let index = self.items.len();
+
         self.items.push(item);
 
-        ItemId(self.items.len() - 1)
+        ItemId(index)
     }
 
     fn get_impl(&mut self, type_: &Type, trait_: &Trait) -> Option<Impl> {
@@ -2578,7 +2576,7 @@ impl Env {
                     unreachable!()
                 };
 
-                let type_ = self.resolve_type(type_, &mut HashMap::new())?;
+                let type_ = self.resolve_type(type_)?;
 
                 let error = || {
                     Err(anyhow!(
@@ -2764,41 +2762,38 @@ impl Env {
 
     fn resolve_scope(&mut self) -> Result<()> {
         let scope = self.scopes.last().unwrap().clone();
-        let mut states = HashMap::new();
 
         for ItemId(item) in scope.borrow().items.values() {
-            self.resolve_item(*item, &mut states)?;
+            self.resolve_item(*item)?;
         }
 
         Ok(())
     }
 
-    fn resolve_item(&mut self, item: usize, states: &mut HashMap<usize, ItemState>) -> Result<()> {
-        match states.entry(item) {
-            Entry::Vacant(e) => {
-                e.insert(ItemState::Resolving);
+    fn resolve_item(&mut self, index: usize) -> Result<()> {
+        let item = match &self.items[index] {
+            Item::Unavailable => {
+                // if this generates false positives, we might be calling `resolve_item` when too early or
+                // unnecessarily:
+                return Err(anyhow!("infinite type detected"));
             }
-            Entry::Occupied(e) => {
-                return if let ItemState::Resolved = e.get() {
-                    Ok(())
-                } else {
-                    // todo: if this generates false positives, we might be calling `resolve_item` when we don't need to
-                    Err(anyhow!("infinite type detected"))
-                };
-            }
-        }
+            Item::Unresolved(item) => item.clone(),
+            _ => return Ok(()),
+        };
+
+        self.items[index] = Item::Unavailable;
 
         // todo: type check method bodies (or else do that lazily elsewhere, e.g. on first invocation)
         #[allow(clippy::single_match)]
-        match self.items[item].clone() {
+        match item.deref() {
             Item::Struct {
                 parameters,
                 fields,
                 methods,
             } => {
-                self.items[item] = Item::Struct {
-                    parameters,
-                    methods,
+                self.items[index] = Item::Struct {
+                    parameters: parameters.clone(),
+                    methods: methods.clone(),
                     fields: {
                         let mut next_offset = 0;
 
@@ -2811,7 +2806,7 @@ impl Env {
                                 .collect::<BTreeMap<_, _>>()
                                 .into_iter()
                                 .map(|(name, mut field)| {
-                                    field.type_ = self.resolve_type(&field.type_, states)?;
+                                    field.type_ = self.resolve_type(&field.type_)?;
 
                                     field.offset = next_offset;
 
@@ -2828,16 +2823,10 @@ impl Env {
             _ => (),
         }
 
-        states.insert(item, ItemState::Resolved);
-
         Ok(())
     }
 
-    fn resolve_type(
-        &mut self,
-        type_: &Type,
-        states: &mut HashMap<usize, ItemState>,
-    ) -> Result<Type> {
+    fn resolve_type(&mut self, type_: &Type) -> Result<Type> {
         // todo: recursively resolve type parameters
 
         // todo: detect infinite types and return error
@@ -2850,7 +2839,7 @@ impl Env {
                     .rev()
                     .find_map(|scope| scope.borrow().items.get(name).copied())
                 {
-                    self.resolve_item(item.0, states)?;
+                    self.resolve_item(item.0)?;
 
                     Ok(match &self.items[item.0] {
                         Item::Type(type_) => type_.clone(),
@@ -2863,6 +2852,7 @@ impl Env {
                                 .unwrap_or(0),
                             arguments: Rc::new([]),
                         },
+                        _ => unreachable!(),
                     })
                 } else {
                     Err(anyhow!("type not found: {}", self.unintern(*name)))
@@ -2870,7 +2860,7 @@ impl Env {
             }
 
             Type::Reference { type_, unique } => Ok(Type::Reference {
-                type_: Rc::new(self.resolve_type(type_, states)?),
+                type_: Rc::new(self.resolve_type(type_)?),
                 unique: *unique,
             }),
 
@@ -2924,6 +2914,8 @@ impl Env {
                                         .unwrap_or(BindingTerm::UntypedAndUninitialized),
                                 ));
 
+                                let index = self.bindings.len();
+
                                 self.bindings.push(Binding {
                                     name,
                                     mutable: mutability.is_some(),
@@ -2933,7 +2925,7 @@ impl Env {
                                 Ok(Term::Let {
                                     name,
                                     mutable: mutability.is_some(),
-                                    index: self.bindings.len() - 1,
+                                    index,
                                     term,
                                 })
                             }
@@ -3028,11 +3020,11 @@ impl Env {
                         )
                         .collect::<Result<_>>()?;
 
-                    let item = self.add_item(Item::Struct {
+                    let item = self.add_item(Item::Unresolved(Rc::new(Item::Struct {
                         parameters: Rc::new([]),
                         fields: Rc::new(fields),
                         methods: Rc::new([]),
-                    });
+                    })));
 
                     let items = &mut self.scopes.last().unwrap().borrow_mut().items;
 
