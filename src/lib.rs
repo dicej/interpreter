@@ -22,9 +22,9 @@ use {
         punctuated::Punctuated, AngleBracketedGenericArguments, BinOp, Block, Expr, ExprAssign,
         ExprAssignOp, ExprBinary, ExprBlock, ExprBreak, ExprField, ExprIf, ExprLit, ExprLoop,
         ExprParen, ExprPath, ExprReference, ExprStruct, ExprUnary, Fields, FieldsNamed,
-        FieldsUnnamed, GenericArgument, GenericParam, Generics, ItemStruct, Lit, LitBool, Local,
-        Member, Pat, PatIdent, Path, PathArguments, PathSegment, Stmt, TypePath, TypeReference,
-        UnOp, Visibility,
+        FieldsUnnamed, GenericArgument, GenericParam, Generics, ItemEnum, ItemStruct, Lit, LitBool,
+        Local, Member, Pat, PatIdent, Path, PathArguments, PathSegment, Stmt, TypePath,
+        TypeReference, UnOp, Visibility,
     },
 };
 
@@ -430,7 +430,7 @@ enum Type {
         size: usize,
         arguments: Rc<[Type]>,
     },
-    Unresolved(NameId),
+    Unresolved(Path),
 }
 
 impl Type {
@@ -553,6 +553,12 @@ impl Lens {
 }
 
 #[derive(Clone, Debug)]
+struct Path {
+    absolute: bool,
+    segments: Rc<[NameId]>,
+}
+
+#[derive(Clone, Debug)]
 enum Term {
     Block {
         scope: Rc<RefCell<Scope>>,
@@ -576,8 +582,7 @@ enum Term {
         right: Rc<Term>,
     },
     Application {
-        // todo: support type and lifetime arguments.
-        abstraction: Abstraction,
+        abstraction: Term,
         arguments: Rc<[Term]>,
     },
     Abstraction(Abstraction),
@@ -615,6 +620,7 @@ enum Term {
         name: NameId,
         lens: Lens,
     },
+    Unresolved(Path),
 }
 
 impl Term {
@@ -876,12 +882,23 @@ struct Field {
 }
 
 #[derive(Clone, Debug)]
+struct Variant {
+    fields: Rc<HashMap<NameId, Field>>,
+    discriminant: Option<Term>,
+}
+
+#[derive(Clone, Debug)]
 enum Item {
     Unavailable,
     Unresolved(Rc<Item>),
     Struct {
         parameters: Rc<[Type]>,
         fields: Rc<HashMap<NameId, Field>>,
+        methods: Rc<[Abstraction]>,
+    },
+    Enum {
+        parameters: Rc<[Type]>,
+        variants: Rc<HashMap<NameId, Variant>>,
         methods: Rc<[Abstraction]>,
     },
     Type(Type),
@@ -2773,7 +2790,7 @@ impl Env {
     fn resolve_item(&mut self, index: usize) -> Result<()> {
         let item = match &self.items[index] {
             Item::Unavailable => {
-                // if this generates false positives, we might be calling `resolve_item` when too early or
+                // if this generates false positives, we might be calling `resolve_item` too early or
                 // unnecessarily:
                 return Err(anyhow!("infinite type detected"));
             }
@@ -2948,95 +2965,132 @@ impl Env {
         match stmt {
             Stmt::Semi(expr, _) | Stmt::Expr(expr) => self.expr_to_term(expr),
 
-            Stmt::Item(syn::Item::Struct(ItemStruct {
-                ident,
-                generics:
-                    Generics {
-                        params,
-                        where_clause,
-                        ..
-                    },
-                fields,
-                vis,
-                attrs,
-                ..
-            })) => {
-                if !attrs.is_empty() {
-                    Err(anyhow!("attributes not yet supported"))
-                } else if !params
-                    .iter()
-                    .all(|param| matches!(param, GenericParam::Lifetime(_)))
-                {
-                    // todo: handle lifetimes
-                    Err(anyhow!("generic parameters not yet supported"))
-                } else if where_clause.is_some() {
-                    Err(anyhow!("where clauses not yet supported"))
-                } else if *vis != Visibility::Inherited {
-                    Err(anyhow!("visibility not yet supported"))
-                } else {
-                    let name = self.intern(&ident.to_string());
-
-                    let empty = Punctuated::new();
-
-                    let fields = match fields {
-                        Fields::Named(FieldsNamed { named, .. }) => named,
-                        Fields::Unnamed(FieldsUnnamed { unnamed, .. }) => unnamed,
-                        Fields::Unit => &empty,
-                    };
-
-                    let fields = fields
+            Stmt::Item(item) => match item {
+                syn::Item::Struct(ItemStruct {
+                    ident,
+                    generics:
+                        Generics {
+                            params,
+                            where_clause,
+                            ..
+                        },
+                    fields,
+                    vis,
+                    attrs,
+                    ..
+                }) => {
+                    if !attrs.is_empty() {
+                        Err(anyhow!("attributes not yet supported"))
+                    } else if !params
                         .iter()
-                        .enumerate()
-                        .map(
-                            |(
-                                index,
-                                syn::Field {
-                                    ident,
-                                    ty,
-                                    vis,
-                                    attrs,
-                                    ..
-                                },
-                            )| {
-                                if !attrs.is_empty() {
-                                    Err(anyhow!("attributes not yet supported"))
-                                } else if *vis != Visibility::Inherited {
-                                    Err(anyhow!("visibility not yet supported"))
-                                } else {
-                                    Ok((
-                                        self.intern(
-                                            &ident
-                                                .as_ref()
-                                                .map(|ident| ident.to_string())
-                                                .unwrap_or_else(|| index.to_string()),
-                                        ),
-                                        Field {
-                                            type_: self.type_to_type(ty)?,
-                                            offset: 0,
-                                        },
-                                    ))
-                                }
-                            },
-                        )
-                        .collect::<Result<_>>()?;
-
-                    let item = self.add_item(Item::Unresolved(Rc::new(Item::Struct {
-                        parameters: Rc::new([]),
-                        fields: Rc::new(fields),
-                        methods: Rc::new([]),
-                    })));
-
-                    let items = &mut self.scopes.last().unwrap().borrow_mut().items;
-
-                    if let Entry::Vacant(e) = items.entry(name) {
-                        e.insert(item);
-
-                        Ok(Term::Literal(self.unit.clone()))
+                        .all(|param| matches!(param, GenericParam::Lifetime(_)))
+                    {
+                        // todo: handle lifetimes
+                        Err(anyhow!("generic parameters not yet supported"))
+                    } else if where_clause.is_some() {
+                        Err(anyhow!("where clauses not yet supported"))
+                    } else if *vis != Visibility::Inherited {
+                        Err(anyhow!("visibility not yet supported"))
                     } else {
-                        Err(anyhow!("duplicate item identifier: {}", ident.to_string()))
+                        let name = self.intern(&ident.to_string());
+
+                        let fields = Rc::new(self.fields_to_fields(fields)?);
+
+                        let item = self.add_item(Item::Unresolved(Rc::new(Item::Struct {
+                            parameters: Rc::new([]),
+                            fields,
+                            methods: Rc::new([]),
+                        })));
+
+                        let items = &mut self.scopes.last().unwrap().borrow_mut().items;
+
+                        if let Entry::Vacant(e) = items.entry(name) {
+                            e.insert(item);
+
+                            Ok(Term::Literal(self.unit.clone()))
+                        } else {
+                            Err(anyhow!("duplicate item identifier: {}", ident.to_string()))
+                        }
                     }
                 }
-            }
+
+                syn::Item::Enum(ItemEnum {
+                    ident,
+                    generics:
+                        Generics {
+                            params,
+                            where_clause,
+                            ..
+                        },
+                    variants,
+                    attrs,
+                    vis,
+                    ..
+                }) => {
+                    if !attrs.is_empty() {
+                        Err(anyhow!("attributes not yet supported"))
+                    } else if !params
+                        .iter()
+                        .all(|param| matches!(param, GenericParam::Lifetime(_)))
+                    {
+                        // todo: handle lifetimes
+                        Err(anyhow!("generic parameters not yet supported"))
+                    } else if where_clause.is_some() {
+                        Err(anyhow!("where clauses not yet supported"))
+                    } else if *vis != Visibility::Inherited {
+                        Err(anyhow!("visibility not yet supported"))
+                    } else {
+                        let name = self.intern(&ident.to_string());
+
+                        let variants = Rc::new(
+                            variants
+                                .iter()
+                                .map(
+                                    |syn::Variant {
+                                         ident,
+                                         fields,
+                                         discriminant,
+                                         attrs,
+                                     }| {
+                                        if !attrs.is_empty() {
+                                            Err(anyhow!("attributes not yet supported"))
+                                        } else {
+                                            Ok((
+                                                self.intern(&ident.to_string()),
+                                                Variant {
+                                                    fields: Rc::new(self.fields_to_fields(fields)?),
+                                                    discriminant: discriminant
+                                                        .as_ref()
+                                                        .map(|(_, expr)| self.expr_to_term(expr))
+                                                        .transpose()?,
+                                                },
+                                            ))
+                                        }
+                                    },
+                                )
+                                .collect::<Result<_>>()?,
+                        );
+
+                        let item = self.add_item(Item::Unresolved(Rc::new(Item::Enum {
+                            parameters: Rc::new([]),
+                            variants,
+                            methods: Rc::new([]),
+                        })));
+
+                        let items = &mut self.scopes.last().unwrap().borrow_mut().items;
+
+                        if let Entry::Vacant(e) = items.entry(name) {
+                            e.insert(item);
+
+                            Ok(Term::Literal(self.unit.clone()))
+                        } else {
+                            Err(anyhow!("duplicate item identifier: {}", ident.to_string()))
+                        }
+                    }
+                }
+
+                _ => Err(anyhow!("item not yet supported: {item:#?}")),
+            },
 
             _ => Err(anyhow!("stmt not yet supported: {stmt:#?}")),
         }
@@ -3129,39 +3183,13 @@ impl Env {
                 }
             }
 
-            Expr::Path(ExprPath {
-                path:
-                    Path {
-                        leading_colon,
-                        segments,
-                    },
-                qself,
-                attrs,
-            }) => {
+            Expr::Path(ExprPath { path, qself, attrs }) => {
                 if !attrs.is_empty() {
                     Err(anyhow!("attributes not yet supported"))
                 } else if qself.is_some() {
                     Err(anyhow!("qualified paths not yet supported"))
-                } else if leading_colon.is_some() {
-                    Err(anyhow!("absolute paths not yet supported"))
-                } else if segments.len() != 1 {
-                    Err(anyhow!("qualified paths not yet supported"))
-                } else if let Some(PathSegment { ident, arguments }) = segments.last() {
-                    if let PathArguments::None = arguments {
-                        let name_string = ident.to_string();
-                        let name = self.intern(&name_string);
-
-                        Ok(Term::Variable {
-                            index: self
-                                .find_term(name)
-                                .ok_or_else(|| anyhow!("symbol not found: {name_string}"))?,
-                            type_: Type::Never,
-                        })
-                    } else {
-                        Err(anyhow!("path arguments not yet supported"))
-                    }
                 } else {
-                    Err(anyhow!("unexpected empty path"))
+                    Ok(Term::Unresolved(self.path_to_path(path)?))
                 }
             }
 
@@ -3336,11 +3364,7 @@ impl Env {
             }
 
             Expr::Struct(ExprStruct {
-                path:
-                    Path {
-                        leading_colon,
-                        segments,
-                    },
+                path,
                 fields,
                 attrs,
                 rest,
@@ -3350,48 +3374,38 @@ impl Env {
                     Err(anyhow!("attributes not yet supported"))
                 } else if rest.is_some() {
                     Err(anyhow!("move initialization not yet supported"))
-                } else if leading_colon.is_some() {
-                    Err(anyhow!("absolute paths not yet supported"))
-                } else if segments.len() != 1 {
-                    Err(anyhow!("qualified paths not yet supported"))
-                } else if let Some(PathSegment { ident, arguments }) = segments.last() {
-                    if let PathArguments::None = arguments {
-                        let type_ = Type::Unresolved(self.intern(&ident.to_string()));
+                } else {
+                    let type_ = Type::Unresolved(self.path_to_path(path)?);
 
-                        let mut arguments = HashMap::new();
+                    let mut arguments = HashMap::new();
 
-                        for syn::FieldValue {
-                            member,
-                            expr,
-                            attrs,
-                            ..
-                        } in fields
-                        {
-                            if !attrs.is_empty() {
-                                return Err(anyhow!("attributes not yet supported"));
+                    for syn::FieldValue {
+                        member,
+                        expr,
+                        attrs,
+                        ..
+                    } in fields
+                    {
+                        if !attrs.is_empty() {
+                            return Err(anyhow!("attributes not yet supported"));
+                        } else {
+                            let name = self.intern_member(member);
+
+                            if let Entry::Vacant(e) = arguments.entry(name) {
+                                e.insert(self.expr_to_term(expr)?);
                             } else {
-                                let name = self.intern_member(member);
-
-                                if let Entry::Vacant(e) = arguments.entry(name) {
-                                    e.insert(self.expr_to_term(expr)?);
-                                } else {
-                                    return Err(anyhow!(
-                                        "duplicate field in struct initializer: {}",
-                                        self.unintern(name)
-                                    ));
-                                }
+                                return Err(anyhow!(
+                                    "duplicate field in struct initializer: {}",
+                                    self.unintern(name)
+                                ));
                             }
                         }
-
-                        Ok(Term::Struct {
-                            type_,
-                            arguments: Rc::new(arguments),
-                        })
-                    } else {
-                        Err(anyhow!("path arguments not yet supported"))
                     }
-                } else {
-                    Err(anyhow!("unexpected empty path"))
+
+                    Ok(Term::Struct {
+                        type_,
+                        arguments: Rc::new(arguments),
+                    })
                 }
             }
 
@@ -3412,12 +3426,69 @@ impl Env {
                 }
             }
 
+            Expr::Call(ExprCall {
+                func, args, attrs, ..
+            }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else if leading_colon.is_some() {
+                    Err(anyhow!("absolute paths not yet supported"))
+                } else {
+                    Ok(Term::Application {
+                        abstraction: Term::Unresolved(self.path_to_path(func)?),
+                        arguments: Rc::new(
+                            args.iter()
+                                .map(|expr| self.expr_to_term(expr))
+                                .collect::<Result<_>>()?,
+                        ),
+                    })
+                }
+            }
+
             _ => Err(anyhow!("expr not yet supported: {expr:#?}")),
         }
     }
 
+    fn path_to_path(
+        &mut self,
+        syn::Path {
+            leading_colon,
+            segments,
+        }: &syn::Path,
+    ) -> Result<Path> {
+        Ok(Path {
+            absolute: leading_colon.is_some(),
+            segments: segments
+                .iter()
+                .map(|PathSegment { ident, arguments }| {
+                    match arguments {
+                        PathArguments::None => (),
+                        PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+                            args,
+                            ..
+                        }) if args
+                            .iter()
+                            .all(|arg| matches!(arg, GenericArgument::Lifetime(_))) =>
+                        // todo: handle lifetimes
+                        {
+                            ()
+                        }
+                        _ => return Err(anyhow!("path arguments not yet supported")),
+                    }
+
+                    Ok(self.intern(&ident.to_string()))
+                })
+                .collect::<Result<_>>()?,
+        })
+    }
+
     fn maybe_make_block(&mut self, binding_count: usize, term: Term) -> Term {
         if self.bindings.len() > binding_count {
+            // todo: the lifetime of a temporary may need to be extended into the surrounding scope if there is a
+            // reference to it that lives beyond the statement in which the temporary appears.  Currently, we only
+            // let them live as long as the statement.  Also, research the rules for lifetime extension for
+            // matching expressions, including while-let loops.
+
             let terms = self
                 .bindings
                 .iter()
@@ -3482,41 +3553,57 @@ impl Env {
         result
     }
 
+    fn fields_to_fields(&mut self, fields: &Fields) -> Result<HashMap<NameId, Field>> {
+        let empty = Punctuated::new();
+
+        match fields {
+            Fields::Named(FieldsNamed { named, .. }) => named,
+            Fields::Unnamed(FieldsUnnamed { unnamed, .. }) => unnamed,
+            Fields::Unit => &empty,
+        }
+        .iter()
+        .enumerate()
+        .map(
+            |(
+                index,
+                syn::Field {
+                    ident,
+                    ty,
+                    vis,
+                    attrs,
+                    ..
+                },
+            )| {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else if *vis != Visibility::Inherited {
+                    Err(anyhow!("visibility not yet supported"))
+                } else {
+                    Ok((
+                        self.intern(
+                            &ident
+                                .as_ref()
+                                .map(|ident| ident.to_string())
+                                .unwrap_or_else(|| index.to_string()),
+                        ),
+                        Field {
+                            type_: self.type_to_type(ty)?,
+                            offset: 0,
+                        },
+                    ))
+                }
+            },
+        )
+        .collect()
+    }
+
     fn type_to_type(&mut self, type_: &syn::Type) -> Result<Type> {
         match type_ {
-            syn::Type::Path(TypePath {
-                path:
-                    Path {
-                        leading_colon,
-                        segments,
-                    },
-                qself,
-            }) => {
+            syn::Type::Path(TypePath { path, qself }) => {
                 if qself.is_some() {
                     Err(anyhow!("qualified paths not yet supported"))
-                } else if leading_colon.is_some() {
-                    Err(anyhow!("absolute paths not yet supported"))
-                } else if segments.len() != 1 {
-                    Err(anyhow!("qualified paths not yet supported"))
-                } else if let Some(PathSegment { ident, arguments }) = segments.last() {
-                    match arguments {
-                        PathArguments::None => {
-                            Ok(Type::Unresolved(self.intern(&ident.to_string())))
-                        }
-                        PathArguments::AngleBracketed(AngleBracketedGenericArguments {
-                            args,
-                            ..
-                        }) if args
-                            .iter()
-                            .all(|arg| matches!(arg, GenericArgument::Lifetime(_))) =>
-                        {
-                            // todo: handle lifetimes
-                            Ok(Type::Unresolved(self.intern(&ident.to_string())))
-                        }
-                        _ => Err(anyhow!("path arguments not yet supported")),
-                    }
                 } else {
-                    Err(anyhow!("unexpected empty path"))
+                    Ok(Type::Unresolved(self.path_to_path(path)?))
                 }
             }
 
@@ -3758,5 +3845,53 @@ mod test {
     #[test]
     fn reference_temporary() {
         assert_eq!(40_i32, eval("*&(33 + 7)").unwrap())
+    }
+
+    #[test]
+    fn simple_enum() {
+        assert_eq!(
+            87_i32,
+            eval(
+                "{ enum Foo { A, B } \
+                 let f = Foo::A; \
+                 match f { \
+                 Foo::A => 87, \
+                 Foo::B => 21, \
+                 } }"
+            )
+            .unwrap()
+        )
+    }
+
+    #[test]
+    fn enum_field() {
+        assert_eq!(
+            12_u32,
+            eval(
+                "{ enum Foo { A, B(u32) } \
+                 let f = Foo::B(12); \
+                 match f { \
+                 Foo::A => 87, \
+                 Foo::B(x) => x, \
+                 } }"
+            )
+            .unwrap()
+        )
+    }
+
+    #[test]
+    fn enum_named_fields() {
+        assert_eq!(
+            7_u8,
+            eval(
+                "{ enum Foo { A { x: u8, y: u64 }, B(u32) } \
+                 let f = Foo::A { x: 7, y: 187 };
+                 match f { \
+                 Foo::A { y, .. } => y, \
+                 Foo::B(_) => 91, \
+                 } }"
+            )
+            .unwrap()
+        )
     }
 }
