@@ -3,7 +3,7 @@
 
 use {
     crate::allocator::Allocator,
-    anyhow::{anyhow, Result},
+    anyhow::{anyhow, Error, Result},
     log::info,
     maplit::hashmap,
     std::{
@@ -12,7 +12,7 @@ use {
         collections::{hash_map::Entry, BTreeMap, HashMap},
         error,
         fmt::{self, Display},
-        mem,
+        iter, mem,
         ops::{Add, Deref, DerefMut, Div, Mul, Neg, Rem, Sub},
         rc::Rc,
         str,
@@ -2549,9 +2549,8 @@ impl Env {
 
             // todo: convert temporaries to bindings and variables as needed to ensure all references are to either
             // variables or field access chains to variables.
-            Term::Reference(reference) => Ok(Term::Reference(Rc::new(Reference {
-                unique: reference.unique,
-                term: self.type_check(
+            Term::Reference(reference) => {
+                let term = self.type_check(
                     &reference.term,
                     expected_type.and_then(|expected| {
                         if let Type::Reference { type_, .. } = expected {
@@ -2560,8 +2559,17 @@ impl Env {
                             None
                         }
                     }),
-                )?,
-            }))),
+                )?;
+
+                if reference.unique && !self.is_mutable(&term) {
+                    Err(anyhow!("invalid unique reference to immutable term"))
+                } else {
+                    Ok(Term::Reference(Rc::new(Reference {
+                        unique: reference.unique,
+                        term,
+                    })))
+                }
+            }
 
             Term::Struct { type_, arguments } => {
                 let name = if let Type::Unresolved(name) = &type_ {
@@ -2881,6 +2889,8 @@ impl Env {
     }
 
     fn stmt_to_term(&mut self, stmt: &Stmt) -> Result<Term> {
+        let binding_count = self.bindings.len();
+
         match stmt {
             Stmt::Local(Local {
                 pat, init, attrs, ..
@@ -2902,7 +2912,13 @@ impl Env {
 
                                 let term = Rc::new(RefCell::new(
                                     init.as_ref()
-                                        .map(|(_, expr)| self.expr_to_term(expr))
+                                        .map(|(_, expr)| {
+                                            let term = self.expr_to_term(expr)?;
+
+                                            Ok::<_, Error>(
+                                                self.maybe_make_block(binding_count, term),
+                                            )
+                                        })
                                         .transpose()?
                                         .map(BindingTerm::Untyped)
                                         .unwrap_or(BindingTerm::UntypedAndUninitialized),
@@ -2928,6 +2944,16 @@ impl Env {
                 }
             }
 
+            _ => {
+                let term = self.non_binding_stmt_to_term(stmt)?;
+
+                Ok(self.maybe_make_block(binding_count, term))
+            }
+        }
+    }
+
+    fn non_binding_stmt_to_term(&mut self, stmt: &Stmt) -> Result<Term> {
+        match stmt {
             Stmt::Semi(expr, _) | Stmt::Expr(expr) => self.expr_to_term(expr),
 
             Stmt::Item(syn::Item::Struct(ItemStruct {
@@ -3289,9 +3315,30 @@ impl Env {
                 if !attrs.is_empty() {
                     Err(anyhow!("attributes not yet supported"))
                 } else {
+                    let mut term = self.expr_to_term(expr)?;
+
+                    if !matches!(
+                        &term,
+                        Term::Variable { .. } | Term::Field { .. } | Term::Literal(_)
+                    ) {
+                        let index = self.bindings.len();
+                        let name = self.intern(&index.to_string());
+
+                        self.bindings.push(Binding {
+                            name,
+                            mutable: true,
+                            term: Rc::new(RefCell::new(BindingTerm::Untyped(term))),
+                        });
+
+                        term = Term::Variable {
+                            index,
+                            type_: Type::Never,
+                        };
+                    }
+
                     Ok(Term::Reference(Rc::new(Reference {
                         unique: mutability.is_some(),
-                        term: self.expr_to_term(expr)?,
+                        term,
                     })))
                 }
             }
@@ -3374,6 +3421,42 @@ impl Env {
             }
 
             _ => Err(anyhow!("expr not yet supported: {expr:#?}")),
+        }
+    }
+
+    fn maybe_make_block(&mut self, binding_count: usize, term: Term) -> Term {
+        if self.bindings.len() > binding_count {
+            let terms = self
+                .bindings
+                .iter()
+                .enumerate()
+                .skip(binding_count)
+                .map(
+                    |(
+                        index,
+                        Binding {
+                            name,
+                            mutable,
+                            term,
+                        },
+                    )| Term::Let {
+                        name: *name,
+                        mutable: *mutable,
+                        term: term.clone(),
+                        index,
+                    },
+                )
+                .chain(iter::once(term))
+                .collect();
+
+            self.bindings.truncate(binding_count);
+
+            Term::Block {
+                scope: Rc::new(RefCell::new(Scope::new())),
+                terms,
+            }
+        } else {
+            term
         }
     }
 
@@ -3599,10 +3682,7 @@ mod test {
 
     #[test]
     fn bad_struct_field_access() {
-        assert_eq!(
-            7_i64,
-            eval("{ struct Foo { x: i64, y: i64 } let f: Foo; f.x }").unwrap()
-        )
+        assert!(eval::<()>("{ struct Foo { x: i64, y: i64 } let f: Foo; f.x }").is_err())
     }
 
     #[test]
@@ -3646,7 +3726,7 @@ mod test {
                 "{ struct Foo { x: i64, y: i64 } \
                  let mut f = Foo { x: 7, y: 14 }; \
                  let y = &mut f.y; \
-                 *y = 22;\
+                 *y = 22; \
                  f.y * *y }"
             )
             .unwrap()
@@ -3659,7 +3739,7 @@ mod test {
             "{ struct Foo { x: i64, y: i64 } \
              let f = Foo { x: 7, y: 14 }; \
              let y = &mut f.y; \
-             *y = 22;\
+             *y = 22; \
              f.y * *y }"
         )
         .is_err())
