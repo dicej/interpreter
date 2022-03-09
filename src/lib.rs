@@ -19,12 +19,12 @@ use {
         str::FromStr,
     },
     syn::{
-        punctuated::Punctuated, AngleBracketedGenericArguments, BinOp, Block, Expr, ExprAssign,
-        ExprAssignOp, ExprBinary, ExprBlock, ExprBreak, ExprField, ExprIf, ExprLit, ExprLoop,
-        ExprParen, ExprPath, ExprReference, ExprStruct, ExprUnary, Fields, FieldsNamed,
-        FieldsUnnamed, GenericArgument, GenericParam, Generics, ItemEnum, ItemStruct, Lit, LitBool,
-        Local, Member, Pat, PatIdent, Path, PathArguments, PathSegment, Stmt, TypePath,
-        TypeReference, UnOp, Visibility,
+        punctuated::Punctuated, AngleBracketedGenericArguments, Arm, BinOp, Block, Expr,
+        ExprAssign, ExprAssignOp, ExprBinary, ExprBlock, ExprBreak, ExprCall, ExprField, ExprIf,
+        ExprLit, ExprLoop, ExprMatch, ExprParen, ExprPath, ExprReference, ExprStruct, ExprUnary,
+        Fields, FieldsNamed, FieldsUnnamed, GenericArgument, GenericParam, Generics, ItemEnum,
+        ItemStruct, Lit, LitBool, Local, Member, Pat, PatIdent, PatPath, PathArguments,
+        PathSegment, Stmt, TypePath, TypeReference, UnOp, Visibility,
     },
 };
 
@@ -202,8 +202,8 @@ macro_rules! integer_binary_ops {
     };
 }
 
-fn pattern_eq<T: FromBytes + ToBytes + PartialEq<T>>((env, offset): (&mut Env, usize)) -> bool {
-    let b = env.load::<T>(offset);
+fn pattern_eq<T: FromBytes + ToBytes + PartialEq<T>>(env: &mut Env) -> bool {
+    let b = env.pop::<T>();
     let a = env.pop::<T>();
     a == b
 }
@@ -504,7 +504,8 @@ struct Abstraction {
 
 #[derive(Clone, Debug)]
 enum Pattern {
-    Literal(Literal),
+    Literal(Term),
+    Path(Path),
     // todo: support other patterns
 }
 
@@ -552,7 +553,7 @@ impl Lens {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct Path {
     absolute: bool,
     segments: Rc<[NameId]>,
@@ -582,7 +583,7 @@ enum Term {
         right: Rc<Term>,
     },
     Application {
-        abstraction: Term,
+        abstraction: Rc<Term>,
         arguments: Rc<[Term]>,
     },
     Abstraction(Abstraction),
@@ -615,6 +616,11 @@ enum Term {
         type_: Type,
         arguments: Rc<HashMap<NameId, Term>>,
     },
+    Enum {
+        type_: Type,
+        variant: NameId,
+        arguments: Rc<HashMap<NameId, Term>>,
+    },
     Field {
         base: Rc<Term>,
         name: NameId,
@@ -631,10 +637,13 @@ impl Term {
             }
             Self::Literal(literal) => literal.type_.clone(),
             // todo: the return type of an abstraction may be a function of its type parameters
-            Self::Application {
-                abstraction: Abstraction { body, .. },
-                ..
-            } => body.type_(),
+            Self::Application { abstraction, .. } => {
+                if let Self::Abstraction(Abstraction { body, .. }) = abstraction.deref() {
+                    body.type_()
+                } else {
+                    unreachable!()
+                }
+            }
             Self::And { .. } | Self::Or { .. } => Type::Boolean,
             Self::UnaryOp(op, term) => match op {
                 UnaryOp::Neg | UnaryOp::Not => term.type_(),
@@ -669,6 +678,7 @@ impl Term {
             Self::Reference(reference) => reference.type_(),
             Self::Loop { type_, .. } => type_.clone(),
             Self::Struct { type_, .. } => type_.clone(),
+            Self::Enum { type_, .. } => type_.clone(),
             Self::Field { lens, .. } => lens.type_(),
             _ => todo!("Term::type_ for {self:?}"),
         }
@@ -879,6 +889,14 @@ fn match_types(expected: &Type, actual: &Type) -> Result<()> {
 struct Field {
     type_: Type,
     offset: usize,
+}
+
+fn fields_size(fields: &HashMap<NameId, Field>) -> usize {
+    fields
+        .values()
+        .max_by(|a, b| a.offset.cmp(&b.offset))
+        .map(|max| max.offset + max.type_.size())
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug)]
@@ -1321,7 +1339,7 @@ impl Env {
         Ok(env)
     }
 
-    fn find_term(&self, id: NameId) -> Option<usize> {
+    fn find_binding(&self, id: NameId) -> Option<usize> {
         self.bindings
             .iter()
             .enumerate()
@@ -1432,6 +1450,18 @@ impl Env {
 
     fn unintern(&self, NameId(id): NameId) -> Rc<str> {
         self.ids_to_names[id].clone()
+    }
+
+    fn unintern_path(&self, Path { absolute, segments }: &Path) -> String {
+        format!(
+            "{}{}",
+            if *absolute { "::" } else { "" },
+            segments
+                .iter()
+                .map(|&segment| self.unintern(segment))
+                .collect::<Vec<_>>()
+                .join("::")
+        )
     }
 
     fn add_item(&mut self, item: Item) -> ItemId {
@@ -1573,42 +1603,47 @@ impl Env {
             Term::Literal(literal) => self.push_literal(literal)?,
 
             Term::Application {
-                abstraction:
-                    Abstraction {
-                        body, parameters, ..
-                    },
+                abstraction,
                 arguments,
             } => {
-                let offset = self.stack.offset;
+                // todo: do we need to eval `abstraction` first?
+                if let Term::Abstraction(Abstraction {
+                    body, parameters, ..
+                }) = abstraction.deref()
+                {
+                    let offset = self.stack.offset;
 
-                let mut parameters = arguments
-                    .iter()
-                    .zip(parameters.iter())
-                    .map(|(term, Parameter { name, mutable, .. })| {
-                        let offset = self.stack.offset;
+                    let mut parameters = arguments
+                        .iter()
+                        .zip(parameters.iter())
+                        .map(|(term, Parameter { name, mutable, .. })| {
+                            let offset = self.stack.offset;
 
-                        self.eval_term(term)?;
+                            self.eval_term(term)?;
 
-                        Ok(Binding {
-                            name: *name,
-                            mutable: *mutable,
-                            term: Rc::new(RefCell::new(BindingTerm::Initialized(Literal {
-                                type_: term.type_(),
-                                offset,
-                            }))),
+                            Ok(Binding {
+                                name: *name,
+                                mutable: *mutable,
+                                term: Rc::new(RefCell::new(BindingTerm::Initialized(Literal {
+                                    type_: term.type_(),
+                                    offset,
+                                }))),
+                            })
                         })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                        .collect::<Result<Vec<_>, _>>()?;
 
-                mem::swap(&mut parameters, &mut self.bindings);
+                    mem::swap(&mut parameters, &mut self.bindings);
 
-                let result = self.eval_term(body);
+                    let result = self.eval_term(body);
 
-                mem::swap(&mut parameters, &mut self.bindings);
+                    mem::swap(&mut parameters, &mut self.bindings);
 
-                self.stack.offset = offset;
+                    self.stack.offset = offset;
 
-                return result;
+                    return result;
+                } else {
+                    unreachable!()
+                }
             }
 
             Term::And(left, right) => {
@@ -1691,7 +1726,7 @@ impl Env {
                 self.eval_term(scrutinee)?;
 
                 for arm in arms.iter() {
-                    if self.match_pattern(&arm.pattern, &scrutinee.type_()) {
+                    if self.match_pattern(&arm.pattern, &scrutinee.type_())? {
                         // todo: push and pop pattern bindings
 
                         let match_guard = if let Some(guard) = &arm.guard {
@@ -2003,18 +2038,28 @@ impl Env {
     }
 
     // Does this need to be a method of Env, or can we move it to Pattern?
-    fn match_pattern(&mut self, pattern: &Pattern, type_: &Type) -> bool {
-        match pattern {
-            Pattern::Literal(literal) => match type_ {
-                Type::Boolean => self.pop::<bool>() == self.load(literal.offset),
+    fn match_pattern(&mut self, pattern: &Pattern, type_: &Type) -> Result<bool, EvalException> {
+        Ok(match pattern {
+            Pattern::Literal(literal) => {
+                self.eval_term(literal)?;
 
-                Type::Integer(integer_type) => {
-                    integer_op!(pattern_eq, integer_type, (self, literal.offset))
+                match type_ {
+                    Type::Boolean => {
+                        let a = self.pop::<bool>();
+                        let b = self.pop::<bool>();
+                        a == b
+                    }
+
+                    Type::Integer(integer_type) => {
+                        integer_op!(pattern_eq, integer_type, self)
+                    }
+
+                    _ => todo!("literal match for {:?}", type_),
                 }
+            }
 
-                _ => todo!("literal match for {:?}", type_),
-            },
-        }
+            _ => todo!("match pattern {pattern:?}"),
+        })
     }
 
     fn type_check(&mut self, term: &Term, expected_type: Option<&Type>) -> Result<Term> {
@@ -2133,7 +2178,9 @@ impl Env {
                     (UnaryOp::Deref, _) => Term::UnaryOp(
                         *op,
                         Rc::new(Term::Application {
-                            abstraction: impl_.functions.get(&function).unwrap().clone(),
+                            abstraction: Rc::new(Term::Abstraction(
+                                impl_.functions.get(&function).unwrap().clone(),
+                            )),
                             arguments: Rc::new([Term::Reference(Rc::new(Reference {
                                 unique: false,
                                 term,
@@ -2142,7 +2189,9 @@ impl Env {
                     ),
 
                     _ => Term::Application {
-                        abstraction: impl_.functions.get(&function).unwrap().clone(),
+                        abstraction: Rc::new(Term::Abstraction(
+                            impl_.functions.get(&function).unwrap().clone(),
+                        )),
                         arguments: Rc::new([term]),
                     },
                 })
@@ -2261,7 +2310,9 @@ impl Env {
                         let (impl_, function) = impl_and_function.unwrap();
 
                         Term::Application {
-                            abstraction: impl_.functions.get(&function).unwrap().clone(),
+                            abstraction: Rc::new(Term::Abstraction(
+                                impl_.functions.get(&function).unwrap().clone(),
+                            )),
                             arguments: Rc::new([
                                 Term::Reference(Rc::new(Reference {
                                     unique: true,
@@ -2279,7 +2330,9 @@ impl Env {
                         let (impl_, function) = impl_and_function.unwrap();
 
                         Term::Application {
-                            abstraction: impl_.functions.get(&function).unwrap().clone(),
+                            abstraction: Rc::new(Term::Abstraction(
+                                impl_.functions.get(&function).unwrap().clone(),
+                            )),
                             arguments: Rc::new([
                                 Term::Reference(Rc::new(Reference {
                                     unique: false,
@@ -2297,7 +2350,9 @@ impl Env {
                         let (impl_, function) = impl_and_function.unwrap();
 
                         Term::Application {
-                            abstraction: impl_.functions.get(&function).unwrap().clone(),
+                            abstraction: Rc::new(Term::Abstraction(
+                                impl_.functions.get(&function).unwrap().clone(),
+                            )),
                             arguments: Rc::new([left, right]),
                         }
                     }
@@ -2587,20 +2642,9 @@ impl Env {
             }
 
             Term::Struct { type_, arguments } => {
-                let name = if let Type::Unresolved(name) = &type_ {
-                    *name
-                } else {
-                    unreachable!()
-                };
-
                 let type_ = self.resolve_type(type_)?;
 
-                let error = || {
-                    Err(anyhow!(
-                        "attempt to initialize non-struct {} as a struct",
-                        self.unintern(name)
-                    ))
-                };
+                let error = || Err(anyhow!("attempt to initialize non-struct as a struct"));
 
                 let fields = if let Type::Nominal { item, .. } = &type_ {
                     if let Item::Struct { fields, .. } = &self.items[item.0] {
@@ -2618,26 +2662,38 @@ impl Env {
 
                 Ok(Term::Struct {
                     type_,
-                    arguments: Rc::new(
-                        arguments
-                            .iter()
-                            .map(|(name, term)| {
-                                if let Some(Field {
-                                    type_: expected_type,
-                                    ..
-                                }) = fields.get(name)
-                                {
-                                    let term = self.type_check(term, Some(expected_type))?;
+                    arguments: Rc::new(self.type_check_arguments(&fields, arguments)?),
+                })
+            }
 
-                                    match_types(expected_type, &term.type_())?;
+            Term::Enum {
+                type_,
+                variant,
+                arguments,
+            } => {
+                let type_ = self.resolve_type(type_)?;
 
-                                    Ok((*name, term))
-                                } else {
-                                    Err(anyhow!("no such field: {}", self.unintern(*name)))
-                                }
-                            })
-                            .collect::<Result<_>>()?,
-                    ),
+                let error = || Err(anyhow!("attempt to initialize non-enum as an enum"));
+
+                let variants = if let Type::Nominal { item, .. } = &type_ {
+                    if let Item::Enum { variants, .. } = &self.items[item.0] {
+                        variants.clone()
+                    } else {
+                        return error();
+                    }
+                } else {
+                    return error();
+                };
+
+                // todo: use discriminant if specified
+                let Variant { fields, .. } = variants.get(variant).ok_or_else(|| {
+                    anyhow!("variant {} not present in enum", self.unintern(*variant))
+                })?;
+
+                Ok(Term::Enum {
+                    type_,
+                    variant: *variant,
+                    arguments: Rc::new(self.type_check_arguments(fields, arguments)?),
                 })
             }
 
@@ -2652,7 +2708,61 @@ impl Env {
                     })
             }
 
+            Term::Unresolved(path) => {
+                let term = self.find_term(path)?;
+
+                self.type_check(&term, expected_type)
+            }
+
             _ => Err(anyhow!("type checking not yet supported for term {term:?}")),
+        }
+    }
+
+    fn type_check_arguments(
+        &mut self,
+        fields: &HashMap<NameId, Field>,
+        arguments: &HashMap<NameId, Term>,
+    ) -> Result<HashMap<NameId, Term>> {
+        arguments
+            .iter()
+            .map(|(name, term)| {
+                if let Some(Field {
+                    type_: expected_type,
+                    ..
+                }) = fields.get(name)
+                {
+                    let term = self.type_check(term, Some(expected_type))?;
+
+                    match_types(expected_type, &term.type_())?;
+
+                    Ok((*name, term))
+                } else {
+                    Err(anyhow!("no such field: {}", self.unintern(*name)))
+                }
+            })
+            .collect::<Result<_>>()
+    }
+
+    fn find_term(&mut self, path @ Path { absolute, segments }: &Path) -> Result<Term> {
+        if *absolute {
+            todo!("absolute paths")
+        } else if let Some(item) = self
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.borrow().items.get(&segments[0]).copied())
+        {
+            match segments[1..] {
+                [name] => Ok(Term::Enum {
+                    type_: self.type_for_item(item),
+                    variant: name,
+                    arguments: Rc::new(HashMap::new()),
+                }),
+
+                _ => Err(anyhow!("unexpected path: {path:?}")),
+            }
+        } else {
+            Err(anyhow!("term not found: {}", self.unintern_path(path)))
         }
     }
 
@@ -2780,15 +2890,15 @@ impl Env {
     fn resolve_scope(&mut self) -> Result<()> {
         let scope = self.scopes.last().unwrap().clone();
 
-        for ItemId(item) in scope.borrow().items.values() {
+        for item in scope.borrow().items.values() {
             self.resolve_item(*item)?;
         }
 
         Ok(())
     }
 
-    fn resolve_item(&mut self, index: usize) -> Result<()> {
-        let item = match &self.items[index] {
+    fn resolve_item(&mut self, index: ItemId) -> Result<()> {
+        let item = match &self.items[index.0] {
             Item::Unavailable => {
                 // if this generates false positives, we might be calling `resolve_item` too early or
                 // unnecessarily:
@@ -2798,7 +2908,7 @@ impl Env {
             _ => return Ok(()),
         };
 
-        self.items[index] = Item::Unavailable;
+        self.items[index.0] = Item::Unavailable;
 
         // todo: type check method bodies (or else do that lazily elsewhere, e.g. on first invocation)
         #[allow(clippy::single_match)]
@@ -2808,39 +2918,106 @@ impl Env {
                 fields,
                 methods,
             } => {
-                self.items[index] = Item::Struct {
+                self.items[index.0] = Item::Struct {
                     parameters: parameters.clone(),
                     methods: methods.clone(),
-                    fields: {
-                        let mut next_offset = 0;
-
-                        // Note that we use the IDs of names to order fields, which would not be ideal if we cared
-                        // about alignment and efficiency.
-                        Rc::new(
-                            fields
-                                .iter()
-                                .map(|(name, field)| (*name, field.clone()))
-                                .collect::<BTreeMap<_, _>>()
-                                .into_iter()
-                                .map(|(name, mut field)| {
-                                    field.type_ = self.resolve_type(&field.type_)?;
-
-                                    field.offset = next_offset;
-
-                                    next_offset += field.type_.size();
-
-                                    Ok((name, field))
-                                })
-                                .collect::<Result<_>>()?,
-                        )
-                    },
+                    fields: Rc::new(self.resolve_fields(fields)?),
                 }
             }
 
-            _ => (),
+            Item::Enum {
+                parameters,
+                variants,
+                methods,
+            } => {
+                self.items[index.0] = Item::Enum {
+                    parameters: parameters.clone(),
+                    methods: methods.clone(),
+                    variants: Rc::new(self.resolve_variants(variants)?),
+                }
+            }
+
+            Item::Type(_) => (),
+
+            Item::Unavailable | Item::Unresolved(_) => unreachable!(),
         }
 
         Ok(())
+    }
+
+    fn resolve_variants(
+        &mut self,
+        variants: &HashMap<NameId, Variant>,
+    ) -> Result<HashMap<NameId, Variant>> {
+        variants
+            .iter()
+            .map(
+                |(
+                    name,
+                    Variant {
+                        fields,
+                        discriminant,
+                    },
+                )| {
+                    Ok((
+                        *name,
+                        Variant {
+                            fields: Rc::new(self.resolve_fields(fields)?),
+                            discriminant: discriminant.clone(),
+                        },
+                    ))
+                },
+            )
+            .collect()
+    }
+
+    fn resolve_fields(
+        &mut self,
+        fields: &HashMap<NameId, Field>,
+    ) -> Result<HashMap<NameId, Field>> {
+        let mut next_offset = 0;
+
+        // Note that we use the IDs of names to order fields, which would not be ideal if we cared
+        // about alignment.
+        fields
+            .iter()
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .map(|(name, Field { type_, .. })| {
+                let type_ = self.resolve_type(type_)?;
+
+                let offset = next_offset;
+
+                next_offset += type_.size();
+
+                Ok((*name, Field { type_, offset }))
+            })
+            .collect()
+    }
+
+    fn find_item_in_item(&mut self, item: ItemId, _path: &[NameId]) -> Result<ItemId> {
+        self.resolve_item(item)?;
+
+        todo!()
+    }
+
+    fn find_item(&mut self, path @ Path { absolute, segments }: &Path) -> Result<ItemId> {
+        if *absolute {
+            todo!("absolute paths")
+        } else if let Some(item) = self
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.borrow().items.get(&segments[0]).copied())
+        {
+            if segments.len() > 1 {
+                self.find_item_in_item(item, &segments[1..])
+            } else {
+                Ok(item)
+            }
+        } else {
+            Err(anyhow!("item not found: {}", self.unintern_path(path)))
+        }
     }
 
     fn resolve_type(&mut self, type_: &Type) -> Result<Type> {
@@ -2849,31 +3026,12 @@ impl Env {
         // todo: detect infinite types and return error
 
         match type_ {
-            Type::Unresolved(name) => {
-                if let Some(item) = self
-                    .scopes
-                    .iter()
-                    .rev()
-                    .find_map(|scope| scope.borrow().items.get(name).copied())
-                {
-                    self.resolve_item(item.0)?;
+            Type::Unresolved(path) => {
+                let item = self.find_item(path)?;
 
-                    Ok(match &self.items[item.0] {
-                        Item::Type(type_) => type_.clone(),
-                        Item::Struct { fields, .. } => Type::Nominal {
-                            item,
-                            size: fields
-                                .values()
-                                .max_by(|a, b| a.offset.cmp(&b.offset))
-                                .map(|max| max.offset + max.type_.size())
-                                .unwrap_or(0),
-                            arguments: Rc::new([]),
-                        },
-                        _ => unreachable!(),
-                    })
-                } else {
-                    Err(anyhow!("type not found: {}", self.unintern(*name)))
-                }
+                self.resolve_item(item)?;
+
+                Ok(self.type_for_item(item))
             }
 
             Type::Reference { type_, unique } => Ok(Type::Reference {
@@ -2885,12 +3043,37 @@ impl Env {
         }
     }
 
+    fn type_for_item(&self, item: ItemId) -> Type {
+        match &self.items[item.0] {
+            Item::Type(type_) => type_.clone(),
+            Item::Struct { fields, .. } => Type::Nominal {
+                item,
+                size: fields_size(fields),
+                arguments: Rc::new([]),
+            },
+            Item::Enum { variants, .. } => Type::Nominal {
+                item,
+                // todo: do we need to consider the discriminant type here, or is it safe to assume the
+                // discriminant is never larger than a usize?
+                size: mem::size_of::<usize>()
+                    + variants
+                        .values()
+                        .map(|Variant { fields, .. }| fields_size(fields))
+                        .max()
+                        .unwrap(),
+                arguments: Rc::new([]),
+            },
+            _ => unreachable!(),
+        }
+    }
+
     // Does this need to be a method of Env, or can we move it to Pattern?
     fn type_check_pattern(&mut self, pattern: &Pattern, expected_type: &Type) -> Result<()> {
         match_types(
             expected_type,
-            match pattern {
-                Pattern::Literal(literal) => &literal.type_,
+            &match pattern {
+                Pattern::Literal(literal) => literal.type_(),
+                Pattern::Path(_path) => todo!(),
             },
         )
     }
@@ -3059,6 +3242,9 @@ impl Env {
                                                 self.intern(&ident.to_string()),
                                                 Variant {
                                                     fields: Rc::new(self.fields_to_fields(fields)?),
+                                                    // todo: evaluate discriminant as a constant and store it as a
+                                                    // Literal since it should always be either a literal or a
+                                                    // negation of a literal
                                                     discriminant: discriminant
                                                         .as_ref()
                                                         .map(|(_, expr)| self.expr_to_term(expr))
@@ -3189,7 +3375,18 @@ impl Env {
                 } else if qself.is_some() {
                     Err(anyhow!("qualified paths not yet supported"))
                 } else {
-                    Ok(Term::Unresolved(self.path_to_path(path)?))
+                    let path = self.path_to_path(path)?;
+
+                    if !path.absolute && path.segments.len() == 1 {
+                        Ok(Term::Variable {
+                            index: self.find_binding(path.segments[0]).ok_or_else(|| {
+                                anyhow!("symbol not found: {}", self.unintern(path.segments[0]))
+                            })?,
+                            type_: Type::Never,
+                        })
+                    } else {
+                        Ok(Term::Unresolved(path))
+                    }
                 }
             }
 
@@ -3214,13 +3411,13 @@ impl Env {
                     let scrutinee = Rc::new(self.expr_to_term(cond)?);
 
                     let then = MatchArm {
-                        pattern: Pattern::Literal(self.true_.clone()),
+                        pattern: Pattern::Literal(Term::Literal(self.true_.clone())),
                         guard: None,
                         body: self.block_to_term(stmts)?,
                     };
 
                     let else_ = MatchArm {
-                        pattern: Pattern::Literal(self.false_.clone()),
+                        pattern: Pattern::Literal(Term::Literal(self.false_.clone())),
                         guard: None,
                         body: else_branch
                             .as_ref()
@@ -3431,21 +3628,71 @@ impl Env {
             }) => {
                 if !attrs.is_empty() {
                     Err(anyhow!("attributes not yet supported"))
-                } else if leading_colon.is_some() {
-                    Err(anyhow!("absolute paths not yet supported"))
                 } else {
                     Ok(Term::Application {
-                        abstraction: Term::Unresolved(self.path_to_path(func)?),
-                        arguments: Rc::new(
-                            args.iter()
-                                .map(|expr| self.expr_to_term(expr))
-                                .collect::<Result<_>>()?,
-                        ),
+                        abstraction: Rc::new(self.expr_to_term(func)?),
+                        arguments: args
+                            .iter()
+                            .map(|expr| self.expr_to_term(expr))
+                            .collect::<Result<_>>()?,
+                    })
+                }
+            }
+
+            Expr::Match(ExprMatch {
+                expr, arms, attrs, ..
+            }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else {
+                    Ok(Term::Match {
+                        scrutinee: Rc::new(self.expr_to_term(expr)?),
+                        arms: arms
+                            .iter()
+                            .map(
+                                |Arm {
+                                     pat,
+                                     guard,
+                                     body,
+                                     attrs,
+                                     ..
+                                 }| {
+                                    if !attrs.is_empty() {
+                                        Err(anyhow!("attributes not yet supported"))
+                                    } else {
+                                        Ok(MatchArm {
+                                            pattern: self.pat_to_pattern(pat)?,
+                                            guard: guard
+                                                .as_ref()
+                                                .map(|(_, expr)| self.expr_to_term(expr))
+                                                .transpose()?,
+                                            body: self.expr_to_term(body)?,
+                                        })
+                                    }
+                                },
+                            )
+                            .collect::<Result<_>>()?,
                     })
                 }
             }
 
             _ => Err(anyhow!("expr not yet supported: {expr:#?}")),
+        }
+    }
+
+    fn pat_to_pattern(&mut self, pat: &Pat) -> Result<Pattern> {
+        match pat {
+            Pat::Path(PatPath { path, attrs, qself }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else if qself.is_some() {
+                    Err(anyhow!("qualified paths not yet supported"))
+                } else {
+                    Ok(Pattern::Path(self.path_to_path(path)?))
+                }
+            }
+
+            _ => Err(anyhow!("pattern not yet supported: {pat:#?}")),
         }
     }
 
@@ -3469,10 +3716,8 @@ impl Env {
                         }) if args
                             .iter()
                             .all(|arg| matches!(arg, GenericArgument::Lifetime(_))) =>
-                        // todo: handle lifetimes
-                        {
-                            ()
-                        }
+                            // todo: handle lifetimes
+                            {}
                         _ => return Err(anyhow!("path arguments not yet supported")),
                     }
 
