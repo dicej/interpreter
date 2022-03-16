@@ -13,6 +13,7 @@ use {
         error,
         fmt::{self, Display},
         iter, mem,
+        num::ParseIntError,
         ops::{Add, Deref, DerefMut, Div, Mul, Neg, Rem, Sub},
         rc::Rc,
         str,
@@ -362,15 +363,26 @@ impl Integer {
         integer_op!(parse, self, (env, value))
     }
 
-    fn as_i128(self, env: &Env, offset: usize) -> i128 {
-        fn as_i128<T: TryInto<i128> + FromBytes>((env, offset): (&Env, usize)) -> i128
+    fn load_i128(self, env: &Env, offset: usize) -> i128 {
+        fn load_i128<T: TryInto<i128> + FromBytes>((env, offset): (&Env, usize)) -> i128
         where
             <T as TryInto<i128>>::Error: std::fmt::Debug,
         {
             env.load::<T>(offset).try_into().unwrap()
         }
 
-        integer_op!(as_i128, self, (env, offset))
+        integer_op!(load_i128, self, (env, offset))
+    }
+
+    fn store_i128(self, env: &mut Env, offset: usize, value: i128) {
+        fn store_i128<T: TryFrom<i128> + ToBytes>((env, offset, value): (&mut Env, usize, i128))
+        where
+            <T as TryFrom<i128>>::Error: std::fmt::Debug,
+        {
+            env.store_at(offset, T::try_from(value).unwrap())
+        }
+
+        integer_op!(store_i128, self, (env, offset, value))
     }
 }
 
@@ -920,6 +932,7 @@ fn fields_size(fields: &HashMap<NameId, Field>, default: usize) -> usize {
 
 #[derive(Clone, Debug)]
 struct Variant {
+    item: ItemId,
     fields: Rc<HashMap<NameId, Field>>,
     discriminant: i128,
 }
@@ -1769,6 +1782,10 @@ impl Env {
                     }
 
                     self.bindings.truncate(binding_count);
+
+                    if matched {
+                        return Ok(());
+                    }
                 }
 
                 unreachable!(
@@ -1929,6 +1946,48 @@ impl Env {
                 self.stack.offset = dst + type_.size();
             }
 
+            Term::Variant {
+                type_,
+                name,
+                arguments,
+            } => {
+                let (discriminant_type, variant) = if let Type::Nominal { item, .. } = &type_ {
+                    if let Item::Enum {
+                        variants,
+                        discriminant_type,
+                        ..
+                    } = &self.items[item.0]
+                    {
+                        (*discriminant_type, variants.get(name).unwrap().clone())
+                    } else {
+                        unreachable!()
+                    }
+                } else {
+                    unreachable!()
+                };
+
+                let size = type_.size();
+
+                let base = self.push_uninitialized(size)?;
+
+                if let Some(discriminant_type) = discriminant_type {
+                    discriminant_type.store_i128(self, base, variant.discriminant);
+                }
+
+                let offset = self.stack.offset;
+
+                for (name, term) in arguments.deref() {
+                    let field = variant.fields.get(name).unwrap();
+
+                    self.eval_term(term)?;
+
+                    self.heap
+                        .copy_within(offset..offset + field.type_.size(), base + field.offset);
+
+                    self.stack.offset = offset;
+                }
+            }
+
             _ => todo!("evaluation not yet supported for term {term:?}"),
         }
 
@@ -2030,10 +2089,14 @@ impl Env {
     fn store<T: ToBytes>(&mut self, value: T) -> Result<usize> {
         let offset = self.allocate(mem::size_of::<T>())?;
 
-        self.heap[offset..(offset + mem::size_of::<T>())]
-            .copy_from_slice(value.to_bytes().as_ref());
+        self.store_at(offset, value);
 
         Ok(offset)
+    }
+
+    fn store_at<T: ToBytes>(&mut self, offset: usize, value: T) {
+        self.heap[offset..(offset + mem::size_of::<T>())]
+            .copy_from_slice(value.to_bytes().as_ref());
     }
 
     fn offset_of(&self, term: &Term) -> usize {
@@ -2063,7 +2126,6 @@ impl Env {
         }
     }
 
-    // Does this need to be a method of Env, or can we move it to Pattern?
     fn match_pattern(&mut self, pattern: &Pattern) -> Result<bool, EvalException> {
         fn pattern_eq<T: FromBytes + ToBytes + PartialEq<T>>(env: &mut Env) -> bool {
             let b = env.pop::<T>();
@@ -2118,7 +2180,7 @@ impl Env {
                 let base = self.stack.offset - size;
 
                 let matched =
-                    variant.discriminant == discriminant_type.unwrap().as_i128(self, base);
+                    variant.discriminant == discriminant_type.unwrap().load_i128(self, base);
 
                 if matched {
                     for (_name, _pattern) in parameters.iter() {
@@ -2726,9 +2788,15 @@ impl Env {
 
                 let error = || Err(anyhow!("attempt to initialize non-enum as an enum"));
 
-                let variants = if let Type::Nominal { item, .. } = &type_ {
+                let fields = if let Type::Nominal { item, .. } = &type_ {
                     if let Item::Enum { variants, .. } = &self.items[item.0] {
-                        variants.clone()
+                        variants
+                            .get(name)
+                            .ok_or_else(|| {
+                                anyhow!("variant {} not present in enum", self.unintern(*name))
+                            })?
+                            .fields
+                            .clone()
                     } else {
                         return error();
                     }
@@ -2736,14 +2804,10 @@ impl Env {
                     return error();
                 };
 
-                let Variant { fields, .. } = variants.get(name).ok_or_else(|| {
-                    anyhow!("variant {} not present in enum", self.unintern(*name))
-                })?;
-
                 Ok(Term::Variant {
                     type_,
                     name: *name,
-                    arguments: Rc::new(self.type_check_arguments(fields, arguments)?),
+                    arguments: Rc::new(self.type_check_arguments(&fields, arguments)?),
                 })
             }
 
@@ -3003,6 +3067,7 @@ impl Env {
                 |(
                     name,
                     Variant {
+                        item,
                         fields,
                         discriminant,
                     },
@@ -3010,6 +3075,7 @@ impl Env {
                     Ok((
                         *name,
                         Variant {
+                            item: *item,
                             fields: Rc::new(self.resolve_fields(fields, discriminant_size)?),
                             discriminant: *discriminant,
                         },
@@ -3042,10 +3108,27 @@ impl Env {
             .collect()
     }
 
-    fn find_item_in_item(&mut self, item: ItemId, _path: &[NameId]) -> Result<ItemId> {
+    fn find_item_in_item(&mut self, item: ItemId, path: &[NameId]) -> Result<ItemId> {
         self.resolve_item(item)?;
 
-        todo!()
+        if path.is_empty() {
+            Ok(item)
+        } else {
+            let item = match &self.items[item.0] {
+                Item::Enum { variants, .. } => {
+                    variants
+                        .get(&path[0])
+                        .ok_or_else(|| {
+                            anyhow!("variant {} not present in enum", self.unintern(path[0]))
+                        })?
+                        .item
+                }
+
+                _ => todo!("find_item_in_item {:?}", self.items[item.0]),
+            };
+
+            self.find_item_in_item(item, &path[1..])
+        }
     }
 
     fn find_item(&mut self, path @ Path { absolute, segments }: &Path) -> Result<ItemId> {
@@ -3118,7 +3201,7 @@ impl Env {
                     arguments: Rc::new([]),
                 }
             }
-            _ => unreachable!(),
+            item => unreachable!("type_for_item {:?}", item),
         }
     }
 
@@ -3387,9 +3470,15 @@ impl Env {
 
                                             default_discriminant = discriminant + 1;
 
+                                            let name = self.intern(&ident.to_string());
+
                                             Ok((
-                                                self.intern(&ident.to_string()),
+                                                name,
                                                 Variant {
+                                                    item: self.add_item(Item::Variant {
+                                                        item: ItemId(usize::MAX),
+                                                        name,
+                                                    }),
                                                     fields: Rc::new(self.fields_to_fields(fields)?),
                                                     discriminant,
                                                 },
@@ -3397,7 +3486,7 @@ impl Env {
                                         }
                                     },
                                 )
-                                .collect::<Result<_>>()?,
+                                .collect::<Result<HashMap<_, _>>>()?,
                         );
 
                         // todo: use #[repr(_)] attribute if present (but still check that bounds fit)
@@ -3430,9 +3519,21 @@ impl Env {
                         let item = self.add_item(Item::Unresolved(Rc::new(Item::Enum {
                             parameters: Rc::new([]),
                             discriminant_type,
-                            variants,
+                            variants: variants.clone(),
                             methods: Rc::new([]),
                         })));
+
+                        for Variant {
+                            item: variant_item, ..
+                        } in variants.values()
+                        {
+                            if let Item::Variant {
+                                item: variant_item, ..
+                            } = &mut self.items[variant_item.0]
+                            {
+                                *variant_item = item;
+                            }
+                        }
 
                         let items = &mut self.scopes.last().unwrap().borrow_mut().items;
 
@@ -3454,7 +3555,7 @@ impl Env {
     }
 
     fn eval_discriminant(&self, term: &Term) -> Result<i128> {
-        Ok(match term {
+        match term {
             Term::Literal(Literal {
                 type_: Type::Integer(integer_type),
                 offset,
@@ -3462,7 +3563,7 @@ impl Env {
                 Integer::Unknown => {
                     let s = str::from_utf8(self.load_slice(*offset)).unwrap();
 
-                    s.parse().or_else(|e| {
+                    s.parse().map_err(|e: ParseIntError| {
                         if s.parse::<u128>().is_ok() {
                             anyhow!("u128 discriminants not yet supported")
                         } else {
@@ -3471,13 +3572,13 @@ impl Env {
                     })
                 }
 
-                _ => integer_type.as_i128(self, *offset),
+                _ => Ok(integer_type.load_i128(self, *offset)),
             },
 
-            Term::UnaryOp(UnaryOp::Neg, term) => -self.eval_discriminant(term)?,
+            Term::UnaryOp(UnaryOp::Neg, term) => Ok(-self.eval_discriminant(term)?),
 
-            _ => return Err(anyhow!("unable to evaluate {term:?} as enum discriminant")),
-        })
+            _ => Err(anyhow!("unable to evaluate {term:?} as enum discriminant")),
+        }
     }
 
     fn expr_to_term(&mut self, expr: &Expr) -> Result<Term> {
