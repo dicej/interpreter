@@ -1779,6 +1779,8 @@ impl Env {
 
                 self.eval_term(scrutinee)?;
 
+                let offset = self.stack.offset;
+
                 let binding_count = self.bindings.len();
 
                 for arm in arms.iter() {
@@ -1801,7 +1803,8 @@ impl Env {
                     self.bindings.truncate(binding_count);
 
                     if matched {
-                        let size = term.type_().size();
+                        let size = arm.body.type_().size();
+
                         let src = self.stack.offset - size;
 
                         self.heap.copy_within(src..(src + size), base);
@@ -1809,6 +1812,8 @@ impl Env {
                         self.stack.offset = base + size;
 
                         return Ok(());
+                    } else {
+                        self.stack.offset = offset;
                     }
                 }
 
@@ -2049,7 +2054,9 @@ impl Env {
     }
 
     fn peek<T: FromBytes>(&self) -> T {
-        self.load(self.stack.offset)
+        assert!(self.stack.offset >= self.stack.bottom + mem::size_of::<T>());
+
+        self.load(self.stack.offset - mem::size_of::<T>())
     }
 
     fn pop<T: FromBytes>(&mut self) -> T {
@@ -2218,8 +2225,6 @@ impl Env {
                         .unwrap()
                         .load_i128(self, self.stack.offset - size)
                 {
-                    let base = self.stack.offset;
-
                     for (name, pattern) in parameters.iter() {
                         let field = variant.fields.get(name).unwrap();
 
@@ -2234,11 +2239,7 @@ impl Env {
 
                         self.eval_term(&scrutinee)?;
 
-                        let matched = self.match_pattern(pattern, &scrutinee)?;
-
-                        self.stack.offset = base;
-
-                        if !matched {
+                        if !self.match_pattern(pattern, &scrutinee)? {
                             return Ok(false);
                         }
                     }
@@ -2834,28 +2835,30 @@ impl Env {
             }
 
             Term::Struct { type_, arguments } => {
-                let type_ = self.resolve_type(type_)?;
+                if let Type::Unresolved(path) = type_.deref() {
+                    self.resolve_term(path, arguments.clone(), expected_type)
+                } else {
+                    let error = || Err(anyhow!("attempt to initialize non-struct as a struct"));
 
-                let error = || Err(anyhow!("attempt to initialize non-struct as a struct"));
-
-                let fields = if let Type::Nominal { item, .. } = &type_ {
-                    if let Item::Struct { fields, .. } = &self.items[item.0] {
-                        if !fields.keys().all(|name| arguments.contains_key(name)) {
-                            return Err(anyhow!("fields missing in struct initializer"));
+                    let fields = if let Type::Nominal { item, .. } = &type_ {
+                        if let Item::Struct { fields, .. } = &self.items[item.0] {
+                            if !fields.keys().all(|name| arguments.contains_key(name)) {
+                                return Err(anyhow!("fields missing in struct initializer"));
+                            } else {
+                                fields.clone()
+                            }
                         } else {
-                            fields.clone()
+                            return error();
                         }
                     } else {
                         return error();
-                    }
-                } else {
-                    return error();
-                };
+                    };
 
-                Ok(Term::Struct {
-                    type_,
-                    arguments: Rc::new(self.type_check_arguments(&fields, arguments)?),
-                })
+                    Ok(Term::Struct {
+                        type_: type_.clone(),
+                        arguments: Rc::new(self.type_check_arguments(&fields, arguments)?),
+                    })
+                }
             }
 
             Term::Variant {
@@ -2942,6 +2945,11 @@ impl Env {
             Item::Variant { item, name } => Term::Variant {
                 type_: self.type_for_item(*item),
                 name: *name,
+                arguments,
+            },
+
+            Item::Struct { .. } => Term::Struct {
+                type_: self.type_for_item(item),
                 arguments,
             },
 
@@ -3254,11 +3262,7 @@ impl Env {
             .rev()
             .find_map(|scope| scope.borrow().items.get(&segments[0]).copied())
         {
-            if segments.len() > 1 {
-                self.find_item_in_item(item, &segments[1..])
-            } else {
-                Ok(item)
-            }
+            self.find_item_in_item(item, &segments[1..])
         } else {
             Err(anyhow!("item not found: {}", self.unintern_path(path)))
         }
@@ -3272,8 +3276,6 @@ impl Env {
         match type_ {
             Type::Unresolved(path) => {
                 let item = self.find_item(path)?;
-
-                self.resolve_item(item)?;
 
                 Ok(self.type_for_item(item))
             }
@@ -4802,7 +4804,7 @@ mod test {
                 "{ enum Foo { A, B(u32, u32, u32, u32, u32, u32) } \
                  let f = Foo::B(1, 2, 3, 4, 5, 6); \
                  match f { \
-                 Foo::A => 87, \
+                 Foo::A => 87_u32, \
                  Foo::B(a, _, .., b, c) => a + b + c, \
                  } }"
             )
@@ -4813,7 +4815,7 @@ mod test {
     #[test]
     fn enum_named_fields() {
         assert_eq!(
-            7_u8,
+            187_u64,
             eval(
                 "{ enum Foo { A { x: u8, y: u64, z: u32 }, B(u32) } \
                  let f = Foo::A { x: 7, y: 187, z: 22 };
