@@ -22,11 +22,11 @@ use {
     syn::{
         punctuated::Punctuated, AngleBracketedGenericArguments, Arm, BinOp, Block, Expr,
         ExprAssign, ExprAssignOp, ExprBinary, ExprBlock, ExprBreak, ExprCall, ExprField, ExprIf,
-        ExprLit, ExprLoop, ExprMatch, ExprParen, ExprPath, ExprReference, ExprStruct, ExprUnary,
-        FieldPat, Fields, FieldsNamed, FieldsUnnamed, GenericArgument, GenericParam, Generics,
-        ItemEnum, ItemStruct, Lit, LitBool, Local, Member, Pat, PatIdent, PatPath, PatRest,
-        PatStruct, PatTuple, PatTupleStruct, PatWild, PathArguments, PathSegment, Stmt, TypePath,
-        TypeReference, UnOp, Visibility,
+        ExprLit, ExprLoop, ExprMatch, ExprParen, ExprPath, ExprReference, ExprStruct, ExprTuple,
+        ExprUnary, FieldPat, Fields, FieldsNamed, FieldsUnnamed, GenericArgument, GenericParam,
+        Generics, ItemEnum, ItemStruct, Lit, LitBool, Local, Member, Pat, PatIdent, PatLit,
+        PatPath, PatReference, PatRest, PatStruct, PatTuple, PatTupleStruct, PatWild,
+        PathArguments, PathSegment, Stmt, TypePath, TypeReference, UnOp, Visibility,
     },
 };
 
@@ -375,15 +375,27 @@ impl Integer {
         integer_op!(load_i128, self, (env, offset))
     }
 
-    fn store_i128(self, env: &mut Env, offset: usize, value: i128) {
-        fn store_i128<T: TryFrom<i128> + ToBytes>((env, offset, value): (&mut Env, usize, i128))
+    fn pop_as_i128(self, env: &mut Env) -> i128 {
+        fn pop_as_i128<T: TryInto<i128> + FromBytes>(env: &mut Env) -> i128
         where
+            <T as TryInto<i128>>::Error: std::fmt::Debug,
+        {
+            env.pop::<T>().try_into().unwrap()
+        }
+
+        integer_op!(pop_as_i128, self, env)
+    }
+
+    fn store_from_i128(self, env: &mut Env, offset: usize, value: i128) {
+        fn store_from_i128<T: TryFrom<i128> + ToBytes>(
+            (env, offset, value): (&mut Env, usize, i128),
+        ) where
             <T as TryFrom<i128>>::Error: std::fmt::Debug,
         {
             env.store_at(offset, T::try_from(value).unwrap())
         }
 
-        integer_op!(store_i128, self, (env, offset, value))
+        integer_op!(store_from_i128, self, (env, offset, value))
     }
 }
 
@@ -527,17 +539,25 @@ enum Pattern {
         parameters: Rc<HashMap<NameId, Pattern>>,
         complete: bool,
     },
-    Literal(Term),
+    Literal {
+        required: Term,
+        actual: Term,
+    },
     Variant {
         type_: Type,
-        name: NameId,
-        parameters: Rc<[(Term, Pattern)]>,
+        required_discriminant: i128,
+        actual_discriminant: Term,
+        parameters: Rc<[Pattern]>,
     },
     Binding {
         binding_mode: Option<BindingMode>,
         name: NameId,
         subpattern: Option<Rc<Pattern>>,
         term: Rc<RefCell<BindingTerm>>,
+    },
+    Reference {
+        unique: bool,
+        pattern: Rc<Pattern>,
     },
     Wildcard,
     Rest,
@@ -546,7 +566,7 @@ enum Pattern {
 impl Pattern {
     fn type_(&self) -> Type {
         match self {
-            Pattern::Literal(literal) => literal.type_(),
+            Pattern::Literal { required, .. } => required.type_(),
             Pattern::Variant { type_, .. } => type_.clone(),
             Pattern::Binding {
                 binding_mode, term, ..
@@ -564,6 +584,7 @@ impl Pattern {
                     }
                 }
             }
+            Pattern::Wildcard => Type::Never,
             _ => todo!("Pattern::type_ for {self:?}"),
         }
     }
@@ -1820,13 +1841,13 @@ impl Env {
                 }
             }
 
-            Term::Match { scrutinee, arms } => {
+            Term::Match { arms, .. } => {
                 let base = self.stack.offset;
 
                 let binding_count = self.bindings.len();
 
                 for arm in arms.iter() {
-                    let matched = if self.match_pattern(&arm.pattern, scrutinee)? {
+                    let matched = if self.match_pattern(&arm.pattern)? {
                         if let Some(guard) = &arm.guard {
                             self.eval_term(guard)?;
 
@@ -2042,7 +2063,7 @@ impl Env {
                 let base = self.push_uninitialized(size)?;
 
                 if let Some(discriminant_type) = discriminant_type {
-                    discriminant_type.store_i128(self, base, variant.discriminant);
+                    discriminant_type.store_from_i128(self, base, variant.discriminant);
                 }
 
                 let offset = self.stack.offset;
@@ -2191,6 +2212,8 @@ impl Env {
 
             Term::Literal(Literal { offset, .. }) => *offset,
 
+            Term::UnaryOp(UnaryOp::Deref, term) => self.load::<usize>(self.offset_of(term)),
+
             // At this point any references to temporaries should have been transformed into references to
             // variables or fields of (fields of ...) variables
             _ => unreachable!("{:?}", term),
@@ -2205,17 +2228,13 @@ impl Env {
         }
     }
 
-    fn match_pattern(
-        &mut self,
-        pattern: &Pattern,
-        scrutinee: &Term,
-    ) -> Result<bool, EvalException> {
+    fn match_pattern(&mut self, pattern: &Pattern) -> Result<bool, EvalException> {
         Ok(match pattern {
-            Pattern::Literal(literal) => {
-                self.eval_term(literal)?;
-                self.eval_term(scrutinee)?;
+            Pattern::Literal { required, actual } => {
+                self.eval_term(required)?;
+                self.eval_term(actual)?;
 
-                match &literal.type_() {
+                match required.type_() {
                     Type::Boolean => {
                         let a = self.pop::<bool>();
                         let b = self.pop::<bool>();
@@ -2237,37 +2256,23 @@ impl Env {
             }
 
             Pattern::Variant {
-                name,
+                required_discriminant,
+                actual_discriminant,
                 parameters,
-                type_,
+                ..
             } => {
-                let (size, discriminant_type, discriminant) =
-                    if let Type::Nominal { item, size, .. } = &type_ {
-                        if let Item::Enum {
-                            discriminant_type,
-                            variants,
-                            ..
-                        } = &self.items[item.0]
-                        {
-                            (
-                                size,
-                                *discriminant_type,
-                                variants.get(name).unwrap().discriminant,
-                            )
-                        } else {
-                            unreachable!()
-                        }
+                self.eval_term(actual_discriminant)?;
+
+                let discriminant_type =
+                    if let Type::Integer(integer_type) = actual_discriminant.type_() {
+                        integer_type
                     } else {
                         unreachable!()
                     };
 
-                if discriminant
-                    == discriminant_type
-                        .unwrap()
-                        .load_i128(self, self.stack.offset - size)
-                {
-                    for (term, pattern) in parameters.iter() {
-                        if !self.match_pattern(pattern, term)? {
+                if *required_discriminant == discriminant_type.pop_as_i128(self) {
+                    for pattern in parameters.iter() {
+                        if !self.match_pattern(pattern)? {
                             return Ok(false);
                         }
                     }
@@ -2284,17 +2289,17 @@ impl Env {
                 subpattern,
                 term,
             } => {
-                if let Some(subpattern) = subpattern.as_ref() {
-                    if !self.match_pattern(subpattern, scrutinee)? {
-                        return Ok(false);
-                    }
-                }
-
                 let scrutinee = if let BindingTerm::Typed(term) = term.borrow().deref() {
                     term.clone()
                 } else {
                     unreachable!()
                 };
+
+                if let Some(subpattern) = subpattern.as_ref() {
+                    if !self.match_pattern(subpattern)? {
+                        return Ok(false);
+                    }
+                }
 
                 self.eval_term(&scrutinee)?;
 
@@ -2313,6 +2318,8 @@ impl Env {
 
                 true
             }
+
+            Pattern::Wildcard => true,
 
             _ => todo!("match pattern {pattern:?}"),
         })
@@ -3375,6 +3382,8 @@ impl Env {
         literal: &Literal,
         expected_type: Option<&Type>,
     ) -> Result<Literal> {
+        // todo: if expected_type is a reference to (a reference to...) an integer type, use that since we may be
+        // type checking a pattern literal
         Ok(if let Type::Integer(Integer::Unknown) = &literal.type_ {
             let string = str::from_utf8(self.load_slice(literal.offset))
                 .unwrap()
@@ -3418,8 +3427,18 @@ impl Env {
                     _ => default_binding_mode,
                 };
 
-                if let Item::Enum { variants, .. } = self.items[item.0].clone() {
-                    if let Some(Variant { fields, .. }) = variants.get(&name) {
+                if let Item::Enum {
+                    variants,
+                    discriminant_type,
+                    ..
+                } = self.items[item.0].clone()
+                {
+                    if let Some(Variant {
+                        fields,
+                        discriminant,
+                        ..
+                    }) = variants.get(&name)
+                    {
                         let missing_count =
                             fields.len().checked_sub(parameters.len()).ok_or_else(|| {
                                 anyhow!(
@@ -3460,15 +3479,13 @@ impl Env {
                                     Some(if let Some(field) = fields.get(&name) {
                                         self.resolve_known_field(&scrutinee.type_(), field)
                                             .and_then(|lens| {
-                                                let term = Term::Field {
-                                                    base: Rc::new(scrutinee.clone()),
-                                                    name,
-                                                    lens,
-                                                };
-
                                                 let pattern = self.type_check_pattern(
                                                     pattern,
-                                                    &term,
+                                                    &Term::Field {
+                                                        base: Rc::new(scrutinee.clone()),
+                                                        name,
+                                                        lens,
+                                                    },
                                                     default_binding_mode,
                                                 )?;
 
@@ -3477,7 +3494,7 @@ impl Env {
                                                     &pattern.type_(),
                                                 )?;
 
-                                                Ok((name, (term, pattern)))
+                                                Ok((name, pattern))
                                             })
                                     } else {
                                         Err(anyhow!("unknown field: {}", self.unintern(name)))
@@ -3504,7 +3521,18 @@ impl Env {
 
                         Ok(Pattern::Variant {
                             type_: self.type_for_item(item),
-                            name,
+                            required_discriminant: *discriminant,
+                            actual_discriminant: Term::Field {
+                                base: Rc::new(scrutinee.clone()),
+                                name: NameId(usize::MAX),
+                                lens: self.resolve_known_field(
+                                    &scrutinee.type_(),
+                                    &Field {
+                                        type_: Type::Integer(discriminant_type.unwrap()),
+                                        offset: 0,
+                                    },
+                                )?,
+                            },
                             parameters: parameters.into_values().collect(),
                         })
                     } else {
@@ -3527,9 +3555,35 @@ impl Env {
     ) -> Result<Pattern> {
         match pattern {
             // todo: may need to deref scrutinee to match literal type
-            Pattern::Literal(literal) => Ok(Pattern::Literal(
-                self.type_check(literal, Some(&scrutinee.type_()))?,
-            )),
+            Pattern::Literal { required, .. } => {
+                let required = self.type_check(required, Some(&scrutinee.type_()))?;
+
+                // todo: deduplicate this logic with respect to `match_types_for_pattern`
+                let mut actual = scrutinee.clone();
+                let required_type = required.type_();
+
+                loop {
+                    let actual_type = actual.type_();
+
+                    if actual_type != Type::Never
+                        && required_type != Type::Never
+                        && actual_type != required_type
+                    {
+                        if let Type::Reference { .. } = actual_type {
+                            actual = Term::UnaryOp(UnaryOp::Deref, Rc::new(actual.clone()))
+                        } else {
+                            return Err(anyhow!(
+                                "pattern type mismatch: expected {:?}, got {required_type:?}",
+                                scrutinee.type_()
+                            ));
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                Ok(Pattern::Literal { required, actual })
+            }
 
             Pattern::Unresolved {
                 path,
@@ -3547,11 +3601,18 @@ impl Env {
 
                 let scrutinee = match binding_mode {
                     BindingMode::Move | BindingMode::MoveMut => scrutinee.clone(),
-                    BindingMode::Ref | BindingMode::RefMut => Term::Reference(Rc::new(Reference {
-                        // todo: check that ref mut is allowed based on scrutinee type
-                        unique: matches!(binding_mode, BindingMode::RefMut),
-                        term: scrutinee.clone(),
-                    })),
+                    BindingMode::Ref | BindingMode::RefMut => {
+                        let unique = matches!(binding_mode, BindingMode::RefMut);
+
+                        if unique && !self.is_mutable(scrutinee) {
+                            return Err(anyhow!("invalid unique reference to immutable term"));
+                        }
+
+                        Term::Reference(Rc::new(Reference {
+                            unique,
+                            term: scrutinee.clone(),
+                        }))
+                    }
                 };
 
                 let subpattern = subpattern
@@ -3580,6 +3641,33 @@ impl Env {
                     subpattern,
                     term: term.clone(),
                 })
+            }
+
+            Pattern::Reference { unique, pattern } => {
+                if let Type::Reference {
+                    unique: type_unique,
+                    ..
+                } = scrutinee.type_()
+                {
+                    if *unique && !type_unique {
+                        Err(anyhow!(
+                            "attempt to match a unique reference pattern to a \
+                             shared reference type: {:?}",
+                            scrutinee.type_()
+                        ))
+                    } else {
+                        self.type_check_pattern(
+                            pattern,
+                            &Term::UnaryOp(UnaryOp::Deref, Rc::new(scrutinee.clone())),
+                            default_binding_mode,
+                        )
+                    }
+                } else {
+                    Err(anyhow!(
+                        "attempt to match a reference pattern to a non-reference type: {:?}",
+                        scrutinee.type_()
+                    ))
+                }
             }
 
             Pattern::Variant { .. } | Pattern::Wildcard | Pattern::Rest => Ok(pattern.clone()),
@@ -4032,13 +4120,19 @@ impl Env {
                     let scrutinee = Rc::new(self.expr_to_term(cond)?);
 
                     let then = MatchArm {
-                        pattern: Pattern::Literal(Term::Literal(self.true_.clone())),
+                        pattern: Pattern::Literal {
+                            required: Term::Literal(self.true_.clone()),
+                            actual: Term::Literal(self.unit.clone()),
+                        },
                         guard: None,
                         body: self.block_to_term(stmts)?,
                     };
 
                     let else_ = MatchArm {
-                        pattern: Pattern::Literal(Term::Literal(self.false_.clone())),
+                        pattern: Pattern::Literal {
+                            required: Term::Literal(self.false_.clone()),
+                            actual: Term::Literal(self.unit.clone()),
+                        },
                         guard: None,
                         body: else_branch
                             .as_ref()
@@ -4290,6 +4384,16 @@ impl Env {
                 }
             }
 
+            Expr::Tuple(ExprTuple { elems, attrs, .. }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else if elems.is_empty() {
+                    Ok(Term::Literal(self.unit.clone()))
+                } else {
+                    Err(anyhow!("tuples not yet supported"))
+                }
+            }
+
             _ => Err(anyhow!("expr not yet supported: {expr:#?}")),
         }
     }
@@ -4297,6 +4401,8 @@ impl Env {
     fn expr_to_referenced_term(&mut self, expr: &Expr) -> Result<Term> {
         let mut term = self.expr_to_term(expr)?;
 
+        // todo: allow arbitrary nestings of refs and derefs around these kinds of terms, i.e. anything that we can
+        // trivially compute an offset from
         if !matches!(
             &term,
             Term::Variable { .. } | Term::Field { .. } | Term::Literal(_)
@@ -4457,6 +4563,33 @@ impl Env {
                     Err(anyhow!("attributes not yet supported"))
                 } else {
                     Ok(Pattern::Rest)
+                }
+            }
+
+            Pat::Reference(PatReference {
+                mutability,
+                pat,
+                attrs,
+                ..
+            }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else {
+                    Ok(Pattern::Reference {
+                        unique: mutability.is_some(),
+                        pattern: Rc::new(self.pat_to_pattern(pat)?),
+                    })
+                }
+            }
+
+            Pat::Lit(PatLit { expr, attrs }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else {
+                    Ok(Pattern::Literal {
+                        required: self.expr_to_term(expr)?,
+                        actual: Term::Literal(self.unit.clone()),
+                    })
                 }
             }
 
@@ -4856,12 +4989,12 @@ mod test {
     }
 
     #[test]
-    fn reference_temporary() {
+    fn reference_to_temporary() {
         assert_eq!(40_i32, eval("*&(33 + 7)").unwrap())
     }
 
     #[test]
-    fn bound_reference_temporary() {
+    fn bound_reference_to_temporary() {
         assert_eq!(40_i32, eval("{ let x = &(33 + 7); *x }").unwrap())
     }
 
