@@ -646,6 +646,7 @@ enum Term {
         scope: Rc<RefCell<Scope>>,
         terms: Rc<[Term]>,
     },
+    Sequence(Rc<[Term]>),
     Literal(Literal),
     Reference(Rc<Reference>),
     Let {
@@ -716,6 +717,7 @@ impl Term {
             Self::Block { terms, .. } => {
                 terms.last().map(|term| term.type_()).unwrap_or(Type::Unit)
             }
+            Self::Sequence(terms) => terms.last().map(|term| term.type_()).unwrap_or(Type::Unit),
             Self::Literal(literal) => literal.type_.clone(),
             // todo: the return type of an abstraction may be a function of its type parameters
             Self::Application { abstraction, .. } => {
@@ -1512,6 +1514,8 @@ impl Env {
 
         self.resolve_scope()?;
 
+        info!("{term:#?}");
+
         self.type_check_bindings(binding_count)?;
 
         self.bindings.truncate(binding_count);
@@ -1535,7 +1539,12 @@ impl Env {
 
         self.stack.offset -= type_.size();
 
-        Ok(if self.bindings.len() > binding_count {
+        let result = self.to_result(&Literal {
+            type_,
+            offset: self.stack.offset,
+        });
+
+        Ok(if let Type::Unit = &result.type_ {
             Eval::Bindings(
                 self.bindings[binding_count..]
                     .iter()
@@ -1551,10 +1560,7 @@ impl Env {
                     .collect(),
             )
         } else {
-            Eval::Result(self.to_result(&Literal {
-                type_,
-                offset: self.stack.offset,
-            }))
+            Eval::Result(result)
         })
     }
 
@@ -1954,6 +1960,8 @@ impl Env {
 
                 return result;
             }
+
+            Term::Sequence(terms) => return terms.iter().try_for_each(|term| self.eval_term(term)),
 
             Term::Loop { label, body, .. } => {
                 let offset = self.stack.offset;
@@ -2764,6 +2772,13 @@ impl Env {
 
                 Ok(Term::Block { scope, terms })
             }
+
+            Term::Sequence(terms) => Ok(Term::Sequence(
+                terms
+                    .iter()
+                    .map(|term| self.type_check(term, None))
+                    .collect::<Result<_>>()?,
+            )),
 
             Term::Phi(terms) => {
                 self.type_check_phi(terms, expected_type)?;
@@ -3708,13 +3723,7 @@ impl Env {
 
                                 let term = Rc::new(RefCell::new(
                                     init.as_ref()
-                                        .map(|(_, expr)| {
-                                            let term = self.expr_to_term(expr)?;
-
-                                            Ok::<_, Error>(
-                                                self.maybe_make_block(binding_count, term),
-                                            )
-                                        })
+                                        .map(|(_, expr)| self.expr_to_term(expr))
                                         .transpose()?
                                         .map(BindingTerm::Untyped)
                                         .unwrap_or(BindingTerm::UntypedAndUninitialized),
@@ -3722,18 +3731,23 @@ impl Env {
 
                                 let index = self.bindings.len();
 
+                                let result = self.sequence_for_temporaries(
+                                    binding_count,
+                                    Term::Let {
+                                        name,
+                                        mutable: mutability.is_some(),
+                                        index,
+                                        term: term.clone(),
+                                    },
+                                );
+
                                 self.bindings.push(Binding {
                                     name,
                                     mutable: mutability.is_some(),
-                                    term: term.clone(),
+                                    term,
                                 });
 
-                                Ok(Term::Let {
-                                    name,
-                                    mutable: mutability.is_some(),
-                                    index,
-                                    term,
-                                })
+                                Ok(result)
                             }
                         }
 
@@ -3745,7 +3759,7 @@ impl Env {
             _ => {
                 let term = self.non_binding_stmt_to_term(stmt)?;
 
-                Ok(self.maybe_make_block(binding_count, term))
+                Ok(self.sequence_for_temporaries(binding_count, term))
             }
         }
     }
@@ -4347,8 +4361,6 @@ impl Env {
                 if !attrs.is_empty() {
                     Err(anyhow!("attributes not yet supported"))
                 } else {
-                    let orig_binding_count = self.bindings.len();
-
                     let scrutinee = self.expr_to_referenced_term(expr)?;
 
                     let binding_count = self.bindings.len();
@@ -4386,7 +4398,7 @@ impl Env {
                             .collect::<Result<_>>()?,
                     };
 
-                    Ok(self.maybe_make_block(orig_binding_count, term))
+                    Ok(self.sequence_for_temporaries(binding_count, term))
                 }
             }
 
@@ -4629,10 +4641,7 @@ impl Env {
         })
     }
 
-    fn maybe_make_block(&mut self, binding_count: usize, term: Term) -> Term {
-        // todo: implement all of
-        // https://doc.rust-lang.org/reference/destructors.html?highlight=temporary#temporary-lifetime-extension
-
+    fn sequence_for_temporaries(&mut self, binding_count: usize, term: Term) -> Term {
         if self.bindings.len() > binding_count {
             let terms = self
                 .bindings
@@ -4654,15 +4663,14 @@ impl Env {
                         index,
                     },
                 )
+                // todo: store this term in a let binding, append drop calls for any temporaries whose lifetimes
+                // should *not* be extended according to
+                // https://doc.rust-lang.org/reference/destructors.html#temporary-lifetime-extension, and finally
+                // end the sequence with the variable referencing the aformentioned binding
                 .chain(iter::once(term))
                 .collect();
 
-            self.bindings.truncate(binding_count);
-
-            Term::Block {
-                scope: Rc::new(RefCell::new(Scope::new())),
-                terms,
-            }
+            Term::Sequence(terms)
         } else {
             term
         }
@@ -4992,11 +5000,10 @@ mod test {
         assert_eq!(40_i32, eval("*&(33 + 7)").unwrap())
     }
 
-    // // see todo in `maybe_make_block`
-    // #[test]
-    // fn bound_reference_to_temporary() {
-    //     assert_eq!(40_i32, eval("{ let x = &(33 + 7); *x }").unwrap())
-    // }
+    #[test]
+    fn bound_reference_to_temporary() {
+        assert_eq!(40_i32, eval("{ let x = &(33 + 7); *x }").unwrap())
+    }
 
     #[test]
     fn simple_enum() {
