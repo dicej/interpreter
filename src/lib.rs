@@ -549,6 +549,10 @@ enum Pattern {
         actual_discriminant: Option<Term>,
         parameters: Rc<[Pattern]>,
     },
+    Struct {
+        type_: Type,
+        parameters: Rc<[Pattern]>,
+    },
     Binding {
         binding_mode: Option<BindingMode>,
         name: NameId,
@@ -568,7 +572,7 @@ impl Pattern {
     fn type_(&self) -> Type {
         match self {
             Pattern::Literal { required, .. } => required.type_(),
-            Pattern::Variant { type_, .. } => type_.clone(),
+            Pattern::Variant { type_, .. } | Pattern::Struct { type_, .. } => type_.clone(),
             Pattern::Binding {
                 binding_mode, term, ..
             } => {
@@ -772,9 +776,8 @@ impl Term {
 
     fn temporary_needs_binding(&self) -> bool {
         match self {
-            Term::Variable { .. } => false,
+            Term::Variable { .. } | Term::Unresolved { .. } | Term::Literal(_) => false,
             Term::Field { base, .. } => base.temporary_needs_binding(),
-            Term::Literal(_) => false,
             Term::UnaryOp(UnaryOp::Deref, term) => term.temporary_needs_binding(),
             // todo: there may be other cases, e.g. global variables, for which we should return false
             _ => true,
@@ -2304,6 +2307,16 @@ impl Env {
                 matched
             }
 
+            Pattern::Struct { parameters, .. } => {
+                for pattern in parameters.iter() {
+                    if !self.eval_pattern(pattern)? {
+                        return Ok(false);
+                    }
+                }
+
+                true
+            }
+
             Pattern::Binding {
                 binding_mode,
                 name,
@@ -2365,6 +2378,8 @@ impl Env {
                     let binding = &self.bindings[index];
 
                     let error = || {
+                        dbg!(binding.term.borrow().deref());
+
                         Err(anyhow!(
                             "use of or assignment to possibly-uninitialized variable: {}",
                             self.unintern(binding.name)
@@ -2686,72 +2701,91 @@ impl Env {
             }
 
             Term::Assignment { left, right } => {
-                if let Term::Variable { index, .. } = left.deref() {
-                    let index = *index;
+                dbg!(left);
+                match left.deref() {
+                    Term::Unresolved(path) => {
+                        let left = dbg!(Rc::new(self.resolve_term(path, Rc::new([]))?));
 
-                    // todo: check binding type ascription, if present
+                        dbg!(self.type_check(
+                            &Term::Assignment {
+                                left,
+                                right: right.clone(),
+                            },
+                            expected_type,
+                        ))
+                    }
 
-                    let expected_type = match self.bindings[index].term.borrow().deref() {
-                        BindingTerm::Typed(term) => Some(term.type_()),
-                        _ => None,
-                    };
+                    Term::Variable { index, .. } => {
+                        let index = *index;
 
-                    let right = self.type_check(right, expected_type.as_ref())?;
+                        // todo: check binding type ascription, if present
 
-                    let right_type = right.type_();
+                        let expected_type = match self.bindings[index].term.borrow().deref() {
+                            BindingTerm::Typed(term) => Some(term.type_()),
+                            _ => None,
+                        };
 
-                    match_types(&self.type_check_binding_index(index, None)?, &right_type)?;
+                        let right = self.type_check(right, expected_type.as_ref())?;
 
-                    match self.bindings[index].term.borrow_mut().deref_mut() {
-                        BindingTerm::Uninitialized(literal) => {
-                            if right_type != Type::Never {
-                                literal.type_ = right_type.clone();
+                        let right_type = right.type_();
+
+                        match_types(&self.type_check_binding_index(index, None)?, &right_type)?;
+
+                        match self.bindings[index].term.borrow_mut().deref_mut() {
+                            BindingTerm::Uninitialized(literal) => {
+                                if right_type != Type::Never {
+                                    literal.type_ = right_type.clone();
+                                }
+                            }
+
+                            term @ BindingTerm::UntypedAndUninitialized => {
+                                *term = BindingTerm::Uninitialized(Literal {
+                                    offset: 0,
+                                    type_: right_type.clone(),
+                                });
+                            }
+
+                            _ => {
+                                if !self.bindings[index].mutable {
+                                    return Err(anyhow!(
+                                        "invalid assignment to immutable variable"
+                                    ));
+                                }
                             }
                         }
 
-                        term @ BindingTerm::UntypedAndUninitialized => {
-                            *term = BindingTerm::Uninitialized(Literal {
-                                offset: 0,
-                                type_: right_type.clone(),
-                            });
-                        }
+                        self.bindings[index].term =
+                            Rc::new(RefCell::new(BindingTerm::Typed(right.clone())));
 
-                        _ => {
-                            if !self.bindings[index].mutable {
-                                return Err(anyhow!("invalid assignment to immutable variable"));
-                            }
-                        }
+                        Ok(Term::Assignment {
+                            left: Rc::new(Term::Variable {
+                                index,
+                                type_: right_type,
+                            }),
+                            right: Rc::new(right),
+                        })
                     }
 
-                    self.bindings[index].term =
-                        Rc::new(RefCell::new(BindingTerm::Typed(right.clone())));
+                    _ => {
+                        let left = self.type_check(left, None)?;
 
-                    Ok(Term::Assignment {
-                        left: Rc::new(Term::Variable {
-                            index,
-                            type_: right_type,
-                        }),
-                        right: Rc::new(right),
-                    })
-                } else {
-                    let left = self.type_check(left, None)?;
+                        if !self.is_mutable(&left) {
+                            return Err(anyhow!("invalid assignment to immutable term"));
+                        }
 
-                    if !self.is_mutable(&left) {
-                        return Err(anyhow!("invalid assignment to immutable term"));
+                        let left_type = left.type_();
+
+                        let right = self.type_check(right, Some(&left_type))?;
+
+                        let right_type = right.type_();
+
+                        match_types(&left_type, &right_type)?;
+
+                        Ok(Term::Assignment {
+                            left: Rc::new(left),
+                            right: Rc::new(right),
+                        })
                     }
-
-                    let left_type = left.type_();
-
-                    let right = self.type_check(right, Some(&left_type))?;
-
-                    let right_type = right.type_();
-
-                    match_types(&left_type, &right_type)?;
-
-                    Ok(Term::Assignment {
-                        left: Rc::new(left),
-                        right: Rc::new(right),
-                    })
                 }
             }
 
@@ -2908,7 +2942,9 @@ impl Env {
 
             Term::Struct { type_, arguments } => {
                 if let Type::Unresolved(path) = type_.deref() {
-                    self.resolve_term(path, arguments.clone(), expected_type)
+                    let term = self.resolve_term(path, arguments.clone())?;
+
+                    self.type_check(&term, expected_type)
                 } else {
                     let error = || Err(anyhow!("attempt to initialize non-struct as a struct"));
 
@@ -2980,7 +3016,11 @@ impl Env {
                 })
             }
 
-            Term::Unresolved(path) => self.resolve_term(path, Rc::new([]), expected_type),
+            Term::Unresolved(path) => {
+                let term = self.resolve_term(path, Rc::new([]))?;
+
+                self.type_check(&term, expected_type)
+            }
 
             Term::Application {
                 abstraction,
@@ -2993,7 +3033,9 @@ impl Env {
                         .map(|(index, term)| (self.intern(&index.to_string()), term.clone()))
                         .collect();
 
-                    self.resolve_term(path, arguments, expected_type)
+                    let term = self.resolve_term(path, arguments)?;
+
+                    self.type_check(&term, expected_type)
                 } else {
                     Err(anyhow!(
                         "application not yet supported for term {abstraction:?}"
@@ -3005,35 +3047,54 @@ impl Env {
         }
     }
 
-    fn resolve_term(
-        &mut self,
-        path: &Path,
-        arguments: Rc<[(NameId, Term)]>,
-        expected_type: Option<&Type>,
-    ) -> Result<Term> {
-        let item = self.find_item(path)?;
+    fn resolve_term(&mut self, path: &Path, arguments: Rc<[(NameId, Term)]>) -> Result<Term> {
+        if let Some(item) = self.maybe_find_item(path)? {
+            Some(match &self.items[item.0] {
+                Item::Variant { item, name } => Term::Variant {
+                    type_: self.type_for_item(*item),
+                    name: *name,
+                    arguments,
+                },
 
-        let term = match &self.items[item.0] {
-            Item::Variant { item, name } => Term::Variant {
-                type_: self.type_for_item(*item),
-                name: *name,
-                arguments,
-            },
+                Item::Struct { .. } => Term::Struct {
+                    type_: self.type_for_item(item),
+                    arguments,
+                },
 
-            Item::Struct { .. } => Term::Struct {
-                type_: self.type_for_item(item),
-                arguments,
-            },
+                _ => {
+                    return Err(anyhow!(
+                        "cannot resolve {} as an expression",
+                        self.unintern_path(path)
+                    ))
+                }
+            })
+        } else if !path.absolute && path.segments.len() == 1 {
+            self.find_binding(path.segments[0])
+                .map(|index| Term::Variable {
+                    index,
+                    type_: Type::Never,
+                })
+        } else {
+            None
+        }
+        .ok_or_else(|| anyhow!("symbol not found: {}", self.unintern_path(path)))
+    }
 
-            _ => {
-                return Err(anyhow!(
-                    "cannot resolve {} as an expression",
-                    self.unintern_path(path)
-                ))
+    fn find_tuple_struct(&mut self, name: NameId) -> bool {
+        let zero = self.intern("0");
+
+        if let Some(item) = self
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.borrow().items.get(&name).copied())
+        {
+            if let Item::Struct { fields, .. } = &self.items[item.0] {
+                return fields.keys().any(|&name| name == zero);
             }
-        };
+        }
 
-        self.type_check(&term, expected_type)
+        false
     }
 
     fn type_check_arguments(
@@ -3117,6 +3178,8 @@ impl Env {
             Term::Field { base, .. } => self.is_mutable(base),
 
             Term::Variable { index, .. } => self.bindings[*index].mutable,
+
+            Term::Literal(_) => true,
 
             _ => todo!("mutability of {term:?}"),
         }
@@ -3345,7 +3408,12 @@ impl Env {
         }
     }
 
-    fn find_item(&mut self, path @ Path { absolute, segments }: &Path) -> Result<ItemId> {
+    fn find_item(&mut self, path: &Path) -> Result<ItemId> {
+        self.maybe_find_item(path)?
+            .ok_or_else(|| anyhow!("item not found: {}", self.unintern_path(path)))
+    }
+
+    fn maybe_find_item(&mut self, Path { absolute, segments }: &Path) -> Result<Option<ItemId>> {
         if *absolute {
             todo!("absolute paths")
         } else if let Some(item) = self
@@ -3354,9 +3422,9 @@ impl Env {
             .rev()
             .find_map(|scope| scope.borrow().items.get(&segments[0]).copied())
         {
-            self.find_item_in_item(item, &segments[1..])
+            self.find_item_in_item(item, &segments[1..]).map(Some)
         } else {
-            Err(anyhow!("item not found: {}", self.unintern_path(path)))
+            Ok(None)
         }
     }
 
@@ -3454,30 +3522,6 @@ impl Env {
 
         match self.items[item.0].clone() {
             Item::Variant { item, name } => {
-                let item_type = self.type_for_item(item);
-
-                let scrutinee = scrutinee
-                    .map(|scrutinee| self.type_check(scrutinee, Some(&item_type)))
-                    .transpose()?;
-
-                *scrutinee_is_typed = true;
-
-                let scrutinee_type = scrutinee
-                    .as_ref()
-                    .map(|scrutinee| scrutinee.type_())
-                    .unwrap_or_else(|| item_type.clone());
-
-                let default_binding_mode = match (&scrutinee_type, default_binding_mode) {
-                    (
-                        Type::Reference { unique: true, .. },
-                        BindingMode::Move | BindingMode::MoveMut,
-                    ) => BindingMode::RefMut,
-
-                    (Type::Reference { unique: false, .. }, _) => BindingMode::Ref,
-
-                    _ => default_binding_mode,
-                };
-
                 if let Item::Enum {
                     variants,
                     discriminant_type,
@@ -3490,112 +3534,30 @@ impl Env {
                         ..
                     }) = variants.get(&name)
                     {
-                        let missing_count =
-                            fields.len().checked_sub(parameters.len()).ok_or_else(|| {
-                                anyhow!(
-                                    "too many parameters specified for variant {}",
-                                    self.unintern(name)
-                                )
-                            })?;
-
-                        let rest = parameters
-                            .iter()
-                            .find_map(|(name, pattern)| {
-                                if matches!(pattern, Pattern::Rest) {
-                                    Some(*name)
-                                } else {
-                                    None
-                                }
-                            })
-                            .map(|name| self.unintern(name).parse::<usize>().unwrap());
-
-                        let parameters = parameters
-                            .iter()
-                            .filter_map(|(name, pattern)| match pattern {
-                                Pattern::Wildcard | Pattern::Rest => None,
-
-                                _ => {
-                                    let name = if let Some(rest) = rest {
-                                        let index = self.unintern(*name).parse::<usize>().unwrap();
-
-                                        if index > rest {
-                                            self.intern(&(index + missing_count).to_string())
-                                        } else {
-                                            *name
-                                        }
-                                    } else {
-                                        *name
-                                    };
-
-                                    Some(if let Some(field) = fields.get(&name) {
-                                        info!(
-                                            "dicej name {name:?} {} index {}",
-                                            self.unintern(name),
-                                            self.bindings.len()
-                                        );
-                                        self.resolve_known_field(&scrutinee_type, field).and_then(
-                                            |lens| {
-                                                let pattern = self.type_check_pattern(
-                                                    pattern,
-                                                    scrutinee
-                                                        .as_ref()
-                                                        .map(|scrutinee| Term::Field {
-                                                            base: Rc::new(scrutinee.clone()),
-                                                            name,
-                                                            lens,
-                                                        })
-                                                        .as_ref(),
-                                                    default_binding_mode,
-                                                    scrutinee_is_typed,
-                                                )?;
-
-                                                match_types_for_pattern(
-                                                    &field.type_,
-                                                    &pattern.type_(),
-                                                )?;
-
-                                                Ok((name, pattern))
-                                            },
-                                        )
-                                    } else {
-                                        Err(anyhow!("unknown field: {}", self.unintern(name)))
-                                    })
-                                }
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-
-                        if complete
-                            && !fields
-                                .keys()
-                                .all(|name| parameters.iter().any(|(n, _)| n == name))
-                        {
-                            return Err(anyhow!(
-                                "missing fields in pattern: expected [{}], got [{}]",
-                                fields
-                                    .keys()
-                                    .map(|&name| self.unintern(name))
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                                parameters
-                                    .iter()
-                                    .map(|(name, _)| self.unintern(*name))
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ));
-                        }
+                        let (scrutinee, type_, parameters) = self.resolve_pattern_parameters(
+                            item,
+                            fields,
+                            parameters,
+                            complete,
+                            scrutinee,
+                            default_binding_mode,
+                            scrutinee_is_typed,
+                        )?;
 
                         Ok(Pattern::Variant {
-                            type_: item_type,
+                            type_,
 
                             required_discriminant: *discriminant,
 
                             actual_discriminant: scrutinee
                                 .map(|scrutinee| {
+                                    let type_ = scrutinee.type_();
+
                                     Ok::<_, Error>(Term::Field {
                                         base: Rc::new(scrutinee),
                                         name: NameId(usize::MAX),
                                         lens: self.resolve_known_field(
-                                            &scrutinee_type,
+                                            &type_,
                                             &Field {
                                                 type_: Type::Integer(discriminant_type.unwrap()),
                                                 offset: 0,
@@ -3605,10 +3567,7 @@ impl Env {
                                 })
                                 .transpose()?,
 
-                            parameters: parameters
-                                .into_iter()
-                                .map(|(_, pattern)| pattern)
-                                .collect(),
+                            parameters,
                         })
                     } else {
                         Err(anyhow!("unknown variant: {}", self.unintern(name)))
@@ -3618,8 +3577,150 @@ impl Env {
                 }
             }
 
+            Item::Struct { fields, .. } => {
+                let (_, type_, parameters) = self.resolve_pattern_parameters(
+                    item,
+                    &fields,
+                    parameters,
+                    complete,
+                    scrutinee,
+                    default_binding_mode,
+                    scrutinee_is_typed,
+                )?;
+
+                Ok(Pattern::Struct { type_, parameters })
+            }
+
             item => todo!("resolve {item:?}"),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_pattern_parameters(
+        &mut self,
+        item: ItemId,
+        fields: &HashMap<NameId, Field>,
+        parameters: &[(NameId, Pattern)],
+        complete: bool,
+        scrutinee: Option<&Term>,
+        default_binding_mode: BindingMode,
+        scrutinee_is_typed: &mut bool,
+    ) -> Result<(Option<Term>, Type, Rc<[Pattern]>)> {
+        let item_type = self.type_for_item(item);
+
+        let scrutinee = scrutinee
+            .map(|scrutinee| self.type_check(scrutinee, Some(&item_type)))
+            .transpose()?;
+
+        *scrutinee_is_typed = true;
+
+        let scrutinee_type = scrutinee
+            .as_ref()
+            .map(|scrutinee| scrutinee.type_())
+            .unwrap_or_else(|| item_type.clone());
+
+        let default_binding_mode = match (&scrutinee_type, default_binding_mode) {
+            (Type::Reference { unique: true, .. }, BindingMode::Move | BindingMode::MoveMut) => {
+                BindingMode::RefMut
+            }
+
+            (Type::Reference { unique: false, .. }, _) => BindingMode::Ref,
+
+            _ => default_binding_mode,
+        };
+
+        let missing_count = fields
+            .len()
+            .checked_sub(parameters.len())
+            .ok_or_else(|| anyhow!("too many parameters specified for variant or struct"))?;
+
+        let rest = parameters
+            .iter()
+            .find_map(|(name, pattern)| {
+                if matches!(pattern, Pattern::Rest) {
+                    Some(*name)
+                } else {
+                    None
+                }
+            })
+            .map(|name| self.unintern(name).parse::<usize>().unwrap());
+
+        let parameters = parameters
+            .iter()
+            .filter_map(|(name, pattern)| match pattern {
+                Pattern::Wildcard | Pattern::Rest => None,
+
+                _ => {
+                    let name = if let Some(rest) = rest {
+                        let index = self.unintern(*name).parse::<usize>().unwrap();
+
+                        if index > rest {
+                            self.intern(&(index + missing_count).to_string())
+                        } else {
+                            *name
+                        }
+                    } else {
+                        *name
+                    };
+
+                    Some(if let Some(field) = fields.get(&name) {
+                        info!(
+                            "dicej name {name:?} {} index {}",
+                            self.unintern(name),
+                            self.bindings.len()
+                        );
+                        self.resolve_known_field(&scrutinee_type, field)
+                            .and_then(|lens| {
+                                let pattern = self.type_check_pattern(
+                                    pattern,
+                                    scrutinee
+                                        .as_ref()
+                                        .map(|scrutinee| Term::Field {
+                                            base: Rc::new(scrutinee.clone()),
+                                            name,
+                                            lens,
+                                        })
+                                        .as_ref(),
+                                    default_binding_mode,
+                                    scrutinee_is_typed,
+                                )?;
+
+                                match_types_for_pattern(&field.type_, &pattern.type_())?;
+
+                                Ok((name, pattern))
+                            })
+                    } else {
+                        Err(anyhow!("unknown field: {}", self.unintern(name)))
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if complete
+            && !fields
+                .keys()
+                .all(|name| parameters.iter().any(|(n, _)| n == name))
+        {
+            return Err(anyhow!(
+                "missing fields in pattern: expected [{}], got [{}]",
+                fields
+                    .keys()
+                    .map(|&name| self.unintern(name))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                parameters
+                    .iter()
+                    .map(|(name, _)| self.unintern(*name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        Ok((
+            scrutinee,
+            item_type,
+            parameters.into_iter().map(|(_, pattern)| pattern).collect(),
+        ))
     }
 
     fn type_check_pattern(
@@ -3694,6 +3795,13 @@ impl Env {
                 subpattern,
                 term,
             } => {
+                if self.find_tuple_struct(*name) {
+                    return Err(anyhow!(
+                        "binding must not shadow tuple struct: {}",
+                        self.unintern(*name)
+                    ));
+                }
+
                 let binding_mode = (*binding_mode).unwrap_or(default_binding_mode);
 
                 let scrutinee = scrutinee
@@ -3806,7 +3914,10 @@ impl Env {
                 Ok(pattern)
             }
 
-            Pattern::Variant { .. } | Pattern::Wildcard | Pattern::Rest => Ok(pattern.clone()),
+            Pattern::Variant { .. }
+            | Pattern::Struct { .. }
+            | Pattern::Wildcard
+            | Pattern::Rest => Ok(pattern.clone()),
         }
     }
 
@@ -4217,18 +4328,7 @@ impl Env {
                 } else if qself.is_some() {
                     Err(anyhow!("qualified paths not yet supported"))
                 } else {
-                    let path = self.path_to_path(path)?;
-
-                    if !path.absolute && path.segments.len() == 1 {
-                        Ok(Term::Variable {
-                            index: self.find_binding(path.segments[0]).ok_or_else(|| {
-                                anyhow!("symbol not found: {}", self.unintern(path.segments[0]))
-                            })?,
-                            type_: Type::Never,
-                        })
-                    } else {
-                        Ok(Term::Unresolved(path))
-                    }
+                    Ok(Term::Unresolved(self.path_to_path(path)?))
                 }
             }
 
@@ -5330,7 +5430,7 @@ mod test {
 
     #[test]
     fn let_ref_declaration() {
-        assert_eq!(84_i32, eval("{ let ref x; x = &42; *x }").unwrap())
+        assert_eq!(42_i32, eval("{ let ref x; x = &42; *x }").unwrap())
     }
 
     #[test]
