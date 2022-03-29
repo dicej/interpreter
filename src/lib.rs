@@ -2363,7 +2363,7 @@ impl Env {
 
                 self.maybe_match_types_for_pattern(term.as_deref(), &pattern, scrutinee_is_typed)?;
 
-                if self.refutable(&pattern) {
+                if self.is_refutable(&pattern) {
                     Err(anyhow!("expected irrefutable pattern; got {pattern:?}"))
                 } else {
                     Ok(Term::Let {
@@ -3049,9 +3049,28 @@ impl Env {
         }
     }
 
-    fn refutable(&mut self, _pattern: &Pattern) -> bool {
-        // todo
-        false
+    fn is_refutable(&self, pattern: &Pattern) -> bool {
+        match pattern {
+            Pattern::Literal { required, .. } => required.type_() != Type::Unit,
+            Pattern::Variant { type_, .. } => {
+                if let Type::Nominal { item, .. } = type_ {
+                    if let Item::Enum { variants, .. } = &self.items[item.0] {
+                        variants.len() > 1
+                    } else {
+                        unreachable!()
+                    }
+                } else {
+                    unreachable!()
+                }
+            }
+            Pattern::Struct { .. } | Pattern::Wildcard | Pattern::Rest => false,
+            Pattern::Binding { subpattern, .. } => subpattern
+                .as_deref()
+                .map(|subpattern| self.is_refutable(subpattern))
+                .unwrap_or(false),
+            Pattern::Reference { pattern, .. } => self.is_refutable(pattern.deref()),
+            Pattern::Unresolved { .. } => unreachable!(),
+        }
     }
 
     fn resolve_term(&mut self, path: &Path, arguments: Rc<[(NameId, Term)]>) -> Result<Term> {
