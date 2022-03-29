@@ -752,7 +752,7 @@ impl Term {
                 _ => unreachable!(),
             },
             Self::Variable { type_, .. } => type_.clone(),
-            Self::Assignment { .. } => Type::Unit,
+            Self::Assignment { .. } | Self::Let { .. } => Type::Unit,
             Self::Match { arms, .. } => arms[0].body.type_(),
             Self::Break { .. } | Self::Return { .. } => Type::Never,
             Self::Phi(terms) => terms
@@ -2352,8 +2352,6 @@ impl Env {
     fn type_check(&mut self, term: &Term, expected_type: Option<&Type>) -> Result<Term> {
         match term {
             Term::Let { pattern, term } => {
-                // todo: verify pattern is irrefutable
-
                 let mut scrutinee_is_typed = false;
 
                 let pattern = self.type_check_pattern(
@@ -2365,10 +2363,14 @@ impl Env {
 
                 self.maybe_match_types_for_pattern(term.as_deref(), &pattern, scrutinee_is_typed)?;
 
-                Ok(Term::Let {
-                    pattern: Rc::new(pattern),
-                    term: None,
-                })
+                if self.refutable(&pattern) {
+                    Err(anyhow!("expected irrefutable pattern; got {pattern:?}"))
+                } else {
+                    Ok(Term::Let {
+                        pattern: Rc::new(pattern),
+                        term: None,
+                    })
+                }
             }
 
             Term::Variable { index, .. } => {
@@ -3047,6 +3049,11 @@ impl Env {
         }
     }
 
+    fn refutable(&mut self, _pattern: &Pattern) -> bool {
+        // todo
+        false
+    }
+
     fn resolve_term(&mut self, path: &Path, arguments: Rc<[(NameId, Term)]>) -> Result<Term> {
         if let Some(item) = self.maybe_find_item(path)? {
             Some(match &self.items[item.0] {
@@ -3494,10 +3501,18 @@ impl Env {
                 .to_owned();
 
             match expected_type.cloned() {
-                Some(Type::Integer(integer_type)) => Literal {
-                    offset: integer_type.parse(self, &string)?,
-                    type_: Type::Integer(integer_type),
-                },
+                Some(Type::Integer(integer_type)) => {
+                    let integer_type = if let Integer::Unknown = integer_type {
+                        Integer::I32
+                    } else {
+                        integer_type
+                    };
+
+                    Literal {
+                        offset: integer_type.parse(self, &string)?,
+                        type_: Type::Integer(integer_type),
+                    }
+                }
 
                 _ => Literal {
                     offset: self.store(string.parse::<i32>()?)?,
@@ -3685,7 +3700,9 @@ impl Env {
                                     scrutinee_is_typed,
                                 )?;
 
-                                match_types_for_pattern(&field.type_, &pattern.type_())?;
+                                if *scrutinee_is_typed && scrutinee.is_some() {
+                                    match_types_for_pattern(&field.type_, &pattern.type_())?;
+                                }
 
                                 Ok((name, pattern))
                             })
