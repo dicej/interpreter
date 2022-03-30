@@ -553,6 +553,7 @@ enum Pattern {
         type_: Type,
         parameters: Rc<[Pattern]>,
     },
+    Tuple(Rc<[Pattern]>),
     Binding {
         binding_mode: Option<BindingMode>,
         name: NameId,
@@ -573,6 +574,13 @@ impl Pattern {
         match self {
             Pattern::Literal { required, .. } => required.type_(),
             Pattern::Variant { type_, .. } | Pattern::Struct { type_, .. } => type_.clone(),
+            Pattern::Tuple(patterns) => {
+                if patterns.is_empty() {
+                    Type::Unit
+                } else {
+                    Type::Tuple(patterns.iter().map(|pattern| pattern.type_()).collect())
+                }
+            }
             Pattern::Binding {
                 binding_mode, term, ..
             } => {
@@ -1551,20 +1559,24 @@ impl Env {
         });
 
         Ok(if let Type::Unit = &result.type_ {
-            Eval::Bindings(
-                self.bindings[binding_count..]
-                    .iter()
-                    .map(|binding| {
-                        (
-                            self.unintern(binding.name),
-                            match binding.term.borrow().deref() {
-                                BindingTerm::Initialized(literal) => self.to_result(literal),
-                                _ => unreachable!(),
-                            },
-                        )
-                    })
-                    .collect(),
-            )
+            if self.bindings.len() > binding_count {
+                Eval::Bindings(
+                    self.bindings[binding_count..]
+                        .iter()
+                        .map(|binding| {
+                            (
+                                self.unintern(binding.name),
+                                match binding.term.borrow().deref() {
+                                    BindingTerm::Initialized(literal) => self.to_result(literal),
+                                    _ => unreachable!(),
+                                },
+                            )
+                        })
+                        .collect(),
+                )
+            } else {
+                Eval::Result(result)
+            }
         } else {
             Eval::Result(result)
         })
@@ -2268,6 +2280,8 @@ impl Env {
                             integer_op!(pattern_eq, integer_type, self)
                         }
 
+                        Type::Unit => true,
+
                         _ => todo!("match pattern {pattern:?}"),
                     }
                 } else {
@@ -2307,8 +2321,12 @@ impl Env {
                 matched
             }
 
-            Pattern::Struct { parameters, .. } => {
-                for pattern in parameters.iter() {
+            Pattern::Struct {
+                parameters: patterns,
+                ..
+            }
+            | Pattern::Tuple(patterns) => {
+                for pattern in patterns.iter() {
                     if !self.eval_pattern(pattern)? {
                         return Ok(false);
                     }
@@ -3052,10 +3070,14 @@ impl Env {
     fn is_refutable(&self, pattern: &Pattern) -> bool {
         match pattern {
             Pattern::Literal { required, .. } => required.type_() != Type::Unit,
-            Pattern::Variant { type_, .. } => {
+
+            Pattern::Variant {
+                type_, parameters, ..
+            } => {
                 if let Type::Nominal { item, .. } = type_ {
                     if let Item::Enum { variants, .. } = &self.items[item.0] {
                         variants.len() > 1
+                            || parameters.iter().any(|pattern| self.is_refutable(pattern))
                     } else {
                         unreachable!()
                     }
@@ -3063,12 +3085,22 @@ impl Env {
                     unreachable!()
                 }
             }
-            Pattern::Struct { .. } | Pattern::Wildcard | Pattern::Rest => false,
+
+            Pattern::Struct {
+                parameters: patterns,
+                ..
+            }
+            | Pattern::Tuple(patterns) => patterns.iter().any(|pattern| self.is_refutable(pattern)),
+
+            Pattern::Wildcard | Pattern::Rest => false,
+
             Pattern::Binding { subpattern, .. } => subpattern
                 .as_deref()
                 .map(|subpattern| self.is_refutable(subpattern))
                 .unwrap_or(false),
+
             Pattern::Reference { pattern, .. } => self.is_refutable(pattern.deref()),
+
             Pattern::Unresolved { .. } => unreachable!(),
         }
     }
@@ -3823,6 +3855,10 @@ impl Env {
                 default_binding_mode,
                 scrutinee_is_typed,
             ),
+
+            // todo: will need to do a lot of the same work as resolve_pattern_parameters here, but may need to
+            // avoid typing the scrutinee if possible
+            Pattern::Tuple(_patterns) => todo!(),
 
             Pattern::Binding {
                 binding_mode,
@@ -4851,6 +4887,24 @@ impl Env {
                 }
             }
 
+            Pat::Tuple(PatTuple { elems, attrs, .. }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else if elems.is_empty() {
+                    Ok(Pattern::Literal {
+                        required: Term::Literal(self.unit.clone()),
+                        actual: None,
+                    })
+                } else {
+                    Ok(Pattern::Tuple(
+                        elems
+                            .iter()
+                            .map(|pat| self.pat_to_pattern(pat))
+                            .collect::<Result<_>>()?,
+                    ))
+                }
+            }
+
             _ => Err(anyhow!("pattern not yet supported: {pat:#?}")),
         }
     }
@@ -5515,11 +5569,87 @@ mod test {
 
     #[test]
     fn let_literal_pattern() {
-        assert!(eval::<()>("let () = ()").is_err())
+        eval::<()>("let () = ()").unwrap()
     }
 
     #[test]
     fn bad_let_literal_pattern() {
         assert!(eval::<()>("let 42 = 42").is_err())
+    }
+
+    #[test]
+    fn simple_lambda() {
+        assert_eq!(32_i32, eval("(|| 32)()").unwrap())
+    }
+
+    #[test]
+    fn identity_lambda() {
+        assert_eq!(61_i32, eval("(|x| x)(61)").unwrap())
+    }
+
+    #[test]
+    fn shared_ref_closure() {
+        assert_eq!(68_i32, eval("{ let y = 7; (|x| x + y)(61) }").unwrap())
+    }
+
+    #[test]
+    fn unique_mutable_ref_closure() {
+        assert_eq!(11_i32, eval("{ let mut y = 7; (|| y += 4)(); y }").unwrap())
+    }
+
+    #[test]
+    fn unique_immutable_ref_closure() {
+        assert_eq!(
+            9_i32,
+            eval("{ let mut y = 7; let z = &mut y; (|| *z += 2)(); y }").unwrap()
+        )
+    }
+
+    #[test]
+    #[ignore = "borrow checker not yet implemented"]
+    fn bad_unique_immutable_ref_closure() {
+        assert!(eval::<()>(
+            "{ let mut y = 7; let z = &mut y; { let c = || *z += 2; let x = &z; c() } y }"
+        )
+        .is_err())
+    }
+
+    #[test]
+    fn implicit_move_closure() {
+        assert_eq!(
+            14_i32,
+            eval("{ struct Foo(i32); let y = Foo(14); (|| y)().0 }").unwrap()
+        )
+    }
+
+    #[test]
+    #[ignore = "borrow checker not yet implemented"]
+    fn bad_implicit_move_closure() {
+        assert!(
+            eval::<()>("{ struct Foo(i32); let y = Foo(14); let x = (|| y)().0; x + y.0 }")
+                .is_err()
+        )
+    }
+
+    #[test]
+    fn explicit_move_closure() {
+        assert_eq!(
+            14_i32,
+            eval("{ struct Foo(i32); let y = Foo(14); (move || y.0)() }").unwrap()
+        )
+    }
+
+    #[test]
+    #[ignore = "borrow checker not yet implemented"]
+    fn bad_explicit_move_closure() {
+        assert!(eval::<()>(
+            "{ struct Foo(i32); let y = Foo(14); let x = (move || y.0)(); x + y.0 }"
+        )
+        .is_err())
+    }
+
+    #[test]
+    fn nested_closure() {
+        assert_eq!(90_i32, eval("{ let y = 90; (|| (|| y)())() }").unwrap())
     }
 }
