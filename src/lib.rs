@@ -8,7 +8,7 @@ use {
     maplit::hashmap,
     std::{
         any,
-        cell::RefCell,
+        cell::{Cell, RefCell},
         collections::{hash_map::Entry, BTreeMap, HashMap},
         error,
         fmt::{self, Display},
@@ -432,6 +432,13 @@ struct Impl {
 //     Trait(Type, Trait),
 // }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+enum ReferenceKind {
+    Shared,
+    UniqueImmutable,
+    UniqueMutable,
+}
+
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 enum Type {
     Never,
@@ -445,7 +452,7 @@ enum Type {
     Pointer(Rc<Type>),
     Reference {
         // todo: add lifetime field
-        unique: bool,
+        kind: ReferenceKind,
         type_: Rc<Type>,
     },
     Slice(Rc<Type>, Lifetime),
@@ -562,7 +569,7 @@ enum Pattern {
         term: Rc<RefCell<BindingTerm>>,
     },
     Reference {
-        unique: bool,
+        kind: ReferenceKind,
         pattern: Rc<Pattern>,
     },
     Wildcard,
@@ -598,9 +605,9 @@ impl Pattern {
                 }
             }
             Pattern::Wildcard => Type::Never,
-            Pattern::Reference { unique, pattern } => Type::Reference {
+            Pattern::Reference { kind, pattern } => Type::Reference {
                 type_: Rc::new(pattern.type_()),
-                unique: *unique,
+                kind: *kind,
             },
             _ => todo!("Pattern::type_ for {self:?}"),
         }
@@ -617,7 +624,7 @@ struct MatchArm {
 #[derive(Clone, Debug)]
 struct Reference {
     // todo: add lifetime field
-    unique: bool,
+    kind: ReferenceKind,
     term: Term,
 }
 
@@ -628,7 +635,7 @@ impl Reference {
 
     fn type_(&self) -> Type {
         Type::Reference {
-            unique: self.unique,
+            kind: self.kind,
             type_: Rc::new(self.deref_type()),
         }
     }
@@ -722,6 +729,11 @@ enum Term {
         base: Rc<Term>,
         name: NameId,
         lens: Lens,
+    },
+    Capture {
+        name: NameId,
+        type_: Type,
+        mode: Rc<Cell<CaptureMode>>,
     },
     Unresolved(Path),
 }
@@ -944,10 +956,14 @@ impl fmt::Display for EvalResult {
 
             Type::Unit => write!(f, "()"),
 
-            Type::Reference { type_, unique } => write!(
+            Type::Reference { type_, kind } => write!(
                 f,
                 "&{}{}",
-                if *unique { "mut " } else { "" },
+                match kind {
+                    ReferenceKind::Shared => "",
+                    ReferenceKind::UniqueMutable => "mut ",
+                    ReferenceKind::UniqueImmutable => unreachable!(),
+                },
                 EvalResult {
                     value: self.value.clone(),
                     type_: type_.deref().clone()
@@ -1092,6 +1108,22 @@ struct StackData {
     offset: usize,
 }
 
+#[derive(Copy, Clone, Debug)]
+enum CaptureMode {
+    SharedReference,
+    UniqueImmutableReference,
+    UniqueMutableReference,
+    Move,
+}
+
+#[derive(Debug)]
+struct ClosureContext {
+    // todo: add a field for whether it's a "move" closure here, or else a reference to the Term for the closure,
+    // perhaps
+    boundary: usize,
+    captures: HashMap<usize, Rc<Cell<CaptureMode>>>,
+}
+
 pub struct Env {
     heap: Box<[u8]>,
     allocator: Allocator,
@@ -1101,6 +1133,7 @@ pub struct Env {
     items: Vec<Item>,
     scopes: Vec<Rc<RefCell<Scope>>>,
     bindings: Vec<Binding>,
+    closure_context: Option<ClosureContext>,
     loops: Vec<Loop>,
     traits: HashMap<NameId, Trait>,
     impls: HashMap<(Type, Trait), Option<Impl>>,
@@ -1160,6 +1193,7 @@ impl Env {
                 Rc::new(RefCell::new(Scope::new())),
             ],
             bindings: Vec::new(),
+            closure_context: None,
             loops: Vec::new(),
             traits: HashMap::new(),
             impls: HashMap::new(),
@@ -1350,7 +1384,7 @@ impl Env {
 
             for type_ in *types {
                 let self_type = Type::Reference {
-                    unique: true,
+                    kind: ReferenceKind::UniqueMutable,
                     type_: Rc::new(type_.clone()),
                 };
 
@@ -1427,7 +1461,7 @@ impl Env {
 
             for type_ in *types {
                 let ref_type = Type::Reference {
-                    unique: false,
+                    kind: ReferenceKind::Shared,
                     type_: Rc::new(type_.clone()),
                 };
 
@@ -1639,10 +1673,10 @@ impl Env {
     }
 
     fn get_blanket_impl(&mut self, type_: &Type, trait_: &Trait) -> Option<Impl> {
-        if let Type::Reference { unique, .. } = type_ {
+        if let Type::Reference { kind, .. } = type_ {
             if trait_.name == self.intern("Deref") {
                 let self_type = Type::Reference {
-                    unique: false,
+                    kind: ReferenceKind::Shared,
                     type_: Rc::new(type_.clone()),
                 };
 
@@ -1664,9 +1698,11 @@ impl Env {
                     arguments: Rc::new([]),
                     functions: Rc::new(hashmap![function => abstraction]),
                 });
-            } else if *unique && trait_.name == self.intern("DerefMut") {
+            } else if *kind == ReferenceKind::UniqueMutable
+                && trait_.name == self.intern("DerefMut")
+            {
                 let self_type = Type::Reference {
-                    unique: true,
+                    kind: ReferenceKind::UniqueMutable,
                     type_: Rc::new(type_.clone()),
                 };
 
@@ -2472,7 +2508,7 @@ impl Env {
                                 impl_.functions.get(&function).unwrap().clone(),
                             )),
                             arguments: Rc::new([Term::Reference(Rc::new(Reference {
-                                unique: false,
+                                kind: ReferenceKind::Shared,
                                 term,
                             }))]),
                         }),
@@ -2605,7 +2641,7 @@ impl Env {
                             )),
                             arguments: Rc::new([
                                 Term::Reference(Rc::new(Reference {
-                                    unique: true,
+                                    kind: ReferenceKind::UniqueMutable,
                                     term: left,
                                 })),
                                 right,
@@ -2625,11 +2661,11 @@ impl Env {
                             )),
                             arguments: Rc::new([
                                 Term::Reference(Rc::new(Reference {
-                                    unique: false,
+                                    kind: ReferenceKind::Shared,
                                     term: left,
                                 })),
                                 Term::Reference(Rc::new(Reference {
-                                    unique: false,
+                                    kind: ReferenceKind::Shared,
                                     term: right,
                                 })),
                             ]),
@@ -2950,11 +2986,11 @@ impl Env {
                     }),
                 )?;
 
-                if reference.unique && !self.is_mutable(&term) {
+                if reference.kind == ReferenceKind::UniqueMutable && !self.is_mutable(&term) {
                     Err(anyhow!("invalid unique reference to immutable term"))
                 } else {
                     Ok(Term::Reference(Rc::new(Reference {
-                        unique: reference.unique,
+                        kind: reference.kind,
                         term,
                     })))
                 }
@@ -3226,8 +3262,8 @@ impl Env {
     fn is_mutable(&self, term: &Term) -> bool {
         match term {
             Term::UnaryOp(UnaryOp::Deref, term) => {
-                if let Type::Reference { unique, .. } = term.type_() {
-                    unique
+                if let Type::Reference { kind, .. } = term.type_() {
+                    kind == ReferenceKind::UniqueMutable
                 } else {
                     unreachable!()
                 }
@@ -3498,9 +3534,9 @@ impl Env {
                 Ok(self.type_for_item(item))
             }
 
-            Type::Reference { type_, unique } => Ok(Type::Reference {
+            Type::Reference { type_, kind } => Ok(Type::Reference {
                 type_: Rc::new(self.resolve_type(type_)?),
-                unique: *unique,
+                kind: *kind,
             }),
 
             _ => Ok(type_.clone()),
@@ -3686,11 +3722,29 @@ impl Env {
             .unwrap_or_else(|| item_type.clone());
 
         let default_binding_mode = match (&scrutinee_type, default_binding_mode) {
-            (Type::Reference { unique: true, .. }, BindingMode::Move | BindingMode::MoveMut) => {
-                BindingMode::RefMut
-            }
+            (
+                Type::Reference {
+                    kind: ReferenceKind::UniqueMutable,
+                    ..
+                },
+                BindingMode::Move | BindingMode::MoveMut,
+            ) => BindingMode::RefMut,
 
-            (Type::Reference { unique: false, .. }, _) => BindingMode::Ref,
+            (
+                Type::Reference {
+                    kind: ReferenceKind::Shared,
+                    ..
+                },
+                _,
+            ) => BindingMode::Ref,
+
+            (
+                Type::Reference {
+                    kind: ReferenceKind::UniqueImmutable,
+                    ..
+                },
+                _,
+            ) => unreachable!(),
 
             _ => default_binding_mode,
         };
@@ -3856,8 +3910,8 @@ impl Env {
                 scrutinee_is_typed,
             ),
 
-            // todo: will need to do a lot of the same work as resolve_pattern_parameters here, but may need to
-            // avoid typing the scrutinee if possible
+            // todo: will need to do a lot of the same work as resolve_pattern_parameters here, except we also need
+            // to avoid typing the scrutinee
             Pattern::Tuple(_patterns) => todo!(),
 
             Pattern::Binding {
@@ -3890,7 +3944,11 @@ impl Env {
                                 }
 
                                 Term::Reference(Rc::new(Reference {
-                                    unique,
+                                    kind: if unique {
+                                        ReferenceKind::UniqueMutable
+                                    } else {
+                                        ReferenceKind::Shared
+                                    },
                                     term: scrutinee.clone(),
                                 }))
                             }
@@ -3948,7 +4006,7 @@ impl Env {
                 })
             }
 
-            Pattern::Reference { unique, pattern } => {
+            Pattern::Reference { kind, pattern } => {
                 let pattern = self.type_check_pattern(
                     pattern,
                     scrutinee
@@ -3964,11 +4022,13 @@ impl Env {
                         .transpose()?
                     {
                         if let Type::Reference {
-                            unique: type_unique,
+                            kind: type_kind,
                             type_,
                         } = scrutinee.type_()
                         {
-                            if *unique && !type_unique {
+                            if *kind == ReferenceKind::UniqueMutable
+                                && type_kind != ReferenceKind::UniqueMutable
+                            {
                                 return Err(anyhow!(
                                     "attempt to match a unique reference pattern to a \
                                      shared reference type: {type_:?}",
@@ -4553,7 +4613,11 @@ impl Env {
                     Err(anyhow!("attributes not yet supported"))
                 } else {
                     Ok(Term::Reference(Rc::new(Reference {
-                        unique: mutability.is_some(),
+                        kind: if mutability.is_some() {
+                            ReferenceKind::UniqueMutable
+                        } else {
+                            ReferenceKind::Shared
+                        },
                         term: self.expr_to_referenced_term(expr)?,
                     })))
                 }
@@ -4870,7 +4934,11 @@ impl Env {
                     Err(anyhow!("attributes not yet supported"))
                 } else {
                     Ok(Pattern::Reference {
-                        unique: mutability.is_some(),
+                        kind: if mutability.is_some() {
+                            ReferenceKind::UniqueMutable
+                        } else {
+                            ReferenceKind::Shared
+                        },
                         pattern: Rc::new(self.pat_to_pattern(pat)?),
                     })
                 }
@@ -5073,7 +5141,11 @@ impl Env {
             }) => {
                 // todo: handle lifetime
                 self.type_to_type(elem).map(|type_| Type::Reference {
-                    unique: mutability.is_some(),
+                    kind: if mutability.is_some() {
+                        ReferenceKind::UniqueMutable
+                    } else {
+                        ReferenceKind::Shared
+                    },
                     type_: Rc::new(type_),
                 })
             }
