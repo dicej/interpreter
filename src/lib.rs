@@ -12,6 +12,7 @@ use {
         collections::{hash_map::Entry, BTreeMap, HashMap},
         error,
         fmt::{self, Display},
+        hash::{Hash, Hasher},
         iter, mem,
         num::ParseIntError,
         ops::{Add, Deref, DerefMut, Div, Mul, Neg, Rem, Sub},
@@ -21,12 +22,13 @@ use {
     },
     syn::{
         punctuated::Punctuated, AngleBracketedGenericArguments, Arm, BinOp, Block, Expr,
-        ExprAssign, ExprAssignOp, ExprBinary, ExprBlock, ExprBreak, ExprCall, ExprField, ExprIf,
-        ExprLit, ExprLoop, ExprMatch, ExprParen, ExprPath, ExprReference, ExprStruct, ExprTuple,
-        ExprUnary, FieldPat, Fields, FieldsNamed, FieldsUnnamed, GenericArgument, GenericParam,
-        Generics, ItemEnum, ItemStruct, Lit, LitBool, Local, Member, Pat, PatIdent, PatLit,
-        PatPath, PatReference, PatRest, PatStruct, PatTuple, PatTupleStruct, PatWild,
-        PathArguments, PathSegment, Stmt, TypePath, TypeReference, UnOp, Visibility,
+        ExprAssign, ExprAssignOp, ExprBinary, ExprBlock, ExprBreak, ExprCall, ExprClosure,
+        ExprField, ExprIf, ExprLit, ExprLoop, ExprMatch, ExprParen, ExprPath, ExprReference,
+        ExprStruct, ExprTuple, ExprUnary, FieldPat, Fields, FieldsNamed, FieldsUnnamed,
+        GenericArgument, GenericParam, Generics, ItemEnum, ItemStruct, Lit, LitBool, Local, Member,
+        Pat, PatIdent, PatLit, PatPath, PatReference, PatRest, PatStruct, PatTuple, PatTupleStruct,
+        PatWild, PathArguments, PathSegment, ReturnType, Stmt, TypePath, TypeReference, UnOp,
+        Visibility,
     },
 };
 
@@ -424,6 +426,7 @@ struct Trait {
 #[derive(Clone, Debug)]
 struct Impl {
     arguments: Rc<[Type]>,
+    types_: Rc<HashMap<NameId, Type>>,
     functions: Rc<HashMap<NameId, Abstraction>>,
 }
 
@@ -439,8 +442,31 @@ enum ReferenceKind {
     UniqueMutable,
 }
 
+#[derive(Clone, Debug)]
+struct Inferred {
+    id: usize,
+    // todo: may need to add trait bounds to this (inside the RefCell, to be updated as we learn more about how the
+    // type is used)
+    type_: Rc<RefCell<Type>>,
+}
+
+impl PartialEq for Inferred {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Inferred {}
+
+impl Hash for Inferred {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 enum Type {
+    Unknown,
     Never,
     Unit,
     Boolean,
@@ -468,6 +494,7 @@ enum Type {
         arguments: Rc<[Type]>,
     },
     Unresolved(Path),
+    Inferred(Inferred),
 }
 
 impl Type {
@@ -480,8 +507,8 @@ impl Type {
                 Integer::U16 | Integer::I16 => 2,
                 Integer::U32 | Integer::I32 => 4,
                 Integer::U64 | Integer::I64 => 8,
-                Integer::Usize | Integer::Isize => mem::size_of::<usize>(),
                 Integer::U128 | Integer::I128 => 16,
+                Integer::Usize | Integer::Isize => mem::size_of::<usize>(),
                 Integer::Unknown => unreachable!(),
             },
             Type::Nominal { size, .. } => *size,
@@ -614,6 +641,20 @@ impl Pattern {
     }
 }
 
+fn is_trivial(pat: &Pat) -> bool {
+    match pat {
+        Pat::Ident(PatIdent {
+            by_ref: None,
+            subpat: None,
+            ..
+        }) => true,
+
+        PatType { pat } => pat_is_trivial(pat),
+
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct MatchArm {
     pattern: Pattern,
@@ -662,6 +703,12 @@ impl Lens {
 struct Path {
     absolute: bool,
     segments: Rc<[NameId]>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CaptureStyle {
+    Move,
+    Infer,
 }
 
 #[derive(Clone, Debug)]
@@ -734,6 +781,13 @@ enum Term {
         name: NameId,
         type_: Type,
         mode: Rc<Cell<CaptureMode>>,
+    },
+    Closure {
+        capture_style: CaptureStyle,
+        parameters: Rc<[Term]>,
+        patterns: Rc<[Term]>,
+        return_type: Type,
+        body: Rc<Term>,
     },
     Unresolved(Path),
 }
@@ -1108,7 +1162,7 @@ struct StackData {
     offset: usize,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum CaptureMode {
     SharedReference,
     UniqueImmutableReference,
@@ -1118,8 +1172,7 @@ enum CaptureMode {
 
 #[derive(Debug)]
 struct ClosureContext {
-    // todo: add a field for whether it's a "move" closure here, or else a reference to the Term for the closure,
-    // perhaps
+    capture_style: CaptureStyle,
     boundary: usize,
     captures: HashMap<usize, Rc<Cell<CaptureMode>>>,
 }
@@ -1137,6 +1190,8 @@ pub struct Env {
     loops: Vec<Loop>,
     traits: HashMap<NameId, Trait>,
     impls: HashMap<(Type, Trait), Option<Impl>>,
+    fn_impls: HashMap<(Type, NameId), Option<Impl>>,
+    next_inferred_id: usize,
     unit: Literal,
     true_: Literal,
     false_: Literal,
@@ -1197,6 +1252,8 @@ impl Env {
             loops: Vec::new(),
             traits: HashMap::new(),
             impls: HashMap::new(),
+            fn_impls: HashMap::new(),
+            next_inferred_id: 0,
             unit: Literal {
                 offset: unit_offset,
                 type_: Type::Unit,
@@ -1544,6 +1601,9 @@ impl Env {
         //
         // If it's not an expression (i.e. it's an item), update the relevant symbol tables.  If it's an item with
         // code inside (e.g. an impl block or fn) do all of the above except evaluation.
+
+        // todo: if an error occurs anywhere here, either undo any state changes to self or restore from a clone
+        // taken prior to doing anything else.
 
         let binding_count = self.bindings.len();
 
@@ -2434,8 +2494,6 @@ impl Env {
                     let binding = &self.bindings[index];
 
                     let error = || {
-                        dbg!(binding.term.borrow().deref());
-
                         Err(anyhow!(
                             "use of or assignment to possibly-uninitialized variable: {}",
                             self.unintern(binding.name)
@@ -2468,6 +2526,7 @@ impl Env {
 
                 let type_ = self.type_check_binding(&term, expected_type)?.type_();
 
+                // todo: adjust index if we're in a closure context
                 Ok(Term::Variable { index, type_ })
             }
 
@@ -2757,18 +2816,17 @@ impl Env {
             }
 
             Term::Assignment { left, right } => {
-                dbg!(left);
                 match left.deref() {
                     Term::Unresolved(path) => {
-                        let left = dbg!(Rc::new(self.resolve_term(path, Rc::new([]))?));
+                        let left = Rc::new(self.resolve_term(path, Rc::new([]))?);
 
-                        dbg!(self.type_check(
+                        self.type_check(
                             &Term::Assignment {
                                 left,
                                 right: right.clone(),
                             },
                             expected_type,
-                        ))
+                        )
                     }
 
                     Term::Variable { index, .. } => {
@@ -3078,6 +3136,171 @@ impl Env {
                 self.type_check(&term, expected_type)
             }
 
+            Term::Closure {
+                capture_style,
+                parameters,
+                patterns,
+                return_type,
+                body,
+            } => {
+                let binding_count = self.bindings.len();
+
+                let mut context = Some(ClosureContext {
+                    capture_style: *capture_style,
+                    boundary: binding_count,
+                    captures: HashMap::new(),
+                });
+
+                mem::swap(&mut context, &mut self.closure_context);
+
+                let parameters = parameters
+                    .iter()
+                    .map(|parameter| self.type_check(parameter, None))
+                    .collect::<Result<_>>();
+
+                for pattern in patterns {
+                    self.type_check(pattern, None)?;
+                }
+
+                let body = self.type_check(body, return_type.as_ref())?;
+
+                let body_type = body.type_();
+
+                if let Some(return_type) = return_type.as_ref() {
+                    match_types(return_type, &body_type)?;
+                }
+
+                mem::swap(&mut context, &mut self.closure_context);
+
+                self.bindings.truncate(binding_count);
+
+                let context = context.unwrap();
+
+                let mut next_offset = 0;
+
+                let item = self.add_item(Item::Struct {
+                    parameters: Rc::new([]),
+
+                    fields: context.captures.iter().map(|(index, mode)| {
+                        let binding = &self.bindings[index];
+
+                        let type_ = binding.term.borrow().type_();
+
+                        let type_ = match mode.get() {
+                            CaptureMode::SharedReference => Type::Reference {
+                                kind: ReferenceKind::Shared,
+                                type_: Rc::new(type_),
+                            },
+                            CaptureMode::UniqueImmutableReference => Type::Reference {
+                                kind: ReferenceKind::UniqueImmutable,
+                                type_: Rc::new(type_),
+                            },
+                            CaptureMode::UniqueMutableReference => Type::Reference {
+                                kind: ReferenceKind::UniqueMutable,
+                                type_: Rc::new(type_),
+                            },
+                            CaptureMode::Move => type_,
+                        };
+
+                        let offset = next_offset;
+
+                        next_offset += type_.size();
+
+                        (binding.name, Field { type_, offset })
+                    }),
+
+                    methods: Rc::new([]),
+                });
+
+                let type_ = self.type_for_item(item);
+
+                // todo: do analysis to determine which combination of Fn, FnMut, and FnOnce to implement
+                let trait_name = self.intern("Fn");
+                let output_name = self.intern("Output");
+                let fn_name = self.intern("call");
+
+                let call = Abstraction {
+                    parameters: iter::once(Parameter {
+                        name: self_,
+                        mutable: false,
+                        type_: Type::Reference {
+                            kind: ReferenceKind::Shared,
+                            type_: Rc::new(type_.clone()),
+                        },
+                    })
+                    .chain(
+                        parameters
+                            .iter()
+                            .map(|term| {
+                                let (name, mutable) = if let Term::Let { pattern, .. } = term {
+                                    if let Pattern::Binding {
+                                        name, binding_mode, ..
+                                    } = pattern.deref()
+                                    {
+                                        (*name, matches!(binding_mode, BindingMode::MoveMut))
+                                    } else {
+                                        unreachable!()
+                                    }
+                                } else {
+                                    unreachable!()
+                                };
+
+                                Parameter {
+                                    name,
+                                    mutable,
+                                    type_: term.type_(),
+                                }
+                            })
+                            .collect(),
+                    ),
+                    body,
+                };
+
+                self.fn_impls.insert(
+                    (type_.clone(), trait_name),
+                    Impl {
+                        arguments: parameters.iter().map(|term| term.type_()).collect(),
+                        types_: Rc::new(hashmap![output_name => body_type]),
+                        functions: Rc::new(hashmap![fn_name => call]),
+                    },
+                );
+
+                Term::Struct {
+                    type_,
+                    arguments: context
+                        .captures
+                        .iter()
+                        .map(|(index, mode)| {
+                            let term = self.resolve_variable(index, mode.get());
+
+                            let term = match mode.get() {
+                                CaptureMode::SharedReference => {
+                                    Term::Reference(Rc::new(Reference {
+                                        kind: ReferenceKind::Shared,
+                                        term,
+                                    }))
+                                }
+                                CaptureMode::UniqueImmutableReference => {
+                                    Term::Reference(Rc::new(Reference {
+                                        kind: ReferenceKind::UniqueImmutable,
+                                        term,
+                                    }))
+                                }
+                                CaptureMode::UniqueMutableReference => {
+                                    Term::Reference(Rc::new(Reference {
+                                        kind: ReferenceKind::UniqueMutable,
+                                        term,
+                                    }))
+                                }
+                                CaptureMode::Move => term,
+                            };
+
+                            (self.bindings[index].name, term)
+                        })
+                        .collect(),
+                }
+            }
+
             Term::Application {
                 abstraction,
                 arguments,
@@ -3093,9 +3316,47 @@ impl Env {
 
                     self.type_check(&term, expected_type)
                 } else {
-                    Err(anyhow!(
-                        "application not yet supported for term {abstraction:?}"
-                    ))
+                    let abstraction = self.type_check(abstraction, None)?;
+
+                    let type_ = abstraction.type_();
+
+                    for name in ["Fn", "FnMut", "FnOnce"] {
+                        let name = self.intern(name);
+
+                        if let Some(Impl {
+                            arguments: impl_arguments,
+                            types_,
+                            functions,
+                        }) = self.fn_impls.get(&(type_.clone(), name))
+                        {
+                            return if impl_arguments.len() == arguments.len() {
+                                Ok(Term::Application {
+                                    abstraction,
+                                    type_: types_.iter().next().unwrap().clone(),
+                                    arguments: arguments
+                                        .iter()
+                                        .zip(impl_arguments.iter())
+                                        .map(|(argument, type_)| {
+                                            let argument =
+                                                self.type_check(argument, Some(type_))?;
+
+                                            match_types(type_, &argument.type_())?;
+
+                                            Ok(argument)
+                                        })
+                                        .collect::<Result<_>>()?,
+                                })
+                            } else {
+                                Err(anyhow!(
+                                    "incorrect arity for {type_} -- expected {}, got {}",
+                                    impl_arguments.len(),
+                                    arguments.len()
+                                ))
+                            };
+                        }
+                    }
+
+                    Err(anyhow!("Fn, FnMut, or FnOnce impl not found for {type_}"))
                 }
             }
 
@@ -3163,15 +3424,50 @@ impl Env {
                 }
             })
         } else if !path.absolute && path.segments.len() == 1 {
-            self.find_binding(path.segments[0])
-                .map(|index| Term::Variable {
-                    index,
-                    type_: Type::Never,
-                })
+            let name = path.segments[0];
+
+            self.find_binding(name)
+                .map(|index| self.resolve_variable(index, CaptureMode::SharedReference))
         } else {
             None
         }
         .ok_or_else(|| anyhow!("symbol not found: {}", self.unintern_path(path)))
+    }
+
+    fn resolve_variable(&mut self, index: usize, minimum_mode: CaptureMode) -> Term {
+        match self.closure_context.as_mut() {
+            Some(ClosureContext {
+                boundary,
+                captures,
+                capture_style,
+            }) if index < boundary => {
+                let minimum_mode = match capture_style {
+                    CaptureStyle::Move => CaptureMode::Move,
+                    CaptureMode::Infer => minimum_mode,
+                };
+
+                let mode = captures
+                    .entry(index)
+                    .and_modify(|cell| {
+                        if cell.get() < minimum_mode {
+                            cell.set(minimum_mode)
+                        }
+                    })
+                    .or_insert_with(Rc::new(Cell::new(minimum_mode)))
+                    .clone();
+
+                Term::Capture {
+                    name,
+                    mode,
+                    type_: Type::Never,
+                }
+            }
+
+            _ => Term::Variable {
+                index,
+                type_: Type::Never,
+            },
+        }
     }
 
     fn find_tuple_struct(&mut self, name: NameId) -> bool {
@@ -3997,6 +4293,7 @@ impl Env {
                     term: term.clone(),
                 });
 
+                // todo: adjust index if we're in a closure context
                 Ok(Pattern::Binding {
                     binding_mode: Some(binding_mode),
                     name: *name,
@@ -4081,15 +4378,12 @@ impl Env {
                 if !attrs.is_empty() {
                     Err(anyhow!("attributes not yet supported"))
                 } else {
+                    let trivial = is_trivial(pat);
+
                     let term = init
                         .as_ref()
                         .map(|(_, expr)| {
-                            if let Pat::Ident(PatIdent {
-                                by_ref: None,
-                                subpat: None,
-                                ..
-                            }) = pat
-                            {
+                            if trivial {
                                 // trivial pattern -- use the initializer directly
                                 self.expr_to_term(expr)
                             } else {
@@ -4761,8 +5055,107 @@ impl Env {
                 }
             }
 
+            Expr::Closure(ExprClosure {
+                movability,
+                asyncness,
+                capture,
+                inputs,
+                output,
+                body,
+                attrs,
+                ..
+            }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else if movability.is_some() {
+                    // todo: what is a "static" closure, anyway?
+                    Err(anyhow!("static closures not yet supported"))
+                } else if asyncness.is_some() {
+                    Err(anyhow!("async closures not yet supported"))
+                } else {
+                    let mut pats = Vec::with_capacity(inputs.len());
+
+                    let parameters = inputs
+                        .iter()
+                        .map(|pat| {
+                            // todo: use type ascription if present
+                            let index = self.bindings.len();
+                            let term = Term::Parameter(self.new_inferred_type());
+
+                            if is_trivial(pat) {
+                                Term::Let {
+                                    pattern: self.pat_to_pattern(pat)?,
+                                    term,
+                                }
+                            } else {
+                                pats.push((index, type_, pat));
+
+                                let name = self.intern(&index.to_string());
+
+                                self.bindings.push(Binding {
+                                    name,
+                                    mutable: true,
+                                    term: Rc::new(RefCell::new(term)),
+                                });
+
+                                Term::Let {
+                                    pattern: Rc::new(Pattern::Binding {
+                                        binding_mode: BindingMode::MoveMut,
+                                        name: *name,
+                                        index,
+                                        term,
+                                        subpattern: None,
+                                    }),
+                                    term: None,
+                                }
+                            }
+                        })
+                        .collect::<Result<_>>()?;
+
+                    Ok(Term::Closure {
+                        capture_style: if capture.is_some() {
+                            CaptureStyle::Move
+                        } else {
+                            CaptureStyle::Infer
+                        },
+
+                        parameters,
+
+                        patterns: pats
+                            .into_iter()
+                            .map(|(index, pat)| {
+                                Ok(Term::Let {
+                                    pattern: self.pat_to_pattern(pat)?,
+                                    term: Term::Variable {
+                                        index,
+                                        type_: Type::Never,
+                                    },
+                                })
+                            })
+                            .collect::<Result<_>>()?,
+
+                        return_type: if let ReturnType::Type(_, type_) = output {
+                            self.type_to_type(type_)?
+                        } else {
+                            self.new_inferred_type()
+                        },
+
+                        body: Rc::new(self.expr_to_term(body.deref())?),
+                    })
+                }
+            }
+
             _ => Err(anyhow!("expr not yet supported: {expr:#?}")),
         }
+    }
+
+    fn new_inferred_type(&mut self) -> Type {
+        let type_ = Type::Inferred(Inferred {
+            id: self.next_inferred_id,
+            type_: Rc::new(RefCell::new(Type::Unknown)),
+        });
+        self.next_inferred_id += 1;
+        type_
     }
 
     fn expr_to_referenced_term(&mut self, expr: &Expr) -> Result<Term> {
