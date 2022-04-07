@@ -445,8 +445,6 @@ enum ReferenceKind {
 #[derive(Clone, Debug)]
 struct Inferred {
     id: usize,
-    // todo: may need to add trait bounds to this (inside the RefCell, to be updated as we learn more about how the
-    // type is used)
     type_: Rc<RefCell<Rc<RefCell<Type>>>>,
 }
 
@@ -466,7 +464,7 @@ impl Hash for Inferred {
 
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 enum Type {
-    Unknown,
+    Unknown(Rc<[Trait]>),
     Never,
     Unit,
     Boolean,
@@ -1056,125 +1054,6 @@ impl fmt::Display for Eval {
 
         Ok(())
     }
-}
-
-fn unify(a: &Type, b: &Type) -> (Type, Type) {
-    match (a, b) {
-        (Type::Inferred(Inferred { type_: a, .. }), Type::Inferred(Inferred { type_: b, .. })) => {
-            if Rc::ptr_eq(a.borrow().deref(), b.borrow().deref()) {
-                let type_ = a.borrow().borrow().deref().clone();
-
-                (type_.clone(), type_)
-            } else {
-                let a_type = a.borrow().borrow().deref().clone();
-                let b_type = b.borrow().borrow().deref().clone();
-
-                match (&a_type, &b_type) {
-                    (Type::Never, _) | (_, Type::Never) => (a_type, b_type),
-
-                    (Type::Unknown, _) => {
-                        *a.borrow_mut() = b.borrow().deref().clone();
-
-                        (b_type.clone(), b_type)
-                    }
-
-                    (_, Type::Unknown) => {
-                        *b.borrow_mut() = a.borrow().deref().clone();
-
-                        (a_type.clone(), a_type)
-                    }
-
-                    _ => (a_type, b_type),
-                }
-            }
-        }
-
-        (Type::Inferred(Inferred { type_, .. }), Type::Never) => {
-            (type_.borrow().borrow().deref().clone(), Type::Never)
-        }
-
-        (Type::Inferred(Inferred { type_, .. }), _) => {
-            let type_ = type_.borrow();
-            let mut type_ = type_.borrow_mut();
-
-            (
-                match type_.deref() {
-                    Type::Unknown => {
-                        *type_ = b.clone();
-
-                        b.clone()
-                    }
-
-                    Type::Inferred(_) => unreachable!(),
-
-                    type_ => type_.clone(),
-                },
-                b.clone(),
-            )
-        }
-
-        (Type::Never, Type::Inferred(Inferred { type_, .. })) => {
-            (Type::Never, type_.borrow().borrow().deref().clone())
-        }
-
-        (_, Type::Inferred(Inferred { type_, .. })) => {
-            let type_ = type_.borrow();
-            let mut type_ = type_.borrow_mut();
-
-            (
-                a.clone(),
-                match type_.deref() {
-                    Type::Unknown => {
-                        *type_ = a.clone();
-
-                        a.clone()
-                    }
-
-                    Type::Inferred(_) => unreachable!(),
-
-                    type_ => type_.clone(),
-                },
-            )
-        }
-
-        _ => (a.clone(), b.clone()),
-    }
-}
-
-fn match_types(expected: &Type, actual: &Type) -> Result<()> {
-    // todo: this will need to be refined once we start doing real unification, and we'll probably need to move
-    // this function into Env's impl
-
-    let (expected, actual) = unify(expected, actual);
-
-    if expected != Type::Never && actual != Type::Never && expected != actual {
-        Err(anyhow!(
-            "type mismatch: expected {expected:?}, got {actual:?}"
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn match_types_for_pattern(mut scrutinee_type: &Type, pattern_type: &Type) -> Result<()> {
-    // todo: see todo in `match_types`
-
-    let orig_scrutinee_type = scrutinee_type;
-
-    while scrutinee_type != &Type::Never
-        && pattern_type != &Type::Never
-        && scrutinee_type != pattern_type
-    {
-        if let Type::Reference { type_, .. } = scrutinee_type {
-            scrutinee_type = type_.deref();
-        } else {
-            return Err(anyhow!(
-                "pattern type mismatch: expected {orig_scrutinee_type:?}, got {pattern_type:?}"
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -2640,6 +2519,8 @@ impl Env {
 
                 let type_ = term.type_();
 
+                // todo: defer impl lookup until type_ has been inferred (and add trait bound to type_)
+
                 let impl_ = self.get_impl(&type_, &trait_).ok_or_else(|| {
                     anyhow!("type {type_:?} is not compatible with unary operator {op:?}")
                 })?;
@@ -2705,6 +2586,8 @@ impl Env {
 
                         let left_type = left.type_();
 
+                        // todo: defer impl lookup until type_ has been inferred (and add trait bound to type_)
+
                         let impl_ = self.get_impl(&left_type, &trait_).ok_or_else(|| {
                             anyhow!(
                                 "type {left_type:?} is not compatible with binary operator {op:?}"
@@ -2729,7 +2612,7 @@ impl Env {
 
                 let right_type = right.type_();
 
-                match_types(&expected_type, &right_type)?;
+                self.match_types(&expected_type, &right_type)?;
 
                 let type_ = left.type_();
 
@@ -2869,7 +2752,7 @@ impl Env {
 
                         let guard_type = guard.type_();
 
-                        match_types(&Type::Boolean, &guard_type)?;
+                        self.match_types(&Type::Boolean, &guard_type)?;
 
                         Some(guard)
                     } else {
@@ -2884,7 +2767,7 @@ impl Env {
                     let body_type = body.type_();
 
                     if let Some(expected_type) = my_expected_type.as_ref() {
-                        match_types(expected_type, &body_type)?
+                        self.match_types(expected_type, &body_type)?
                     }
 
                     my_expected_type.get_or_insert(body_type);
@@ -2934,7 +2817,9 @@ impl Env {
 
                         let right_type = right.type_();
 
-                        match_types(&self.type_check_binding_index(index, None)?, &right_type)?;
+                        let left_type = self.type_check_binding_index(index, None)?;
+
+                        self.match_types(&left_type, &right_type)?;
 
                         match self.bindings[index].term.borrow_mut().deref_mut() {
                             BindingTerm::Uninitialized(type_) => {
@@ -2981,7 +2866,7 @@ impl Env {
 
                         let right_type = right.type_();
 
-                        match_types(&left_type, &right_type)?;
+                        self.match_types(&left_type, &right_type)?;
 
                         Ok(Term::Assignment {
                             left: Rc::new(left),
@@ -3076,15 +2961,15 @@ impl Env {
                             }
                         })
                 {
-                    let term = self.type_check(term, expected_type.as_ref());
+                    let term = self.type_check(term, expected_type.as_ref())?;
 
-                    let loop_ = &mut self.loops[index];
+                    let expected_type = {
+                        let loop_ = &mut self.loops[index];
 
-                    loop_.branch_context.record_and_reset(&mut self.bindings);
+                        loop_.branch_context.record_and_reset(&mut self.bindings);
 
-                    let term = term?;
+                        loop_.break_terms.push(term.clone());
 
-                    if let Some(expected_type) =
                         loop_
                             .break_terms
                             .iter()
@@ -3092,11 +2977,11 @@ impl Env {
                                 Type::Never => None,
                                 type_ => Some(type_),
                             })
-                    {
-                        match_types(&expected_type, &term.type_())?;
-                    }
+                    };
 
-                    loop_.break_terms.push(term.clone());
+                    if let Some(expected_type) = expected_type {
+                        self.match_types(&expected_type, &term.type_())?;
+                    }
 
                     Ok(Term::Break {
                         label,
@@ -3277,7 +3162,7 @@ impl Env {
 
                 let body_type = body.type_();
 
-                match_types(return_type, &body_type)?;
+                self.match_types(return_type, &body_type)?;
 
                 mem::swap(&mut context, &mut self.closure_context);
 
@@ -3482,7 +3367,7 @@ impl Env {
                                                 let argument =
                                                     self.type_check(argument, Some(type_))?;
 
-                                                match_types(type_, &argument.type_())?;
+                                                self.match_types(type_, &argument.type_())?;
 
                                                 Ok(argument)
                                             },
@@ -3505,6 +3390,141 @@ impl Env {
 
             _ => Err(anyhow!("type checking not yet supported for term {term:?}")),
         }
+    }
+
+    fn match_traits(&mut self, _type_: &Type, _traits: &[Trait]) -> Result<()> {
+        todo!()
+    }
+
+    fn unify(&mut self, a: &Type, b: &Type) -> Result<(Type, Type)> {
+        Ok(match (a, b) {
+            (
+                Type::Inferred(Inferred { type_: a, .. }),
+                Type::Inferred(Inferred { type_: b, .. }),
+            ) => {
+                if Rc::ptr_eq(a.borrow().deref(), b.borrow().deref()) {
+                    let type_ = a.borrow().borrow().deref().clone();
+
+                    (type_.clone(), type_)
+                } else {
+                    let a_type = a.borrow().borrow().deref().clone();
+                    let b_type = b.borrow().borrow().deref().clone();
+
+                    match (&a_type, &b_type) {
+                        (Type::Never, _) | (_, Type::Never) => (a_type, b_type),
+
+                        (Type::Unknown(traits), _) => {
+                            self.match_traits(&b_type, traits)?;
+
+                            *a.borrow_mut() = b.borrow().deref().clone();
+
+                            (b_type.clone(), b_type)
+                        }
+
+                        (_, Type::Unknown(traits)) => {
+                            self.match_traits(&b_type, traits)?;
+
+                            *b.borrow_mut() = a.borrow().deref().clone();
+
+                            (a_type.clone(), a_type)
+                        }
+
+                        _ => (a_type, b_type),
+                    }
+                }
+            }
+
+            (Type::Inferred(Inferred { type_, .. }), Type::Never) => {
+                (type_.borrow().borrow().deref().clone(), Type::Never)
+            }
+
+            (Type::Inferred(Inferred { type_, .. }), _) => {
+                let type_ = type_.borrow();
+                let mut type_ = type_.borrow_mut();
+
+                (
+                    match type_.deref() {
+                        Type::Unknown(traits) => {
+                            self.match_traits(b, traits)?;
+
+                            *type_ = b.clone();
+
+                            b.clone()
+                        }
+
+                        Type::Inferred(_) => unreachable!(),
+
+                        type_ => type_.clone(),
+                    },
+                    b.clone(),
+                )
+            }
+
+            (Type::Never, Type::Inferred(Inferred { type_, .. })) => {
+                (Type::Never, type_.borrow().borrow().deref().clone())
+            }
+
+            (_, Type::Inferred(Inferred { type_, .. })) => {
+                let type_ = type_.borrow();
+                let mut type_ = type_.borrow_mut();
+
+                (
+                    a.clone(),
+                    match type_.deref() {
+                        Type::Unknown(traits) => {
+                            self.match_traits(a, traits)?;
+
+                            *type_ = a.clone();
+
+                            a.clone()
+                        }
+
+                        Type::Inferred(_) => unreachable!(),
+
+                        type_ => type_.clone(),
+                    },
+                )
+            }
+
+            _ => (a.clone(), b.clone()),
+        })
+    }
+
+    fn match_types(&mut self, expected: &Type, actual: &Type) -> Result<()> {
+        let (expected, actual) = self.unify(expected, actual)?;
+
+        if expected != Type::Never && actual != Type::Never && expected != actual {
+            Err(anyhow!(
+                "type mismatch: expected {expected:?}, got {actual:?}"
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn match_types_for_pattern(
+        &mut self,
+        mut scrutinee_type: &Type,
+        pattern_type: &Type,
+    ) -> Result<()> {
+        // todo: do unification here like in match_types
+
+        let orig_scrutinee_type = scrutinee_type;
+
+        while scrutinee_type != &Type::Never
+            && pattern_type != &Type::Never
+            && scrutinee_type != pattern_type
+        {
+            if let Type::Reference { type_, .. } = scrutinee_type {
+                scrutinee_type = type_.deref();
+            } else {
+                return Err(anyhow!(
+                    "pattern type mismatch: expected {orig_scrutinee_type:?}, got {pattern_type:?}"
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     fn is_refutable(&self, pattern: &Pattern) -> bool {
@@ -3645,7 +3665,7 @@ impl Env {
                 {
                     let term = self.type_check(term, Some(expected_type))?;
 
-                    match_types(expected_type, &term.type_())?;
+                    self.match_types(expected_type, &term.type_())?;
 
                     Ok((*name, term))
                 } else {
@@ -3731,7 +3751,7 @@ impl Env {
                 .type_();
 
             if let Some(expected_type) = my_expected_type.as_ref() {
-                match_types(expected_type, &type_)?;
+                self.match_types(expected_type, &type_)?;
             }
 
             my_expected_type.get_or_insert(type_);
@@ -4249,7 +4269,7 @@ impl Env {
                                 )?;
 
                                 if *scrutinee_is_typed && scrutinee.is_some() {
-                                    match_types_for_pattern(&field.type_, &pattern.type_())?;
+                                    self.match_types_for_pattern(&field.type_, &pattern.type_())?;
                                 }
 
                                 Ok((name, pattern))
@@ -4509,7 +4529,7 @@ impl Env {
                 .map(|scrutinee| self.type_check(scrutinee, None))
                 .transpose()?
             {
-                match_types_for_pattern(&scrutinee.type_(), &pattern.type_())?;
+                self.match_types_for_pattern(&scrutinee.type_(), &pattern.type_())?;
             }
         }
 
@@ -5332,7 +5352,9 @@ impl Env {
     fn new_inferred_type(&mut self) -> Type {
         let type_ = Type::Inferred(Inferred {
             id: self.next_inferred_id,
-            type_: Rc::new(RefCell::new(Rc::new(RefCell::new(Type::Unknown)))),
+            type_: Rc::new(RefCell::new(Rc::new(RefCell::new(Type::Unknown(Rc::new(
+                [],
+            )))))),
         });
         self.next_inferred_id += 1;
         type_
@@ -6258,6 +6280,16 @@ mod test {
     fn bad_unique_immutable_ref_closure() {
         assert!(eval::<()>(
             "{ let mut y = 7; let z = &mut y; { let c = || *z += 2; let x = &z; c() } y }"
+        )
+        .is_err())
+    }
+
+    #[test]
+    // todo: we might not need full borrow checking to make this work
+    #[ignore = "borrow checker not yet implemented"]
+    fn bad_fn_once_closure() {
+        assert!(eval::<()>(
+            "{ struct Foo; let drop = move |_| (); let x = Foo; let once = move || drop(x); once(); once(); }"
         )
         .is_err())
     }
