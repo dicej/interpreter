@@ -447,7 +447,7 @@ struct Inferred {
     id: usize,
     // todo: may need to add trait bounds to this (inside the RefCell, to be updated as we learn more about how the
     // type is used)
-    type_: Rc<RefCell<Type>>,
+    type_: Rc<RefCell<Rc<RefCell<Type>>>>,
 }
 
 impl PartialEq for Inferred {
@@ -513,6 +513,7 @@ impl Type {
             },
             Type::Nominal { size, .. } => *size,
             Type::Reference { .. } => mem::size_of::<usize>(),
+            Type::Inferred(Inferred { type_, .. }) => type_.borrow().borrow().size(),
             _ => todo!("size for {self:?}"),
         }
     }
@@ -800,7 +801,6 @@ impl Term {
                 terms.last().map(|term| term.type_()).unwrap_or(Type::Unit)
             }
             Self::Sequence(terms) => terms.last().map(|term| term.type_()).unwrap_or(Type::Unit),
-            Self::Literal(literal) => literal.type_.clone(),
             // todo: the return type of an abstraction may be a function of its type parameters
             Self::Application { abstraction, .. } => {
                 if let Self::Abstraction(Abstraction { body, .. }) = abstraction.deref() {
@@ -826,7 +826,6 @@ impl Term {
                 }
                 _ => unreachable!(),
             },
-            Self::Variable { type_, .. } => type_.clone(),
             Self::Assignment { .. } | Self::Let { .. } => Type::Unit,
             Self::Match { arms, .. } => arms[0].body.type_(),
             Self::Break { .. } | Self::Return { .. } => Type::Never,
@@ -839,9 +838,12 @@ impl Term {
                 })
                 .unwrap(),
             Self::Reference(reference) => reference.type_(),
-            Self::Loop { type_, .. } => type_.clone(),
-            Self::Struct { type_, .. } => type_.clone(),
-            Self::Variant { type_, .. } => type_.clone(),
+            Self::Variable { type_, .. }
+            | Self::Loop { type_, .. }
+            | Self::Struct { type_, .. }
+            | Self::Variant { type_, .. }
+            | Self::Parameter(type_)
+            | Self::Literal(Literal { type_, .. }) => type_.clone(),
             Self::Field { lens, .. } => lens.type_(),
             _ => todo!("Term::type_ for {self:?}"),
         }
@@ -1058,9 +1060,41 @@ impl fmt::Display for Eval {
 
 fn unify(a: &Type, b: &Type) -> (Type, Type) {
     match (a, b) {
-        (Type::Inferred(_), Type::Inferred(_)) => todo!("unify two inferred types"),
+        (Type::Inferred(Inferred { type_: a, .. }), Type::Inferred(Inferred { type_: b, .. })) => {
+            if Rc::ptr_eq(a.borrow().deref(), b.borrow().deref()) {
+                let type_ = a.borrow().borrow().deref().clone();
+
+                (type_.clone(), type_)
+            } else {
+                let a_type = a.borrow().borrow().deref().clone();
+                let b_type = b.borrow().borrow().deref().clone();
+
+                match (&a_type, &b_type) {
+                    (Type::Never, _) | (_, Type::Never) => (a_type, b_type),
+
+                    (Type::Unknown, _) => {
+                        *a.borrow_mut() = b.borrow().deref().clone();
+
+                        (b_type.clone(), b_type)
+                    }
+
+                    (_, Type::Unknown) => {
+                        *b.borrow_mut() = a.borrow().deref().clone();
+
+                        (a_type.clone(), a_type)
+                    }
+
+                    _ => (a_type, b_type),
+                }
+            }
+        }
+
+        (Type::Inferred(Inferred { type_, .. }), Type::Never) => {
+            (type_.borrow().borrow().deref().clone(), Type::Never)
+        }
 
         (Type::Inferred(Inferred { type_, .. }), _) => {
+            let type_ = type_.borrow();
             let mut type_ = type_.borrow_mut();
 
             (
@@ -1079,7 +1113,12 @@ fn unify(a: &Type, b: &Type) -> (Type, Type) {
             )
         }
 
+        (Type::Never, Type::Inferred(Inferred { type_, .. })) => {
+            (Type::Never, type_.borrow().borrow().deref().clone())
+        }
+
         (_, Type::Inferred(Inferred { type_, .. })) => {
+            let type_ = type_.borrow();
             let mut type_ = type_.borrow_mut();
 
             (
@@ -1913,6 +1952,8 @@ impl Env {
 
                     mem::swap(&mut parameters, &mut self.bindings);
 
+                    result?;
+
                     let size = body.type_().size();
 
                     let limit = self.stack.offset;
@@ -1922,8 +1963,6 @@ impl Env {
                     self.heap.copy_within(src..limit, offset);
 
                     self.stack.offset = offset + size;
-
-                    return result;
                 } else {
                     todo!("eval abstraction before applying it")
                 }
@@ -2509,6 +2548,8 @@ impl Env {
 
     fn type_check(&mut self, term: &Term, expected_type: Option<&Type>) -> Result<Term> {
         match term {
+            Term::Parameter(_) => Ok(term.clone()),
+
             Term::Let { pattern, term } => {
                 let mut scrutinee_is_typed = false;
 
@@ -2570,8 +2611,14 @@ impl Env {
 
                 let type_ = self.type_check_binding(&term, expected_type)?.type_();
 
-                // todo: adjust index if we're in a closure context
-                Ok(Term::Variable { index, type_ })
+                Ok(Term::Variable {
+                    index: if let Some(context) = self.closure_context.as_ref() {
+                        index + 1 - context.boundary
+                    } else {
+                        index
+                    },
+                    type_,
+                })
             }
 
             Term::Literal(literal) => {
@@ -3196,7 +3243,30 @@ impl Env {
 
                 let parameters = parameters
                     .iter()
-                    .map(|parameter| self.type_check(parameter, None))
+                    .map(|parameter| {
+                        self.type_check(parameter, None)?;
+
+                        if let Term::Let {
+                            pattern,
+                            term: Some(term),
+                        } = parameter
+                        {
+                            if let Pattern::Binding {
+                                name, binding_mode, ..
+                            } = pattern.deref()
+                            {
+                                Ok(Parameter {
+                                    type_: term.type_(),
+                                    name: *name,
+                                    mutable: matches!(binding_mode, Some(BindingMode::MoveMut)),
+                                })
+                            } else {
+                                unreachable!("{:?}", pattern.deref())
+                            }
+                        } else {
+                            unreachable!("{:?}", term)
+                        }
+                    })
                     .collect::<Result<Vec<_>>>()?;
 
                 for pattern in patterns.iter() {
@@ -3296,26 +3366,7 @@ impl Env {
                             mutable: false,
                             type_: self_type,
                         })
-                        .chain(parameters.iter().map(|term| {
-                            let (name, mutable) = if let Term::Let { pattern, .. } = term {
-                                if let Pattern::Binding {
-                                    name, binding_mode, ..
-                                } = pattern.deref()
-                                {
-                                    (*name, matches!(binding_mode, Some(BindingMode::MoveMut)))
-                                } else {
-                                    unreachable!()
-                                }
-                            } else {
-                                unreachable!()
-                            };
-
-                            Parameter {
-                                name,
-                                mutable,
-                                type_: term.type_(),
-                            }
-                        }))
+                        .chain(parameters.iter().cloned())
                         .collect(),
 
                         body: Rc::new(body.clone()),
@@ -3324,8 +3375,13 @@ impl Env {
                     self.fn_impls.insert(
                         (type_.clone(), trait_name),
                         Impl {
-                            arguments: parameters.iter().skip(1).map(|term| term.type_()).collect(),
+                            arguments: parameters
+                                .iter()
+                                .map(|Parameter { type_, .. }| type_.clone())
+                                .collect(),
+
                             types_: Rc::new(hashmap![output_name => body_type.clone()]),
+
                             functions: Rc::new(hashmap![fn_name => call]),
                         },
                     );
@@ -4382,11 +4438,14 @@ impl Env {
                     offset: 0,
                 });
 
-                // todo: adjust index if we're in a closure context
                 Ok(Pattern::Binding {
                     binding_mode: Some(binding_mode),
                     name: *name,
-                    index: *index,
+                    index: if let Some(context) = self.closure_context.as_ref() {
+                        *index + 1 - context.boundary
+                    } else {
+                        *index
+                    },
                     subpattern,
                     term: term.clone(),
                 })
@@ -5172,19 +5231,33 @@ impl Env {
                 } else if asyncness.is_some() {
                     Err(anyhow!("async closures not yet supported"))
                 } else {
+                    let binding_count = self.bindings.len();
+
                     let mut pats = Vec::with_capacity(inputs.len());
+
+                    {
+                        let name = self.intern("self");
+
+                        self.bindings.push(Binding {
+                            name,
+                            mutable: false,
+                            term: Rc::new(RefCell::new(BindingTerm::UntypedAndUninitialized)),
+                            offset: 0,
+                        });
+                    }
 
                     let parameters = inputs
                         .iter()
                         .map(|pat| {
-                            // todo: use type ascription if present
                             let index = self.bindings.len();
-                            let term = Term::Parameter(self.new_inferred_type());
+
+                            // todo: use type ascription if present
+                            let term = Some(Rc::new(Term::Parameter(self.new_inferred_type())));
 
                             Ok(if is_trivial(pat) {
                                 Term::Let {
                                     pattern: Rc::new(self.pat_to_pattern(pat)?),
-                                    term: Some(Rc::new(term)),
+                                    term,
                                 }
                             } else {
                                 pats.push((index, pat));
@@ -5209,11 +5282,28 @@ impl Env {
                                         term: binding_term,
                                         subpattern: None,
                                     }),
-                                    term: Some(Rc::new(term)),
+                                    term,
                                 }
                             })
                         })
                         .collect::<Result<_>>()?;
+
+                    let patterns = pats
+                        .into_iter()
+                        .map(|(index, pat)| {
+                            Ok(Term::Let {
+                                pattern: Rc::new(self.pat_to_pattern(pat)?),
+                                term: Some(Rc::new(Term::Variable {
+                                    index,
+                                    type_: Type::Never,
+                                })),
+                            })
+                        })
+                        .collect::<Result<_>>()?;
+
+                    let body = Rc::new(self.expr_to_term(body.deref())?);
+
+                    self.bindings.truncate(binding_count);
 
                     Ok(Term::Closure {
                         capture_style: if capture.is_some() {
@@ -5222,28 +5312,15 @@ impl Env {
                             CaptureStyle::Infer
                         },
 
-                        parameters,
-
-                        patterns: pats
-                            .into_iter()
-                            .map(|(index, pat)| {
-                                Ok(Term::Let {
-                                    pattern: Rc::new(self.pat_to_pattern(pat)?),
-                                    term: Some(Rc::new(Term::Variable {
-                                        index,
-                                        type_: Type::Never,
-                                    })),
-                                })
-                            })
-                            .collect::<Result<_>>()?,
-
                         return_type: if let ReturnType::Type(_, type_) = output {
                             self.type_to_type(type_)?
                         } else {
                             self.new_inferred_type()
                         },
 
-                        body: Rc::new(self.expr_to_term(body.deref())?),
+                        parameters,
+                        patterns,
+                        body,
                     })
                 }
             }
@@ -5255,7 +5332,7 @@ impl Env {
     fn new_inferred_type(&mut self) -> Type {
         let type_ = Type::Inferred(Inferred {
             id: self.next_inferred_id,
-            type_: Rc::new(RefCell::new(Type::Unknown)),
+            type_: Rc::new(RefCell::new(Rc::new(RefCell::new(Type::Unknown)))),
         });
         self.next_inferred_id += 1;
         type_
