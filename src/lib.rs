@@ -14,7 +14,6 @@ use {
         fmt::{self, Display},
         hash::{Hash, Hasher},
         iter, mem,
-        num::ParseIntError,
         ops::{Add, Deref, DerefMut, Div, Mul, Neg, Rem, Sub},
         rc::Rc,
         str,
@@ -85,8 +84,7 @@ integer_to_bytes!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize
 macro_rules! integer_op_cases {
     ($fn:ident, $discriminator:expr, $arg:expr, $($pattern:pat, $type:path),+) => {
         match $discriminator {
-            $($pattern => $fn::<$type>($arg)),+,
-            _ => unreachable!(),
+            $($pattern => $fn::<$type>($arg)),+
         }
     }
 }
@@ -125,9 +123,18 @@ macro_rules! integer_op {
     };
 }
 
+macro_rules! integer_signed_op_cases {
+    ($fn:ident, $discriminator:expr, $arg:expr, $($pattern:pat, $type:path),+) => {
+        match $discriminator {
+            $($pattern => $fn::<$type>($arg)),+,
+            _ => unreachable!(),
+        }
+    }
+}
+
 macro_rules! integer_signed_op {
     ($fn:ident, $discriminator:expr, $arg:expr) => {
-        integer_op_cases!(
+        integer_signed_op_cases!(
             $fn,
             $discriminator,
             $arg,
@@ -339,7 +346,6 @@ impl ToBytes for bool {
 
 #[derive(Clone, Hash, Eq, PartialEq, Copy, Debug)]
 enum Integer {
-    Unknown,
     U8,
     U16,
     U32,
@@ -493,6 +499,11 @@ enum Type {
     },
     Unresolved(Path),
     Inferred(Inferred),
+    TraitArgument {
+        type_: Rc<Type>,
+        trait_: Trait,
+        index: usize,
+    },
 }
 
 impl Type {
@@ -507,13 +518,35 @@ impl Type {
                 Integer::U64 | Integer::I64 => 8,
                 Integer::U128 | Integer::I128 => 16,
                 Integer::Usize | Integer::Isize => mem::size_of::<usize>(),
-                Integer::Unknown => unreachable!(),
             },
             Type::Nominal { size, .. } => *size,
             Type::Reference { .. } => mem::size_of::<usize>(),
             Type::Inferred(Inferred { type_, .. }) => type_.borrow().borrow().size(),
+
             _ => todo!("size for {self:?}"),
         }
+    }
+
+    fn expect_trait(&self, trait_: &Trait) -> Result<()> {
+        #[allow(clippy::single_match)]
+        match self {
+            Type::Inferred(Inferred { type_, .. }) => {
+                if let Type::Unknown(traits) = type_.borrow().borrow_mut().deref_mut() {
+                    if !traits.contains(trait_) {
+                        *traits = traits
+                            .iter()
+                            .cloned()
+                            .chain(iter::once(trait_.clone()))
+                            .collect()
+                    }
+                }
+            }
+
+            // todo: for polymorphic type variables, return an error if they do not contain `trait_` as a bound
+            _ => (),
+        }
+
+        Ok(())
     }
 }
 
@@ -790,6 +823,11 @@ enum Term {
     },
     Parameter(Type),
     Unresolved(Path),
+    TraitFunction {
+        type_: Type,
+        trait_: Trait,
+        function: NameId,
+    },
 }
 
 impl Term {
@@ -989,18 +1027,15 @@ impl fmt::Debug for EvalResult {
 impl fmt::Display for EvalResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.type_ {
-            Type::Integer(integer) => match integer {
-                Integer::Unknown => str::from_utf8(&self.value).unwrap().fmt(f),
-                _ => {
-                    fn fmt<T: FromBytes + Display>(
-                        (f, value): (&mut fmt::Formatter<'_>, &[u8]),
-                    ) -> fmt::Result {
-                        write!(f, "{}_{}", T::from_bytes(value), any::type_name::<T>())
-                    }
-
-                    integer_op!(fmt, integer, (f, &self.value))
+            Type::Integer(integer) => {
+                fn fmt<T: FromBytes + Display>(
+                    (f, value): (&mut fmt::Formatter<'_>, &[u8]),
+                ) -> fmt::Result {
+                    write!(f, "{}_{}", T::from_bytes(value), any::type_name::<T>())
                 }
-            },
+
+                integer_op!(fmt, integer, (f, &self.value))
+            }
 
             Type::Boolean => bool::from_bytes(&self.value).fmt(f),
 
@@ -1596,7 +1631,7 @@ impl Env {
 
         self.bindings.truncate(binding_count);
 
-        let term = self.type_check(term, None)?;
+        let term = self.type_check(term)?;
 
         self.bindings.truncate(binding_count);
 
@@ -2425,7 +2460,7 @@ impl Env {
         })
     }
 
-    fn type_check(&mut self, term: &Term, expected_type: Option<&Type>) -> Result<Term> {
+    fn type_check(&mut self, term: &Term) -> Result<Term> {
         match term {
             Term::Parameter(_) => Ok(term.clone()),
 
@@ -2488,7 +2523,7 @@ impl Env {
                     binding.term.clone()
                 };
 
-                let type_ = self.type_check_binding(&term, expected_type)?.type_();
+                let type_ = self.type_check_binding(&term)?.type_();
 
                 Ok(Term::Variable {
                     index: if let Some(context) = self.closure_context.as_ref() {
@@ -2500,12 +2535,10 @@ impl Env {
                 })
             }
 
-            Term::Literal(literal) => {
-                Ok(Term::Literal(self.typed_literal(literal, expected_type)?))
-            }
+            Term::Literal(_) => Ok(term.clone()),
 
             Term::UnaryOp(op, term) => {
-                let term = self.type_check(term, expected_type)?;
+                let term = self.type_check(term)?;
 
                 let (trait_, function) = match op {
                     UnaryOp::Neg => ("Neg", "neg"),
@@ -2519,179 +2552,124 @@ impl Env {
 
                 let type_ = term.type_();
 
-                // todo: defer impl lookup until type_ has been inferred (and add trait bound to type_)
+                type_.expect_trait(&trait_)?;
 
-                let impl_ = self.get_impl(&type_, &trait_).ok_or_else(|| {
-                    anyhow!("type {type_:?} is not compatible with unary operator {op:?}")
-                })?;
+                let abstraction = Rc::new(Term::TraitFunction {
+                    type_,
+                    trait_,
+                    function,
+                });
 
-                let type_ = term.type_();
-
-                Ok(match (op, type_) {
-                    (UnaryOp::Neg, Type::Integer(_))
-                    | (UnaryOp::Not, Type::Boolean)
-                    | (UnaryOp::Deref, Type::Reference { .. }) => Term::UnaryOp(*op, Rc::new(term)),
-
-                    (UnaryOp::Deref, _) => Term::UnaryOp(
+                Ok(if let UnaryOp::Deref = op {
+                    Term::UnaryOp(
                         *op,
                         Rc::new(Term::Application {
-                            abstraction: Rc::new(Term::Abstraction(
-                                impl_.functions.get(&function).unwrap().clone(),
-                            )),
+                            abstraction,
                             arguments: Rc::new([Term::Reference(Rc::new(Reference {
                                 kind: ReferenceKind::Shared,
                                 term,
                             }))]),
                         }),
-                    ),
-
-                    _ => Term::Application {
-                        abstraction: Rc::new(Term::Abstraction(
-                            impl_.functions.get(&function).unwrap().clone(),
-                        )),
+                    )
+                } else {
+                    Term::Application {
+                        abstraction,
                         arguments: Rc::new([term]),
-                    },
+                    }
+                })
+            }
+
+            Term::BinaryOp(op @ (BinaryOp::And | BinaryOp::Or), left, right) => {
+                let left = self.type_check(left)?;
+
+                self.match_types(&Type::Boolean, &left.type_())?;
+
+                let branch_context = BranchContext::new(&self.bindings);
+
+                let right = self.type_check(right)?;
+
+                self.match_types(&Type::Boolean, &right.type_())?;
+
+                branch_context.reset(&mut self.bindings);
+
+                Ok(match op {
+                    BinaryOp::And => Term::And(Rc::new(left), Rc::new(right)),
+
+                    BinaryOp::Or => Term::Or(Rc::new(left), Rc::new(right)),
+
+                    _ => unreachable!(),
                 })
             }
 
             Term::BinaryOp(op, left, right) => {
-                let left = self.type_check(left, expected_type)?;
+                let left = self.type_check(left)?;
 
-                let (expected_type, impl_and_function) = match op {
-                    BinaryOp::And | BinaryOp::Or => (Type::Boolean, None),
+                let left_type = left.type_();
 
-                    _ => {
-                        let (trait_, function) = match op {
-                            BinaryOp::Add => ("Add", "add"),
-                            BinaryOp::Sub => ("Sub", "sub"),
-                            BinaryOp::Mul => ("Mul", "mul"),
-                            BinaryOp::Div => ("Div", "div"),
-                            BinaryOp::Rem => ("Rem", "rem"),
-                            BinaryOp::AddAssign => ("AddAssign", "add_assign"),
-                            BinaryOp::SubAssign => ("SubAssign", "sub_assign"),
-                            BinaryOp::MulAssign => ("MulAssign", "mul_assign"),
-                            BinaryOp::DivAssign => ("DivAssign", "div_assign"),
-                            BinaryOp::RemAssign => ("RemAssign", "rem_assign"),
-                            BinaryOp::Eq => ("PartialEq", "eq"),
-                            BinaryOp::Ge => ("PartialOrd", "ge"),
-                            BinaryOp::Gt => ("PartialOrd", "gt"),
-                            BinaryOp::Le => ("PartialOrd", "le"),
-                            BinaryOp::Lt => ("PartialOrd", "lt"),
-                            _ => unreachable!(),
-                        };
+                let (trait_, function) = match op {
+                    BinaryOp::Add => ("Add", "add"),
+                    BinaryOp::Sub => ("Sub", "sub"),
+                    BinaryOp::Mul => ("Mul", "mul"),
+                    BinaryOp::Div => ("Div", "div"),
+                    BinaryOp::Rem => ("Rem", "rem"),
+                    BinaryOp::AddAssign => ("AddAssign", "add_assign"),
+                    BinaryOp::SubAssign => ("SubAssign", "sub_assign"),
+                    BinaryOp::MulAssign => ("MulAssign", "mul_assign"),
+                    BinaryOp::DivAssign => ("DivAssign", "div_assign"),
+                    BinaryOp::RemAssign => ("RemAssign", "rem_assign"),
+                    BinaryOp::Eq => ("PartialEq", "eq"),
+                    BinaryOp::Ge => ("PartialOrd", "ge"),
+                    BinaryOp::Gt => ("PartialOrd", "gt"),
+                    BinaryOp::Le => ("PartialOrd", "le"),
+                    BinaryOp::Lt => ("PartialOrd", "lt"),
 
-                        let trait_ = self.intern(trait_);
-                        let trait_ = self.traits.get(&trait_).unwrap().clone();
-                        let function = self.intern(function);
-
-                        let left_type = left.type_();
-
-                        // todo: defer impl lookup until type_ has been inferred (and add trait bound to type_)
-
-                        let impl_ = self.get_impl(&left_type, &trait_).ok_or_else(|| {
-                            anyhow!(
-                                "type {left_type:?} is not compatible with binary operator {op:?}"
-                            )
-                        })?;
-
-                        (impl_.arguments[0].clone(), Some((impl_, function)))
-                    }
+                    _ => unreachable!(),
                 };
 
-                let branch_context = if let BinaryOp::And | BinaryOp::Or = op {
-                    Some(BranchContext::new(&self.bindings))
-                } else {
-                    None
-                };
+                let trait_ = self.intern(trait_);
+                let trait_ = self.traits.get(&trait_).unwrap().clone();
+                let function = self.intern(function);
 
-                let right = self.type_check(right, Some(&expected_type))?;
+                left_type.expect_trait(&trait_)?;
 
-                if let Some(branch_context) = branch_context {
-                    branch_context.reset(&mut self.bindings);
-                }
+                let right = self.type_check(right)?;
 
                 let right_type = right.type_();
 
-                self.match_types(&expected_type, &right_type)?;
+                self.match_types(
+                    &Type::TraitArgument {
+                        type_: Rc::new(left_type.clone()),
+                        trait_: trait_.clone(),
+                        index: 0,
+                    },
+                    &right_type,
+                )?;
 
-                let type_ = left.type_();
+                let abstraction = Rc::new(Term::TraitFunction {
+                    type_: left_type,
+                    trait_,
+                    function,
+                });
 
-                Ok(match (op, type_) {
-                    (BinaryOp::And, _) => Term::And(Rc::new(left), Rc::new(right)),
-
-                    (BinaryOp::Or, _) => Term::Or(Rc::new(left), Rc::new(right)),
-
-                    (
-                        BinaryOp::Add
-                        | BinaryOp::Sub
-                        | BinaryOp::Mul
-                        | BinaryOp::Div
-                        | BinaryOp::Rem
-                        | BinaryOp::Eq
-                        | BinaryOp::Ge
-                        | BinaryOp::Gt
-                        | BinaryOp::Le
-                        | BinaryOp::Lt,
-                        Type::Integer(_),
-                    ) => Term::BinaryOp(*op, Rc::new(left), Rc::new(right)),
-
-                    (
-                        BinaryOp::AddAssign
-                        | BinaryOp::SubAssign
-                        | BinaryOp::MulAssign
-                        | BinaryOp::DivAssign
-                        | BinaryOp::RemAssign,
-                        Type::Integer(_),
-                    ) => Term::Assignment {
-                        left: Rc::new(left.clone()),
-                        right: Rc::new(Term::BinaryOp(
-                            match op {
-                                BinaryOp::AddAssign => BinaryOp::Add,
-                                BinaryOp::SubAssign => BinaryOp::Sub,
-                                BinaryOp::MulAssign => BinaryOp::Mul,
-                                BinaryOp::DivAssign => BinaryOp::Div,
-                                BinaryOp::RemAssign => BinaryOp::Rem,
-                                _ => unreachable!(),
-                            },
-                            Rc::new(left),
-                            Rc::new(right),
-                        )),
+                Ok(match op {
+                    BinaryOp::AddAssign
+                    | BinaryOp::SubAssign
+                    | BinaryOp::MulAssign
+                    | BinaryOp::DivAssign
+                    | BinaryOp::RemAssign => Term::Application {
+                        abstraction,
+                        arguments: Rc::new([
+                            Term::Reference(Rc::new(Reference {
+                                kind: ReferenceKind::UniqueMutable,
+                                term: left,
+                            })),
+                            right,
+                        ]),
                     },
 
-                    (
-                        BinaryOp::AddAssign
-                        | BinaryOp::SubAssign
-                        | BinaryOp::MulAssign
-                        | BinaryOp::DivAssign
-                        | BinaryOp::RemAssign,
-                        _,
-                    ) => {
-                        let (impl_, function) = impl_and_function.unwrap();
-
+                    BinaryOp::Eq | BinaryOp::Ge | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Lt => {
                         Term::Application {
-                            abstraction: Rc::new(Term::Abstraction(
-                                impl_.functions.get(&function).unwrap().clone(),
-                            )),
-                            arguments: Rc::new([
-                                Term::Reference(Rc::new(Reference {
-                                    kind: ReferenceKind::UniqueMutable,
-                                    term: left,
-                                })),
-                                right,
-                            ]),
-                        }
-                    }
-
-                    (
-                        BinaryOp::Eq | BinaryOp::Ge | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Lt,
-                        _,
-                    ) => {
-                        let (impl_, function) = impl_and_function.unwrap();
-
-                        Term::Application {
-                            abstraction: Rc::new(Term::Abstraction(
-                                impl_.functions.get(&function).unwrap().clone(),
-                            )),
+                            abstraction,
                             arguments: Rc::new([
                                 Term::Reference(Rc::new(Reference {
                                     kind: ReferenceKind::Shared,
@@ -2705,16 +2683,10 @@ impl Env {
                         }
                     }
 
-                    _ => {
-                        let (impl_, function) = impl_and_function.unwrap();
-
-                        Term::Application {
-                            abstraction: Rc::new(Term::Abstraction(
-                                impl_.functions.get(&function).unwrap().clone(),
-                            )),
-                            arguments: Rc::new([left, right]),
-                        }
-                    }
+                    _ => Term::Application {
+                        abstraction,
+                        arguments: Rc::new([left, right]),
+                    },
                 })
             }
 
@@ -2748,7 +2720,7 @@ impl Env {
                     // todo: push and pop pattern bindings
 
                     let guard = if let Some(guard) = &arm.guard {
-                        let guard = self.type_check(guard, Some(&Type::Boolean))?;
+                        let guard = self.type_check(guard)?;
 
                         let guard_type = guard.type_();
 
@@ -2759,8 +2731,7 @@ impl Env {
                         None
                     };
 
-                    let body =
-                        self.type_check(&arm.body, my_expected_type.as_ref().or(expected_type))?;
+                    let body = self.type_check(&arm.body)?;
 
                     branch_context.record_and_reset(&mut self.bindings);
 
@@ -2794,13 +2765,10 @@ impl Env {
                     Term::Unresolved(path) => {
                         let left = Rc::new(self.resolve_term(path, Rc::new([]))?);
 
-                        self.type_check(
-                            &Term::Assignment {
-                                left,
-                                right: right.clone(),
-                            },
-                            expected_type,
-                        )
+                        self.type_check(&Term::Assignment {
+                            left,
+                            right: right.clone(),
+                        })
                     }
 
                     Term::Variable { index, .. } => {
@@ -2808,16 +2776,11 @@ impl Env {
 
                         // todo: check binding type ascription, if present
 
-                        let expected_type = match self.bindings[index].term.borrow().deref() {
-                            BindingTerm::Typed(term) => Some(term.type_()),
-                            _ => None,
-                        };
-
-                        let right = self.type_check(right, expected_type.as_ref())?;
+                        let right = self.type_check(right)?;
 
                         let right_type = right.type_();
 
-                        let left_type = self.type_check_binding_index(index, None)?;
+                        let left_type = self.type_check_binding_index(index)?;
 
                         self.match_types(&left_type, &right_type)?;
 
@@ -2854,7 +2817,7 @@ impl Env {
                     }
 
                     _ => {
-                        let left = self.type_check(left, None)?;
+                        let left = self.type_check(left)?;
 
                         if !self.is_mutable(&left) {
                             return Err(anyhow!("invalid assignment to immutable term"));
@@ -2862,7 +2825,7 @@ impl Env {
 
                         let left_type = left.type_();
 
-                        let right = self.type_check(right, Some(&left_type))?;
+                        let right = self.type_check(right)?;
 
                         let right_type = right.type_();
 
@@ -2886,7 +2849,7 @@ impl Env {
 
                 let terms = terms
                     .iter()
-                    .map(|term| self.type_check(term, None))
+                    .map(|term| self.type_check(term))
                     .collect::<Result<_>>()?;
 
                 self.type_check_bindings(binding_count)?;
@@ -2905,12 +2868,12 @@ impl Env {
             Term::Sequence(terms) => Ok(Term::Sequence(
                 terms
                     .iter()
-                    .map(|term| self.type_check(term, None))
+                    .map(|term| self.type_check(term))
                     .collect::<Result<_>>()?,
             )),
 
             Term::Phi(terms) => {
-                self.type_check_phi(terms, expected_type)?;
+                self.type_check_phi(terms)?;
 
                 Ok(Term::Phi(terms.clone()))
             }
@@ -2920,12 +2883,12 @@ impl Env {
 
                 self.loops.push(Loop {
                     label,
-                    expected_type: expected_type.cloned(),
+                    expected_type: None,
                     break_terms: Vec::new(),
                     branch_context: BranchContext::new(&self.bindings),
                 });
 
-                let body = self.type_check(body, None);
+                let body = self.type_check(body);
 
                 let mut loop_ = self.loops.pop().unwrap();
 
@@ -2948,20 +2911,20 @@ impl Env {
             Term::Break { label, term } => {
                 let label = *label;
 
-                if let Some((index, expected_type)) =
+                if let Some(index) =
                     self.loops
                         .iter()
                         .enumerate()
                         .rev()
                         .find_map(|(index, loop_)| {
                             if label.is_none() || loop_.label == label {
-                                Some((index, loop_.expected_type.clone()))
+                                Some(index)
                             } else {
                                 None
                             }
                         })
                 {
-                    let term = self.type_check(term, expected_type.as_ref())?;
+                    let term = self.type_check(term)?;
 
                     let expected_type = {
                         let loop_ = &mut self.loops[index];
@@ -3006,16 +2969,7 @@ impl Env {
             // todo: convert temporaries to bindings and variables as needed to ensure all references are to either
             // variables or field access chains to variables.
             Term::Reference(reference) => {
-                let term = self.type_check(
-                    &reference.term,
-                    expected_type.and_then(|expected| {
-                        if let Type::Reference { type_, .. } = expected {
-                            Some(type_.deref())
-                        } else {
-                            None
-                        }
-                    }),
-                )?;
+                let term = self.type_check(&reference.term)?;
 
                 if reference.kind == ReferenceKind::UniqueMutable && !self.is_mutable(&term) {
                     Err(anyhow!("invalid unique reference to immutable term"))
@@ -3031,7 +2985,7 @@ impl Env {
                 if let Type::Unresolved(path) = type_.deref() {
                     let term = self.resolve_term(path, arguments.clone())?;
 
-                    self.type_check(&term, expected_type)
+                    self.type_check(&term)
                 } else {
                     let error = || Err(anyhow!("attempt to initialize non-struct as a struct"));
 
@@ -3092,7 +3046,7 @@ impl Env {
             }
 
             Term::Field { base, name, .. } => {
-                let base = self.type_check(base, None)?;
+                let base = self.type_check(base)?;
 
                 let lens = self.resolve_field(&base.type_(), *name)?;
 
@@ -3106,7 +3060,7 @@ impl Env {
             Term::Unresolved(path) => {
                 let term = self.resolve_term(path, Rc::new([]))?;
 
-                self.type_check(&term, expected_type)
+                self.type_check(&term)
             }
 
             Term::Closure {
@@ -3129,7 +3083,7 @@ impl Env {
                 let parameters = parameters
                     .iter()
                     .map(|parameter| {
-                        self.type_check(parameter, None)?;
+                        self.type_check(parameter)?;
 
                         if let Term::Let {
                             pattern,
@@ -3155,10 +3109,10 @@ impl Env {
                     .collect::<Result<Vec<_>>>()?;
 
                 for pattern in patterns.iter() {
-                    self.type_check(pattern, None)?;
+                    self.type_check(pattern)?;
                 }
 
-                let body = self.type_check(body, Some(return_type))?;
+                let body = self.type_check(body)?;
 
                 let body_type = body.type_();
 
@@ -3321,9 +3275,9 @@ impl Env {
 
                     let term = self.resolve_term(path, arguments)?;
 
-                    self.type_check(&term, expected_type)
+                    self.type_check(&term)
                 } else {
-                    let term = self.type_check(abstraction, None)?;
+                    let term = self.type_check(abstraction)?;
 
                     let type_ = term.type_();
 
@@ -3364,8 +3318,7 @@ impl Env {
                                     arguments: iter::once(Ok(self_))
                                         .chain(arguments.iter().zip(impl_arguments.iter()).map(
                                             |(argument, type_)| {
-                                                let argument =
-                                                    self.type_check(argument, Some(type_))?;
+                                                let argument = self.type_check(argument)?;
 
                                                 self.match_types(type_, &argument.type_())?;
 
@@ -3392,11 +3345,19 @@ impl Env {
         }
     }
 
-    fn match_traits(&mut self, _type_: &Type, _traits: &[Trait]) -> Result<()> {
-        todo!()
+    fn match_traits(&mut self, type_: &Type, traits: &[Trait]) -> Result<()> {
+        for trait_ in traits {
+            if self.get_impl(type_, trait_).is_none() {
+                return Err(anyhow!("type {type_:?} is does not implement {trait_:?}"));
+            }
+        }
+
+        Ok(())
     }
 
     fn unify(&mut self, a: &Type, b: &Type) -> Result<(Type, Type)> {
+        // todo: how do we handle e.g. Type::TraitArgument and Type::TraitAssociatedType here?
+
         Ok(match (a, b) {
             (
                 Type::Inferred(Inferred { type_: a, .. }),
@@ -3658,14 +3619,10 @@ impl Env {
         arguments
             .iter()
             .map(|(name, term)| {
-                if let Some(Field {
-                    type_: expected_type,
-                    ..
-                }) = fields.get(name)
-                {
-                    let term = self.type_check(term, Some(expected_type))?;
+                if let Some(Field { type_, .. }) = fields.get(name) {
+                    let term = self.type_check(term)?;
 
-                    self.match_types(expected_type, &term.type_())?;
+                    self.match_types(type_, &term.type_())?;
 
                     Ok((*name, term))
                 } else {
@@ -3738,43 +3695,29 @@ impl Env {
         }
     }
 
-    fn type_check_phi(
-        &mut self,
-        terms: &[Rc<RefCell<BindingTerm>>],
-        expected_type: Option<&Type>,
-    ) -> Result<Option<Type>> {
-        let mut my_expected_type = None;
+    fn type_check_phi(&mut self, terms: &[Rc<RefCell<BindingTerm>>]) -> Result<Option<Type>> {
+        let mut expected_type = None;
 
         for term in terms.iter() {
-            let type_ = self
-                .type_check_binding(term, my_expected_type.as_ref().or(expected_type))?
-                .type_();
+            let type_ = self.type_check_binding(term)?.type_();
 
-            if let Some(expected_type) = my_expected_type.as_ref() {
+            if let Some(expected_type) = expected_type.as_ref() {
                 self.match_types(expected_type, &type_)?;
             }
 
-            my_expected_type.get_or_insert(type_);
+            expected_type.get_or_insert(type_);
         }
 
-        Ok(my_expected_type)
+        Ok(expected_type)
     }
 
-    fn type_check_binding_index(
-        &mut self,
-        index: usize,
-        expected_type: Option<&Type>,
-    ) -> Result<Type> {
+    fn type_check_binding_index(&mut self, index: usize) -> Result<Type> {
         let term = self.bindings[index].term.clone();
 
-        Ok(self.type_check_binding(&term, expected_type)?.type_())
+        Ok(self.type_check_binding(&term)?.type_())
     }
 
-    fn type_check_binding(
-        &mut self,
-        term: &RefCell<BindingTerm>,
-        expected_type: Option<&Type>,
-    ) -> Result<Term> {
+    fn type_check_binding(&mut self, term: &RefCell<BindingTerm>) -> Result<Term> {
         let untyped = match term.borrow().deref() {
             BindingTerm::Uninitialized(type_) => {
                 return Ok(Term::Literal(Literal {
@@ -3792,7 +3735,7 @@ impl Env {
             BindingTerm::Typed(term) => return Ok(term.clone()),
         };
 
-        let typed = self.type_check(&untyped, expected_type)?;
+        let typed = self.type_check(&untyped)?;
 
         *term.borrow_mut() = BindingTerm::Typed(typed.clone());
 
@@ -3811,13 +3754,10 @@ impl Env {
             .collect::<Vec<_>>();
 
         indexes.into_iter().try_for_each(|index| {
-            self.type_check(
-                &Term::Variable {
-                    index,
-                    type_: Type::Never,
-                },
-                None,
-            )
+            self.type_check(&Term::Variable {
+                index,
+                type_: Type::Never,
+            })
             .map(drop)
         })
     }
@@ -4038,42 +3978,6 @@ impl Env {
         }
     }
 
-    fn typed_literal(
-        &mut self,
-        literal: &Literal,
-        expected_type: Option<&Type>,
-    ) -> Result<Literal> {
-        // todo: if expected_type is a reference to (a reference to...) an integer type, use that since we may be
-        // type checking a pattern literal
-        Ok(if let Type::Integer(Integer::Unknown) = &literal.type_ {
-            let string = str::from_utf8(self.load_slice(literal.offset))
-                .unwrap()
-                .to_owned();
-
-            match expected_type.cloned() {
-                Some(Type::Integer(integer_type)) => {
-                    let integer_type = if let Integer::Unknown = integer_type {
-                        Integer::I32
-                    } else {
-                        integer_type
-                    };
-
-                    Literal {
-                        offset: integer_type.parse(self, &string)?,
-                        type_: Type::Integer(integer_type),
-                    }
-                }
-
-                _ => Literal {
-                    offset: self.store(string.parse::<i32>()?)?,
-                    type_: Type::Integer(Integer::I32),
-                },
-            }
-        } else {
-            literal.clone()
-        })
-    }
-
     fn resolve_pattern(
         &mut self,
         path: &Path,
@@ -4174,7 +4078,7 @@ impl Env {
         let item_type = self.type_for_item(item);
 
         let scrutinee = scrutinee
-            .map(|scrutinee| self.type_check(scrutinee, Some(&item_type)))
+            .map(|scrutinee| self.type_check(scrutinee))
             .transpose()?;
 
         *scrutinee_is_typed = true;
@@ -4318,14 +4222,12 @@ impl Env {
         match pattern {
             Pattern::Literal { required, .. } => {
                 let scrutinee = scrutinee
-                    .map(|scrutinee| self.type_check(scrutinee, Some(&required.type_())))
+                    .map(|scrutinee| self.type_check(scrutinee))
                     .transpose()?;
 
                 *scrutinee_is_typed = true;
 
-                let scrutinee_type = scrutinee.as_ref().map(|scrutinee| scrutinee.type_());
-
-                let required = self.type_check(required, scrutinee_type.as_ref())?;
+                let required = self.type_check(required)?;
 
                 let actual = scrutinee
                     .map(|scrutinee| {
@@ -4483,7 +4385,7 @@ impl Env {
 
                 if *scrutinee_is_typed {
                     if let Some(scrutinee) = scrutinee
-                        .map(|scrutinee| self.type_check(scrutinee, None))
+                        .map(|scrutinee| self.type_check(scrutinee))
                         .transpose()?
                     {
                         if let Type::Reference {
@@ -4526,7 +4428,7 @@ impl Env {
     ) -> Result<()> {
         if scrutinee_is_typed {
             if let Some(scrutinee) = scrutinee
-                .map(|scrutinee| self.type_check(scrutinee, None))
+                .map(|scrutinee| self.type_check(scrutinee))
                 .transpose()?
             {
                 self.match_types_for_pattern(&scrutinee.type_(), &pattern.type_())?;
@@ -4803,21 +4705,7 @@ impl Env {
             Term::Literal(Literal {
                 type_: Type::Integer(integer_type),
                 offset,
-            }) => match integer_type {
-                Integer::Unknown => {
-                    let s = str::from_utf8(self.load_slice(*offset)).unwrap();
-
-                    s.parse().map_err(|e: ParseIntError| {
-                        if s.parse::<u128>().is_ok() {
-                            anyhow!("u128 discriminants not yet supported")
-                        } else {
-                            e.into()
-                        }
-                    })
-                }
-
-                _ => Ok(integer_type.load_i128(self, *offset)),
-            },
+            }) => Ok(integer_type.load_i128(self, *offset)),
 
             Term::UnaryOp(UnaryOp::Neg, term) => Ok(-self.eval_discriminant(term)?),
 
@@ -4849,7 +4737,7 @@ impl Env {
                         Lit::Int(lit) => match lit.suffix() {
                             "" => Ok(Term::Literal(Literal {
                                 offset: self.store_slice(lit.base10_digits().as_bytes())?,
-                                type_: Type::Integer(Integer::Unknown),
+                                type_: self.new_inferred_type(),
                             })),
 
                             suffix => integer_suffix_op!(parse, suffix, self, lit.base10_digits()),
@@ -6285,7 +6173,7 @@ mod test {
     }
 
     #[test]
-    // todo: we might not need full borrow checking to make this work
+    // todo: we shouldn't need full borrow checking to make this work
     #[ignore = "borrow checker not yet implemented"]
     fn bad_fn_once_closure() {
         assert!(eval::<()>(
