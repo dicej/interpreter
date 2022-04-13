@@ -9,7 +9,7 @@ use {
     std::{
         any,
         cell::{Cell, RefCell},
-        collections::{hash_map::Entry, BTreeMap, HashMap},
+        collections::{hash_map::Entry, BTreeMap, HashMap, HashSet},
         error,
         fmt::{self, Display},
         hash::{Hash, Hasher},
@@ -450,13 +450,13 @@ enum ReferenceKind {
 
 #[derive(Clone, Debug)]
 struct Inferred {
-    id: usize,
+    index: usize,
     type_: Rc<RefCell<Rc<RefCell<Type>>>>,
 }
 
 impl PartialEq for Inferred {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+        self.index == other.index
     }
 }
 
@@ -464,13 +464,16 @@ impl Eq for Inferred {}
 
 impl Hash for Inferred {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
+        self.index.hash(state);
     }
 }
 
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 enum Type {
-    Unknown(Rc<[Trait]>),
+    Unknown(
+        // todo: make this an Rc<HashSet<Trait>>
+        Rc<[Trait]>,
+    ),
     Never,
     Unit,
     Boolean,
@@ -504,6 +507,11 @@ enum Type {
         trait_: Trait,
         index: usize,
     },
+    TraitAssociated {
+        type_: Rc<Type>,
+        trait_: Trait,
+        name: NameId,
+    },
 }
 
 impl Type {
@@ -521,30 +529,25 @@ impl Type {
             },
             Type::Nominal { size, .. } => *size,
             Type::Reference { .. } => mem::size_of::<usize>(),
-            Type::Inferred(Inferred { type_, .. }) => type_.borrow().borrow().size(),
 
             _ => todo!("size for {self:?}"),
         }
     }
 
     fn expect_trait(&self, trait_: &Trait) -> Result<()> {
-        #[allow(clippy::single_match)]
-        match self {
-            Type::Inferred(Inferred { type_, .. }) => {
-                if let Type::Unknown(traits) = type_.borrow().borrow_mut().deref_mut() {
-                    if !traits.contains(trait_) {
-                        *traits = traits
-                            .iter()
-                            .cloned()
-                            .chain(iter::once(trait_.clone()))
-                            .collect()
-                    }
+        if let Type::Inferred(Inferred { type_, .. }) = self {
+            if let Type::Unknown(traits) = type_.borrow().borrow_mut().deref_mut() {
+                if !traits.contains(trait_) {
+                    *traits = traits
+                        .iter()
+                        .cloned()
+                        .chain(iter::once(trait_.clone()))
+                        .collect()
                 }
             }
-
-            // todo: for polymorphic type variables, return an error if they do not contain `trait_` as a bound
-            _ => (),
         }
+
+        // todo: for polymorphic type variables, return an error if they do not contain `trait_` as a bound
 
         Ok(())
     }
@@ -828,6 +831,7 @@ enum Term {
         type_: Type,
         trait_: Trait,
         function: NameId,
+        return_type: Type,
     },
 }
 
@@ -839,13 +843,13 @@ impl Term {
             }
             Self::Sequence(terms) => terms.last().map(|term| term.type_()).unwrap_or(Type::Unit),
             // todo: the return type of an abstraction may be a function of its type parameters
-            Self::Application { abstraction, .. } => {
-                if let Self::Abstraction(Abstraction { body, .. }) = abstraction.deref() {
-                    body.type_()
-                } else {
-                    unreachable!()
-                }
-            }
+            Self::Application { abstraction, .. } => match abstraction.deref() {
+                Self::Abstraction(Abstraction { body, .. }) => body.type_(),
+
+                Self::TraitFunction { return_type, .. } => return_type.clone(),
+
+                _ => todo!("{:?}", abstraction.deref()),
+            },
             Self::And { .. } | Self::Or { .. } => Type::Boolean,
             Self::UnaryOp(op, term) => match op {
                 UnaryOp::Neg | UnaryOp::Not => term.type_(),
@@ -876,6 +880,7 @@ impl Term {
                 .unwrap(),
             Self::Reference(reference) => reference.type_(),
             Self::Variable { type_, .. }
+            | Self::Capture { type_, .. }
             | Self::Loop { type_, .. }
             | Self::Struct { type_, .. }
             | Self::Variant { type_, .. }
@@ -1189,7 +1194,8 @@ pub struct Env {
     traits: HashMap<NameId, Trait>,
     impls: HashMap<(Type, Trait), Option<Impl>>,
     fn_impls: HashMap<(Type, NameId), Impl>,
-    next_inferred_id: usize,
+    inferred_types: Vec<Rc<RefCell<Rc<RefCell<Type>>>>>,
+    integer_trait: Trait,
     unit: Literal,
     true_: Literal,
     false_: Literal,
@@ -1251,7 +1257,11 @@ impl Env {
             traits: HashMap::new(),
             impls: HashMap::new(),
             fn_impls: HashMap::new(),
-            next_inferred_id: 0,
+            inferred_types: Vec::new(),
+            integer_trait: Trait {
+                name: NameId(0),
+                parameters: Rc::new([]),
+            },
             unit: Literal {
                 offset: unit_offset,
                 type_: Type::Unit,
@@ -1265,6 +1275,8 @@ impl Env {
                 type_: Type::Boolean,
             },
         };
+
+        assert_eq!(env.integer_trait.name, env.intern("(integer)"));
 
         // todo: should load types, traits and impls from core/std source files (lazily if appropriate)
 
@@ -1637,6 +1649,10 @@ impl Env {
         self.bindings.truncate(binding_count);
 
         info!("typed: {term:#?}");
+
+        let term = self.infer_types(term)?;
+
+        info!("inferred: {term:#?}");
 
         match self.eval_term(&term) {
             Ok(_) => (),
@@ -2457,7 +2473,7 @@ impl Env {
 
             Pattern::Wildcard => true,
 
-            _ => todo!("match pattern {pattern:?}"),
+            _ => todo!("eval_pattern {pattern:?}"),
         })
     }
 
@@ -2512,7 +2528,7 @@ impl Env {
                 Ok(Term::Capture {
                     index: None,
                     name: *name,
-                    mode: *mode,
+                    mode: mode.clone(),
                     type_,
                 })
             }
@@ -2537,9 +2553,25 @@ impl Env {
                 type_.expect_trait(&trait_)?;
 
                 let abstraction = Rc::new(Term::TraitFunction {
-                    type_,
-                    trait_,
+                    type_: type_.clone(),
+                    trait_: trait_.clone(),
                     function,
+                    return_type: if let UnaryOp::Deref = op {
+                        Type::Reference {
+                            kind: ReferenceKind::Shared,
+                            type_: Rc::new(Type::TraitAssociated {
+                                type_: Rc::new(type_),
+                                trait_,
+                                name: self.intern("Target"),
+                            }),
+                        }
+                    } else {
+                        Type::TraitAssociated {
+                            type_: Rc::new(type_),
+                            trait_,
+                            name: self.intern("Output"),
+                        }
+                    },
                 });
 
                 Ok(if let UnaryOp::Deref = op {
@@ -2627,19 +2659,18 @@ impl Env {
                     &right_type,
                 )?;
 
-                let abstraction = Rc::new(Term::TraitFunction {
-                    type_: left_type,
-                    trait_,
-                    function,
-                });
-
                 Ok(match op {
                     BinaryOp::AddAssign
                     | BinaryOp::SubAssign
                     | BinaryOp::MulAssign
                     | BinaryOp::DivAssign
                     | BinaryOp::RemAssign => Term::Application {
-                        abstraction,
+                        abstraction: Rc::new(Term::TraitFunction {
+                            type_: left_type,
+                            trait_,
+                            function,
+                            return_type: Type::Unit,
+                        }),
                         arguments: Rc::new([
                             Term::Reference(Rc::new(Reference {
                                 kind: ReferenceKind::UniqueMutable,
@@ -2651,7 +2682,12 @@ impl Env {
 
                     BinaryOp::Eq | BinaryOp::Ge | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Lt => {
                         Term::Application {
-                            abstraction,
+                            abstraction: Rc::new(Term::TraitFunction {
+                                type_: left_type,
+                                trait_,
+                                function,
+                                return_type: Type::Boolean,
+                            }),
                             arguments: Rc::new([
                                 Term::Reference(Rc::new(Reference {
                                     kind: ReferenceKind::Shared,
@@ -2666,7 +2702,16 @@ impl Env {
                     }
 
                     _ => Term::Application {
-                        abstraction,
+                        abstraction: Rc::new(Term::TraitFunction {
+                            type_: left_type.clone(),
+                            trait_: trait_.clone(),
+                            function,
+                            return_type: Type::TraitAssociated {
+                                type_: Rc::new(left_type),
+                                trait_,
+                                name: self.intern("Output"),
+                            },
+                        }),
                         arguments: Rc::new([left, right]),
                     },
                 })
@@ -3108,42 +3153,44 @@ impl Env {
 
                 let mut next_offset = 0;
 
+                let fields = Rc::new(
+                    context
+                        .captures
+                        .iter()
+                        .map(|(index, mode)| {
+                            let binding = &self.bindings[*index];
+
+                            let type_ = binding.term.borrow().type_();
+
+                            let type_ = match mode.get() {
+                                CaptureMode::SharedReference => Type::Reference {
+                                    kind: ReferenceKind::Shared,
+                                    type_: Rc::new(type_),
+                                },
+                                CaptureMode::UniqueImmutableReference => Type::Reference {
+                                    kind: ReferenceKind::UniqueImmutable,
+                                    type_: Rc::new(type_),
+                                },
+                                CaptureMode::UniqueMutableReference => Type::Reference {
+                                    kind: ReferenceKind::UniqueMutable,
+                                    type_: Rc::new(type_),
+                                },
+                                CaptureMode::Move => type_,
+                            };
+
+                            let offset = next_offset;
+
+                            next_offset += type_.size();
+
+                            (binding.name, Field { type_, offset })
+                        })
+                        .collect::<HashMap<_, _>>(),
+                );
+
                 let item = self.add_item(Item::Struct {
                     parameters: Rc::new([]),
 
-                    fields: Rc::new(
-                        context
-                            .captures
-                            .iter()
-                            .map(|(index, mode)| {
-                                let binding = &self.bindings[*index];
-
-                                let type_ = binding.term.borrow().type_();
-
-                                let type_ = match mode.get() {
-                                    CaptureMode::SharedReference => Type::Reference {
-                                        kind: ReferenceKind::Shared,
-                                        type_: Rc::new(type_),
-                                    },
-                                    CaptureMode::UniqueImmutableReference => Type::Reference {
-                                        kind: ReferenceKind::UniqueImmutable,
-                                        type_: Rc::new(type_),
-                                    },
-                                    CaptureMode::UniqueMutableReference => Type::Reference {
-                                        kind: ReferenceKind::UniqueMutable,
-                                        type_: Rc::new(type_),
-                                    },
-                                    CaptureMode::Move => type_,
-                                };
-
-                                let offset = next_offset;
-
-                                next_offset += type_.size();
-
-                                (binding.name, Field { type_, offset })
-                            })
-                            .collect(),
-                    ),
+                    fields: fields.clone(),
 
                     methods: Rc::new([]),
                 });
@@ -3208,39 +3255,39 @@ impl Env {
                     );
                 }
 
+                let arguments = context
+                    .captures
+                    .iter()
+                    .map(|(index, mode)| {
+                        let term = self.resolve_variable(*index, mode.get());
+
+                        let term = match mode.get() {
+                            CaptureMode::SharedReference => Term::Reference(Rc::new(Reference {
+                                kind: ReferenceKind::Shared,
+                                term,
+                            })),
+                            CaptureMode::UniqueImmutableReference => {
+                                Term::Reference(Rc::new(Reference {
+                                    kind: ReferenceKind::UniqueImmutable,
+                                    term,
+                                }))
+                            }
+                            CaptureMode::UniqueMutableReference => {
+                                Term::Reference(Rc::new(Reference {
+                                    kind: ReferenceKind::UniqueMutable,
+                                    term,
+                                }))
+                            }
+                            CaptureMode::Move => term,
+                        };
+
+                        (self.bindings[*index].name, term)
+                    })
+                    .collect::<Box<[_]>>();
+
                 Ok(Term::Struct {
                     type_,
-                    arguments: context
-                        .captures
-                        .iter()
-                        .map(|(index, mode)| {
-                            let term = self.resolve_variable(*index, mode.get());
-
-                            let term = match mode.get() {
-                                CaptureMode::SharedReference => {
-                                    Term::Reference(Rc::new(Reference {
-                                        kind: ReferenceKind::Shared,
-                                        term,
-                                    }))
-                                }
-                                CaptureMode::UniqueImmutableReference => {
-                                    Term::Reference(Rc::new(Reference {
-                                        kind: ReferenceKind::UniqueImmutable,
-                                        term,
-                                    }))
-                                }
-                                CaptureMode::UniqueMutableReference => {
-                                    Term::Reference(Rc::new(Reference {
-                                        kind: ReferenceKind::UniqueMutable,
-                                        term,
-                                    }))
-                                }
-                                CaptureMode::Move => term,
-                            };
-
-                            (self.bindings[*index].name, term)
-                        })
-                        .collect(),
+                    arguments: self.type_check_arguments(fields.deref(), &arguments)?,
                 })
             }
 
@@ -3327,10 +3374,283 @@ impl Env {
         }
     }
 
+    fn infer_types(&mut self, term: &Term) -> Result<Term> {
+        let mut types = Vec::new();
+
+        mem::swap(&mut types, &mut self.inferred_types);
+
+        for type_ in types {
+            let type_ = type_.borrow().borrow_mut();
+
+            let is_integer = if let Type::Unknown(traits) = type_.deref() {
+                if traits.contains(&self.integer_trait) {
+                    true
+                } else {
+                    return Err(anyhow!("unable to infer type"));
+                }
+            } else {
+                false
+            };
+
+            *type_ = Type::Integer(Integer::I32);
+        }
+
+        Ok(self.flatten(term))
+    }
+
+    fn flatten(&mut self, term: &Term) -> Term {
+        match term {
+            Term::Block { scope, terms } => Term::Block {
+                scope: scope.clone(),
+                terms: terms.iter().map(|term| self.flatten(term)).collect(),
+            },
+            Term::Sequence(terms) => {
+                Term::Sequence(terms.iter().map(|term| self.flatten(term)).collect())
+            }
+            Term::Literal(Literal { offset, type_ }) => Term::Literal(Literal {
+                offset: *offset,
+                type_: self.flatten_type(type_),
+            }),
+            Term::Reference(reference) => Term::Reference(Rc::new(Reference {
+                kind: reference.kind,
+                term: self.flatten(&reference.term),
+            })),
+            Term::Let { pattern, .. } => Term::Let {
+                pattern: self.flatten_pattern(pattern),
+                term: None,
+            },
+            Term::Variable { index, .. } => Term::Variable {
+                index,
+                type_: Type::Never,
+            },
+            Term::Assignment { left, right } => Term::Assignment {
+                left: Rc::new(self.flatten(left)),
+                right: Rc::new(self.flatten(right)),
+            },
+            Term::Application {
+                abstraction,
+                arguments,
+            } => Term::Application {
+                abstraction: Rc::new(self.flatten(abstraction)),
+                arguments: arguments.map(|term| self.flatten(term)).collect(),
+            },
+            Term::And(left, right) => {
+                Term::And(Rc::new(self.flatten(left)), Rc::new(self.flatten(right)))
+            }
+            Term::Or(left, right) => {
+                Term::Or(Rc::new(self.flatten(left)), Rc::new(self.flatten(right)))
+            }
+            Term::UnaryOp(op, term) => Term::UnaryOp(*op, Rc::new(self.flatten(term))),
+            Term::BinaryOp(op, left, right) => Term::BinaryOp(
+                *op,
+                Rc::new(self.flatten(left)),
+                Rc::new(self.flatten(right)),
+            ),
+            Term::Match { scrutinee, arms } => Term::Match {
+                scrutinee: scrutinee.clone(),
+                arms: arms
+                    .iter()
+                    .map(
+                        |MatchArm {
+                             pattern,
+                             guard,
+                             body,
+                         }| {
+                            Ok(MatchArm {
+                                pattern: self.flatten_pattern(pattern),
+                                guard: guard.as_ref().map(|guard| self.flatten(guard)),
+                                body: self.flatten(body),
+                            })
+                        },
+                    )
+                    .collect(),
+            },
+            Term::Loop { label, body, .. } => Term::Loop {
+                label: *label,
+                body: Rc::new(self.flatten(body)),
+                type_: Type::Never,
+            },
+            Term::Break { label, term } => Term::Break {
+                label: *label,
+                term: Rc::new(self.flatten(term)),
+            },
+            Term::Struct { type_, arguments } => Term::Struct {
+                type_: self.flatten_type(type_),
+                arguments: arguments
+                    .iter()
+                    .map(|(name, term)| Ok((*name, self.flatten(term))))
+                    .collect(),
+            },
+            Term::Variant {
+                type_,
+                name,
+                arguments,
+            } => Term::Variant {
+                type_: self.flatten_type(type_),
+                name: *name,
+                arguments: arguments
+                    .iter()
+                    .map(|(name, term)| Ok((*name, self.flatten(term))))
+                    .collect(),
+            },
+            Term::Field { base, lens, name } => Term::Field {
+                base: Rc::new(self.flatten(base)),
+                lens: self.flatten_lens(lens),
+                name: *name,
+            },
+            Term::Capture {
+                index, name, mode, ..
+            } => Term::Capture {
+                index: *index,
+                name: *name,
+                mode: mode.clone(),
+                type_: Type::Never,
+            },
+            Term::TraitFunction {
+                type_,
+                trait_,
+                function,
+                ..
+            } => {
+                let type_ = self.flatten_type(type_);
+
+                Term::Abstraction(
+                    self.get_impl(&type_, trait_)
+                        .unwrap()
+                        .functions
+                        .get(function)
+                        .unwrap()
+                        .clone(),
+                )
+            }
+
+            _ => todo!("flatten for {term:?}"),
+        }
+    }
+
+    fn flatten_pattern(&mut self, pattern: &Pattern) -> Pattern {
+        match pattern {
+            Pattern::Literal { required, actual } => Pattern::Literal {
+                required: self.flatten(required),
+                actual: actual.as_ref().map(|actual| self.flatten(actual)),
+            },
+            Pattern::Variant {
+                required_discriminant,
+                actual_discriminant,
+                parameters,
+                ..
+            } => Pattern::Variant {
+                required_discriminant: *required_discriminant,
+                actual_discriminant: actual_discriminant
+                    .as_ref()
+                    .map(|actual| self.flatten(actual)),
+                parameters: parameters
+                    .iter()
+                    .map(|parameter| self.flatten_pattern(parameter))
+                    .collect(),
+                type_: Type::Never,
+            },
+            Pattern::Struct { parameters, .. } => Pattern::Struct {
+                parameters: parameters
+                    .iter()
+                    .map(|parameter| self.flatten_pattern(parameter))
+                    .collect(),
+                type_: Type::Never,
+            },
+            Pattern::Tuple(patterns) => Pattern::Tuple(
+                patterns
+                    .iter()
+                    .map(|pattern| self.flatten_pattern(pattern))
+                    .collect(),
+            ),
+            Pattern::Binding {
+                binding_mode,
+                name,
+                subpattern,
+                index,
+                term,
+            } => {
+                let mut term = term.borrow_mut();
+
+                *term = match term.deref() {
+                    BindingTerm::Uninitialized(type_) => {
+                        BindingTerm::Uninitialized(self.flatten_type(type_))
+                    }
+
+                    BindingTerm::Typed(term) => BindingTerm::Typed(self.flatten(term)),
+
+                    _ => unreachable!("{:?}", term.deref()),
+                };
+
+                Pattern::Binding {
+                    binding_mode: *binding_mode,
+                    name: *name,
+                    index: *index,
+                    subpattern: subpattern
+                        .as_ref()
+                        .map(|subpattern| self.flatten_pattern(subpattern)),
+                    term: term.clone(),
+                }
+            }
+            Pattern::Reference { kind, pattern } => Pattern::Reference {
+                kind: *kind,
+                pattern: Rc::new(self.flatten_pattern(pattern)),
+            },
+            _ => pattern.clone(),
+        }
+    }
+
+    fn flatten_lens(&mut self, lens: &Lens) -> Lens {
+        match lens {
+            Lens::Field(Field { type_, offset }) => Lens::Field(Field {
+                type_: self.flatten_type(type_),
+                offset: *offset,
+            }),
+            Lens::Reference(lens) => Lens::Reference(Rc::new(self.flatten_lens(lens))),
+            _ => unreachable!(),
+        }
+    }
+
+    fn flatten_type(&mut self, type_: &Type) -> Type {
+        match type_ {
+            Type::Inferred(Inferred { type_, .. }) => {
+                self.flatten_type(type_.borrow().borrow().deref())
+            }
+            Type::TraitArgument {
+                type_,
+                trait_,
+                index,
+            } => {
+                let type_ = self.flatten_type(type_);
+
+                self.get_impl(&type_, trait_).unwrap().arguments[index].clone()
+            }
+            Type::TraitAssociated { .. } => todo!(),
+            Type::Reference { kind, type_ } => Type::Reference {
+                kind: *kind,
+                type_: Rc::new(self.flatten_type(type_)),
+            },
+            Type::Nominal {
+                item,
+                size,
+                arguments,
+            } => Type::Nominal {
+                item: *item,
+                size: *size,
+                arguments: arguments
+                    .iter()
+                    .map(|argument| self.flatten_type(argument))
+                    .collect(),
+            },
+
+            _ => type_.clone(),
+        }
+    }
+
     fn match_traits(&mut self, type_: &Type, traits: &[Trait]) -> Result<()> {
         for trait_ in traits {
             if self.get_impl(type_, trait_).is_none() {
-                return Err(anyhow!("type {type_:?} is does not implement {trait_:?}"));
+                return Err(anyhow!("type {type_:?} does not implement {trait_:?}"));
             }
         }
 
@@ -3355,6 +3675,24 @@ impl Env {
 
                     match (&a_type, &b_type) {
                         (Type::Never, _) | (_, Type::Never) => (a_type, b_type),
+
+                        (Type::Unknown(a_traits), Type::Unknown(b_traits)) => {
+                            *a.borrow_mut() = b.borrow().deref().clone();
+
+                            let type_ = Type::Unknown(
+                                a_traits
+                                    .iter()
+                                    .chain(b_traits.iter())
+                                    .cloned()
+                                    .collect::<HashSet<_>>()
+                                    .into_iter()
+                                    .collect(),
+                            );
+
+                            *a.borrow().borrow_mut() = type_.clone();
+
+                            (type_.clone(), type_)
+                        }
 
                         (Type::Unknown(traits), _) => {
                             self.match_traits(&b_type, traits)?;
@@ -4756,7 +5094,7 @@ impl Env {
                         Lit::Int(lit) => match lit.suffix() {
                             "" => Ok(Term::Literal(Literal {
                                 offset: self.store_slice(lit.base10_digits().as_bytes())?,
-                                type_: self.new_inferred_type(),
+                                type_: self.new_inferred_type(&[self.integer_trait.clone()]),
                             })),
 
                             suffix => integer_suffix_op!(parse, suffix, self, lit.base10_digits()),
@@ -5179,7 +5517,7 @@ impl Env {
                             let index = self.bindings.len();
 
                             // todo: use type ascription if present
-                            let term = Some(Rc::new(Term::Parameter(self.new_inferred_type())));
+                            let term = Some(Rc::new(Term::Parameter(self.new_inferred_type(&[]))));
 
                             Ok(if is_trivial(pat) {
                                 Term::Let {
@@ -5242,7 +5580,7 @@ impl Env {
                         return_type: if let ReturnType::Type(_, type_) = output {
                             self.type_to_type(type_)?
                         } else {
-                            self.new_inferred_type()
+                            self.new_inferred_type(&[])
                         },
 
                         parameters,
@@ -5256,15 +5594,16 @@ impl Env {
         }
     }
 
-    fn new_inferred_type(&mut self) -> Type {
-        let type_ = Type::Inferred(Inferred {
-            id: self.next_inferred_id,
-            type_: Rc::new(RefCell::new(Rc::new(RefCell::new(Type::Unknown(Rc::new(
-                [],
-            )))))),
-        });
-        self.next_inferred_id += 1;
-        type_
+    fn new_inferred_type(&mut self, traits: &[Trait]) -> Type {
+        let index = self.inferred_types.len();
+
+        let type_ = Rc::new(RefCell::new(Rc::new(RefCell::new(Type::Unknown(
+            traits.iter().cloned().collect(),
+        )))));
+
+        self.inferred_types.push(type_.clone());
+
+        Type::Inferred(Inferred { index, type_ })
     }
 
     fn expr_to_referenced_term(&mut self, expr: &Expr) -> Result<Term> {
