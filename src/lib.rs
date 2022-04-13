@@ -810,6 +810,7 @@ enum Term {
         lens: Lens,
     },
     Capture {
+        index: Option<usize>,
         name: NameId,
         type_: Type,
         mode: Rc<Cell<CaptureMode>>,
@@ -2489,41 +2490,7 @@ impl Env {
             Term::Variable { index, .. } => {
                 let index = *index;
 
-                let term = {
-                    let binding = &self.bindings[index];
-
-                    let error = || {
-                        Err(anyhow!(
-                            "use of or assignment to possibly-uninitialized variable: {}",
-                            self.unintern(binding.name)
-                        ))
-                    };
-
-                    match binding.term.borrow().deref() {
-                        BindingTerm::Typed(Term::Phi(terms))
-                        | BindingTerm::Untyped(Term::Phi(terms)) => {
-                            if terms.iter().any(|term| {
-                                matches!(
-                                    term.borrow().deref(),
-                                    BindingTerm::Uninitialized(_)
-                                        | BindingTerm::UntypedAndUninitialized
-                                )
-                            }) {
-                                return error();
-                            }
-                        }
-
-                        BindingTerm::Uninitialized(_) | BindingTerm::UntypedAndUninitialized => {
-                            return error()
-                        }
-
-                        _ => (),
-                    }
-
-                    binding.term.clone()
-                };
-
-                let type_ = self.type_check_binding(&term)?.type_();
+                let type_ = self.type_check_variable(index)?;
 
                 Ok(Term::Variable {
                     index: if let Some(context) = self.closure_context.as_ref() {
@@ -2531,6 +2498,21 @@ impl Env {
                     } else {
                         index
                     },
+                    type_,
+                })
+            }
+
+            Term::Capture {
+                index, name, mode, ..
+            } => {
+                let index = index.unwrap();
+
+                let type_ = self.type_check_variable(index)?;
+
+                Ok(Term::Capture {
+                    index: None,
+                    name: *name,
+                    mode: *mode,
                     type_,
                 })
             }
@@ -3581,6 +3563,7 @@ impl Env {
                     .clone();
 
                 Term::Capture {
+                    index: Some(index),
                     name: self.bindings[index].name,
                     mode,
                     type_: Type::Never,
@@ -3740,6 +3723,42 @@ impl Env {
         *term.borrow_mut() = BindingTerm::Typed(typed.clone());
 
         Ok(typed)
+    }
+
+    fn type_check_variable(&mut self, index: usize) -> Result<Type> {
+        let term = {
+            let binding = &self.bindings[index];
+
+            let error = || {
+                Err(anyhow!(
+                    "use of or assignment to possibly-uninitialized variable: {}",
+                    self.unintern(binding.name)
+                ))
+            };
+
+            match binding.term.borrow().deref() {
+                BindingTerm::Typed(Term::Phi(terms)) | BindingTerm::Untyped(Term::Phi(terms)) => {
+                    if terms.iter().any(|term| {
+                        matches!(
+                            term.borrow().deref(),
+                            BindingTerm::Uninitialized(_) | BindingTerm::UntypedAndUninitialized
+                        )
+                    }) {
+                        return error();
+                    }
+                }
+
+                BindingTerm::Uninitialized(_) | BindingTerm::UntypedAndUninitialized => {
+                    return error()
+                }
+
+                _ => (),
+            }
+
+            binding.term.clone()
+        };
+
+        Ok(self.type_check_binding(&term)?.type_())
     }
 
     #[allow(clippy::needless_collect)]
