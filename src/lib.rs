@@ -553,6 +553,7 @@ fn match_types_for_pattern_now(mut scrutinee_type: &Type, pattern_type: &Type) -
     Ok(())
 }
 
+#[derive(Debug)]
 enum Constraint {
     Equal { expected: Type, actual: Type },
     PatternEqual { scrutinee: Type, pattern: Type },
@@ -1332,8 +1333,8 @@ impl Env {
         let unaries = &[
             (UnaryOp::Neg, "Neg", "neg", &signed as &[Type]),
             (UnaryOp::Not, "Not", "not", &[Type::Boolean]),
-            (UnaryOp::Not, "Deref", "deref", &[]),
-            (UnaryOp::Not, "DerefMut", "deref_mut", &[]),
+            (UnaryOp::Deref, "Deref", "deref", &[]),
+            (UnaryOp::Deref, "DerefMut", "deref_mut", &[]),
         ];
 
         for (op, name, function, types) in unaries {
@@ -1448,11 +1449,11 @@ impl Env {
         }
 
         let assignments = &[
-            (BinaryOp::AddAssign, "AddAssign", "add_assign", &integers),
-            (BinaryOp::SubAssign, "SubAssign", "sub_assign", &integers),
-            (BinaryOp::MulAssign, "MulAssign", "mul_assign", &integers),
-            (BinaryOp::DivAssign, "DivAssign", "div_assign", &integers),
-            (BinaryOp::RemAssign, "RemAssign", "rem_assign", &integers),
+            (BinaryOp::Add, "AddAssign", "add_assign", &integers),
+            (BinaryOp::Sub, "SubAssign", "sub_assign", &integers),
+            (BinaryOp::Mul, "MulAssign", "mul_assign", &integers),
+            (BinaryOp::Div, "DivAssign", "div_assign", &integers),
+            (BinaryOp::Rem, "RemAssign", "rem_assign", &integers),
         ];
 
         for (op, name, function, types) in assignments {
@@ -1768,7 +1769,7 @@ impl Env {
     }
 
     fn get_blanket_impl(&mut self, type_: &Type, trait_: &Trait) -> Option<Impl> {
-        if let Type::Reference { kind, .. } = type_ {
+        if let Type::Reference { kind, type_: inner } = type_ {
             let target_name = self.intern("Target");
 
             if trait_.name == self.intern("Deref") {
@@ -1785,15 +1786,18 @@ impl Env {
                         mutable: false,
                         type_: self_type.clone(),
                     }]),
-                    body: Rc::new(Term::Variable {
-                        index: 0,
-                        type_: self_type,
-                    }),
+                    body: Rc::new(Term::UnaryOp(
+                        UnaryOp::Deref,
+                        Rc::new(Term::Variable {
+                            index: 0,
+                            type_: self_type,
+                        }),
+                    )),
                 };
 
                 return Some(Impl {
                     arguments: Rc::new([]),
-                    types: Rc::new(hashmap![target_name => type_.clone()]),
+                    types: Rc::new(hashmap![target_name => inner.deref().clone()]),
                     functions: Rc::new(hashmap![function => abstraction]),
                 });
             } else if *kind == ReferenceKind::UniqueMutable
@@ -1812,15 +1816,18 @@ impl Env {
                         mutable: false,
                         type_: self_type.clone(),
                     }]),
-                    body: Rc::new(Term::Variable {
-                        index: 0,
-                        type_: self_type,
-                    }),
+                    body: Rc::new(Term::UnaryOp(
+                        UnaryOp::Deref,
+                        Rc::new(Term::Variable {
+                            index: 0,
+                            type_: self_type,
+                        }),
+                    )),
                 };
 
                 return Some(Impl {
                     arguments: Rc::new([]),
-                    types: Rc::new(hashmap![target_name => type_.clone()]),
+                    types: Rc::new(hashmap![target_name => inner.deref().clone()]),
                     functions: Rc::new(hashmap![function => abstraction]),
                 });
             }
@@ -1983,7 +1990,8 @@ impl Env {
                         | BinaryOp::Gt
                         | BinaryOp::Le
                         | BinaryOp::Lt => integer_comparison_ops!(op, integer_type, self)?,
-                        _ => unreachable!(),
+
+                        _ => unreachable!("{:?}", op),
                     },
                     _ => unreachable!(),
                 }
@@ -2549,6 +2557,12 @@ impl Env {
             Term::UnaryOp(op, term) => {
                 let term = self.type_check(term)?;
 
+                let type_ = term.type_();
+
+                if let (UnaryOp::Deref, Type::Reference { .. }) = (op, &type_) {
+                    return Ok(Term::UnaryOp(UnaryOp::Deref, Rc::new(term)));
+                }
+
                 let (trait_, function) = match op {
                     UnaryOp::Neg => ("Neg", "neg"),
                     UnaryOp::Not => ("Not", "not"),
@@ -2558,8 +2572,6 @@ impl Env {
                 let trait_ = self.intern(trait_);
                 let trait_ = self.traits.get(&trait_).unwrap().clone();
                 let function = self.intern(function);
-
-                let type_ = term.type_();
 
                 self.match_trait(&type_, &trait_)?;
 
@@ -2849,9 +2861,9 @@ impl Env {
                     _ => {
                         let left = self.type_check(left)?;
 
-                        if !self.is_mutable(&left) {
-                            return Err(anyhow!("invalid assignment to immutable term"));
-                        }
+                        let left = self.as_mutable(&left).ok_or_else(|| {
+                            anyhow!("invalid assignment to immutable term: {left:?}")
+                        })?;
 
                         let left_type = left.type_();
 
@@ -3001,14 +3013,18 @@ impl Env {
             Term::Reference(reference) => {
                 let term = self.type_check(&reference.term)?;
 
-                if reference.kind == ReferenceKind::UniqueMutable && !self.is_mutable(&term) {
-                    Err(anyhow!("invalid unique reference to immutable term"))
+                let term = if reference.kind == ReferenceKind::UniqueMutable {
+                    self.as_mutable(&term).ok_or_else(|| {
+                        anyhow!("invalid unique reference to immutable term: {term:?}")
+                    })?
                 } else {
-                    Ok(Term::Reference(Rc::new(Reference {
-                        kind: reference.kind,
-                        term,
-                    })))
-                }
+                    term
+                };
+
+                Ok(Term::Reference(Rc::new(Reference {
+                    kind: reference.kind,
+                    term,
+                })))
             }
 
             Term::Struct { type_, arguments } => {
@@ -3391,6 +3407,8 @@ impl Env {
         let mut progress;
         let mut inferred_integer_literals = false;
 
+        dbg!(&constraints);
+
         loop {
             progress = false;
 
@@ -3401,18 +3419,22 @@ impl Env {
                         let b = self.maybe_flatten_type(actual, &types)?;
 
                         match (&a, &b) {
+                            (Type::Never, _) | (_, Type::Never) => (),
+
                             (Type::Inferred(a), _) => {
                                 if !b.inferred() {
                                     types[*a] = Some(b.clone());
                                     progress = true;
                                 }
                             }
+
                             (_, Type::Inferred(b)) => {
                                 if !a.inferred() {
                                     types[*b] = Some(a.clone());
                                     progress = true;
                                 }
                             }
+
                             _ => {
                                 if !(a.inferred() || b.inferred()) {
                                     match_types_now(&a, &b)?;
@@ -3899,7 +3921,9 @@ impl Env {
     }
 
     fn match_types(&mut self, expected: &Type, actual: &Type) -> Result<()> {
-        if expected.inferred() || actual.inferred() {
+        if expected == &Type::Never || actual == &Type::Never || expected == actual {
+            Ok(())
+        } else if expected.inferred() || actual.inferred() {
             self.constraints.push(Constraint::Equal {
                 expected: expected.clone(),
                 actual: actual.clone(),
@@ -3907,7 +3931,9 @@ impl Env {
 
             Ok(())
         } else {
-            match_types_now(expected, actual)
+            Err(anyhow!(
+                "type mismatch: expected {expected:?}, got {actual:?}"
+            ))
         }
     }
 
@@ -3916,7 +3942,12 @@ impl Env {
         scrutinee_type: &Type,
         pattern_type: &Type,
     ) -> Result<()> {
-        if scrutinee_type.inferred() || pattern_type.inferred() {
+        if scrutinee_type == &Type::Never
+            || pattern_type == &Type::Never
+            || scrutinee_type == pattern_type
+        {
+            Ok(())
+        } else if scrutinee_type.inferred() || pattern_type.inferred() {
             self.constraints.push(Constraint::PatternEqual {
                 scrutinee: scrutinee_type.clone(),
                 pattern: pattern_type.clone(),
@@ -4116,21 +4147,80 @@ impl Env {
         }
     }
 
-    fn is_mutable(&self, term: &Term) -> bool {
+    fn as_mutable(&mut self, term: &Term) -> Option<Term> {
         match term {
-            Term::UnaryOp(UnaryOp::Deref, term) => {
-                if let Type::Reference { kind, .. } = term.type_() {
-                    kind == ReferenceKind::UniqueMutable
+            Term::UnaryOp(UnaryOp::Deref, inner) => match inner.deref() {
+                Term::Application {
+                    abstraction,
+                    arguments,
+                } => {
+                    if let (Term::TraitFunction { type_, .. }, Term::Reference(reference)) =
+                        (abstraction.deref(), &arguments[0])
+                    {
+                        let trait_ = self.intern("DerefMut");
+                        let trait_ = self.traits.get(&trait_).unwrap().clone();
+                        let function = self.intern("deref_mut");
+
+                        self.constraints.push(Constraint::Impl {
+                            type_: type_.clone(),
+                            trait_: trait_.clone(),
+                        });
+
+                        Some(Term::UnaryOp(
+                            UnaryOp::Deref,
+                            Rc::new(Term::Application {
+                                abstraction: Rc::new(Term::TraitFunction {
+                                    type_: type_.clone(),
+                                    trait_: trait_.clone(),
+                                    function,
+                                    return_type: Type::Reference {
+                                        kind: ReferenceKind::UniqueMutable,
+                                        type_: Rc::new(Type::TraitType {
+                                            type_: Rc::new(type_.clone()),
+                                            trait_,
+                                            name: self.intern("Target"),
+                                        }),
+                                    },
+                                }),
+                                arguments: Rc::new([Term::Reference(Rc::new(Reference {
+                                    kind: ReferenceKind::UniqueMutable,
+                                    term: reference.term.clone(),
+                                }))]),
+                            }),
+                        ))
+                    } else {
+                        unreachable!()
+                    }
+                }
+
+                _ => {
+                    if let Type::Reference { kind, .. } = inner.type_() {
+                        if kind == ReferenceKind::UniqueMutable {
+                            Some(term.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        unreachable!("{:?}", inner.type_())
+                    }
+                }
+            },
+
+            Term::Field { base, name, lens } => self.as_mutable(base).map(|base| Term::Field {
+                base: Rc::new(base),
+                name: *name,
+                lens: lens.clone(),
+            }),
+
+            Term::Variable { index, .. } => {
+                if self.bindings[*index].mutable {
+                    Some(term.clone())
                 } else {
-                    unreachable!()
+                    None
                 }
             }
 
-            Term::Field { base, .. } => self.is_mutable(base),
-
-            Term::Variable { index, .. } => self.bindings[*index].mutable,
-
-            Term::Literal(_) => true,
+            Term::Literal(_) => Some(term.clone()),
 
             _ => todo!("mutability of {term:?}"),
         }
@@ -4723,8 +4813,7 @@ impl Env {
                 complete,
             } => self.resolve_pattern(path, parameters, *complete, scrutinee, default_binding_mode),
 
-            // todo: will need to do a lot of the same work as resolve_pattern_parameters here, except we also need
-            // to avoid typing the scrutinee
+            // todo: will need to do a lot of the same work as resolve_pattern_parameters here
             Pattern::Tuple(_patterns) => todo!(),
 
             Pattern::Binding {
@@ -4745,16 +4834,18 @@ impl Env {
 
                 let scrutinee = scrutinee
                     .map(|scrutinee| {
-                        Ok(match binding_mode {
+                        Ok::<_, Error>(match binding_mode {
                             BindingMode::Move | BindingMode::MoveMut => scrutinee.clone(),
                             BindingMode::Ref | BindingMode::RefMut => {
                                 let unique = matches!(binding_mode, BindingMode::RefMut);
 
-                                if unique && !self.is_mutable(scrutinee) {
-                                    return Err(anyhow!(
-                                        "invalid unique reference to immutable term"
-                                    ));
-                                }
+                                let term = if unique {
+                                    self.as_mutable(scrutinee).ok_or_else(|| {
+                                        anyhow!("invalid unique reference to immutable term: {scrutinee:?}")
+                                    })?
+                                } else {
+                                    scrutinee.clone()
+                                };
 
                                 Term::Reference(Rc::new(Reference {
                                     kind: if unique {
@@ -4762,7 +4853,7 @@ impl Env {
                                     } else {
                                         ReferenceKind::Shared
                                     },
-                                    term: scrutinee.clone(),
+                                    term,
                                 }))
                             }
                         })
