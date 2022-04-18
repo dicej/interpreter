@@ -2580,20 +2580,24 @@ impl Env {
                     trait_: trait_.clone(),
                     function,
                     return_type: if let UnaryOp::Deref = op {
+                        let associated = Type::TraitType {
+                            type_: Rc::new(type_),
+                            trait_,
+                            name: self.intern("Target"),
+                        };
+
                         Type::Reference {
                             kind: ReferenceKind::Shared,
-                            type_: Rc::new(Type::TraitType {
-                                type_: Rc::new(type_),
-                                trait_,
-                                name: self.intern("Target"),
-                            }),
+                            type_: Rc::new(self.maybe_resolve(associated)?),
                         }
                     } else {
-                        Type::TraitType {
+                        let associated = Type::TraitType {
                             type_: Rc::new(type_),
                             trait_,
                             name: self.intern("Output"),
-                        }
+                        };
+
+                        self.maybe_resolve(associated)?
                     },
                 });
 
@@ -2673,14 +2677,13 @@ impl Env {
 
                 let right_type = right.type_();
 
-                self.match_types(
-                    &Type::TraitArgument {
-                        type_: Rc::new(left_type.clone()),
-                        trait_: trait_.clone(),
-                        index: 0,
-                    },
-                    &right_type,
-                )?;
+                let argument = self.maybe_resolve(Type::TraitArgument {
+                    type_: Rc::new(left_type.clone()),
+                    trait_: trait_.clone(),
+                    index: 0,
+                })?;
+
+                self.match_types(&argument, &right_type)?;
 
                 Ok(match op {
                     BinaryOp::AddAssign
@@ -2724,19 +2727,23 @@ impl Env {
                         }
                     }
 
-                    _ => Term::Application {
-                        abstraction: Rc::new(Term::TraitFunction {
-                            type_: left_type.clone(),
+                    _ => {
+                        let associated = Type::TraitType {
+                            type_: Rc::new(left_type.clone()),
                             trait_: trait_.clone(),
-                            function,
-                            return_type: Type::TraitType {
-                                type_: Rc::new(left_type),
+                            name: self.intern("Output"),
+                        };
+
+                        Term::Application {
+                            abstraction: Rc::new(Term::TraitFunction {
+                                type_: left_type,
                                 trait_,
-                                name: self.intern("Output"),
-                            },
-                        }),
-                        arguments: Rc::new([left, right]),
-                    },
+                                function,
+                                return_type: self.maybe_resolve(associated)?,
+                            }),
+                            arguments: Rc::new([left, right]),
+                        }
+                    }
                 })
             }
 
@@ -3393,6 +3400,14 @@ impl Env {
         }
     }
 
+    fn maybe_resolve(&mut self, type_: Type) -> Result<Type> {
+        if type_.inferred() {
+            Ok(type_)
+        } else {
+            self.maybe_flatten_type(&type_, &[])
+        }
+    }
+
     fn infer_types(&mut self, term: &Term) -> Result<Term> {
         let mut types = vec![None; self.next_inferred_index];
 
@@ -3407,7 +3422,7 @@ impl Env {
         let mut progress;
         let mut inferred_integer_literals = false;
 
-        dbg!(&constraints);
+        info!("constraints: {constraints:#?}");
 
         loop {
             progress = false;
@@ -3459,11 +3474,17 @@ impl Env {
                             if trait_ == &self.integer_trait {
                                 integers.insert(*index);
                             }
-                        } else if !(type_.inferred()
-                            || trait_ == &self.integer_trait
-                            || self.get_impl(&type_, trait_).is_some())
-                        {
-                            return Err(anyhow!("type {type_:?} does not implement {trait_:?}"));
+                        } else if !type_.inferred() {
+                            if trait_ == &self.integer_trait {
+                                if let Type::Integer(_) = type_ {
+                                } else {
+                                    return Err(anyhow!("expected integer, got {type_:?}"));
+                                }
+                            } else if self.get_impl(&type_, trait_).is_none() {
+                                return Err(anyhow!(
+                                    "type {type_:?} does not implement {trait_:?}"
+                                ));
+                            }
                         }
                     }
                 }
@@ -4166,20 +4187,22 @@ impl Env {
                             trait_: trait_.clone(),
                         });
 
+                        let associated = Type::TraitType {
+                            type_: Rc::new(type_.clone()),
+                            trait_: trait_.clone(),
+                            name: self.intern("Target"),
+                        };
+
                         Some(Term::UnaryOp(
                             UnaryOp::Deref,
                             Rc::new(Term::Application {
                                 abstraction: Rc::new(Term::TraitFunction {
                                     type_: type_.clone(),
-                                    trait_: trait_.clone(),
+                                    trait_,
                                     function,
                                     return_type: Type::Reference {
                                         kind: ReferenceKind::UniqueMutable,
-                                        type_: Rc::new(Type::TraitType {
-                                            type_: Rc::new(type_.clone()),
-                                            trait_,
-                                            name: self.intern("Target"),
-                                        }),
+                                        type_: Rc::new(self.maybe_resolve(associated).ok()?),
                                     },
                                 }),
                                 arguments: Rc::new([Term::Reference(Rc::new(Reference {
