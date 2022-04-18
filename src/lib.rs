@@ -12,7 +12,7 @@ use {
         collections::{hash_map::Entry, BTreeMap, HashMap, HashSet},
         error,
         fmt::{self, Display},
-        hash::{Hash, Hasher},
+        hash::Hash,
         iter, mem,
         ops::{Add, Deref, DerefMut, Div, Mul, Neg, Rem, Sub},
         rc::Rc,
@@ -432,7 +432,7 @@ struct Trait {
 #[derive(Clone, Debug)]
 struct Impl {
     arguments: Rc<[Type]>,
-    types_: Rc<HashMap<NameId, Type>>,
+    types: Rc<HashMap<NameId, Type>>,
     functions: Rc<HashMap<NameId, Abstraction>>,
 }
 
@@ -448,32 +448,8 @@ enum ReferenceKind {
     UniqueMutable,
 }
 
-#[derive(Clone, Debug)]
-struct Inferred {
-    index: usize,
-    type_: Rc<RefCell<Rc<RefCell<Type>>>>,
-}
-
-impl PartialEq for Inferred {
-    fn eq(&self, other: &Self) -> bool {
-        self.index == other.index
-    }
-}
-
-impl Eq for Inferred {}
-
-impl Hash for Inferred {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.index.hash(state);
-    }
-}
-
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 enum Type {
-    Unknown(
-        // todo: make this an Rc<HashSet<Trait>>
-        Rc<[Trait]>,
-    ),
     Never,
     Unit,
     Boolean,
@@ -501,13 +477,13 @@ enum Type {
         arguments: Rc<[Type]>,
     },
     Unresolved(Path),
-    Inferred(Inferred),
+    Inferred(usize),
     TraitArgument {
         type_: Rc<Type>,
         trait_: Trait,
         index: usize,
     },
-    TraitAssociated {
+    TraitType {
         type_: Rc<Type>,
         trait_: Trait,
         name: NameId,
@@ -534,23 +510,53 @@ impl Type {
         }
     }
 
-    fn expect_trait(&self, trait_: &Trait) -> Result<()> {
-        if let Type::Inferred(Inferred { type_, .. }) = self {
-            if let Type::Unknown(traits) = type_.borrow().borrow_mut().deref_mut() {
-                if !traits.contains(trait_) {
-                    *traits = traits
-                        .iter()
-                        .cloned()
-                        .chain(iter::once(trait_.clone()))
-                        .collect()
-                }
-            }
+    fn inferred(&self) -> bool {
+        match self {
+            Type::Inferred(_) => true,
+
+            Type::TraitArgument { type_, .. }
+            | Type::TraitType { type_, .. }
+            | Type::Reference { type_, .. } => type_.inferred(),
+
+            // todo: recurse for Nominal, Array, Tuple, etc.
+            _ => false,
         }
+    }
+}
 
-        // todo: for polymorphic type variables, return an error if they do not contain `trait_` as a bound
-
+fn match_types_now(expected: &Type, actual: &Type) -> Result<()> {
+    if expected != &Type::Never && actual != &Type::Never && expected != actual {
+        Err(anyhow!(
+            "type mismatch: expected {expected:?}, got {actual:?}"
+        ))
+    } else {
         Ok(())
     }
+}
+
+fn match_types_for_pattern_now(mut scrutinee_type: &Type, pattern_type: &Type) -> Result<()> {
+    let orig_scrutinee_type = scrutinee_type;
+
+    while scrutinee_type != &Type::Never
+        && pattern_type != &Type::Never
+        && scrutinee_type != pattern_type
+    {
+        if let Type::Reference { type_, .. } = scrutinee_type {
+            scrutinee_type = type_.deref();
+        } else {
+            return Err(anyhow!(
+                "pattern type mismatch: expected {orig_scrutinee_type:?}, got {pattern_type:?}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+enum Constraint {
+    Equal { expected: Type, actual: Type },
+    PatternEqual { scrutinee: Type, pattern: Type },
+    Impl { type_: Type, trait_: Trait },
 }
 
 #[derive(Clone, Debug)]
@@ -1194,7 +1200,9 @@ pub struct Env {
     traits: HashMap<NameId, Trait>,
     impls: HashMap<(Type, Trait), Option<Impl>>,
     fn_impls: HashMap<(Type, NameId), Impl>,
-    inferred_types: Vec<Rc<RefCell<Rc<RefCell<Type>>>>>,
+    next_inferred_index: usize,
+    constraints: Vec<Constraint>,
+    self_type: Option<Type>,
     integer_trait: Trait,
     unit: Literal,
     true_: Literal,
@@ -1257,7 +1265,9 @@ impl Env {
             traits: HashMap::new(),
             impls: HashMap::new(),
             fn_impls: HashMap::new(),
-            inferred_types: Vec::new(),
+            next_inferred_index: 0,
+            constraints: Vec::new(),
+            self_type: None,
             integer_trait: Trait {
                 name: NameId(0),
                 parameters: Rc::new([]),
@@ -1276,7 +1286,9 @@ impl Env {
             },
         };
 
-        assert_eq!(env.integer_trait.name, env.intern("(integer)"));
+        let integer_trait_name = env.intern("(integer)");
+
+        assert_eq!(env.integer_trait.name, integer_trait_name);
 
         // todo: should load types, traits and impls from core/std source files (lazily if appropriate)
 
@@ -1354,7 +1366,7 @@ impl Env {
                     (type_.clone(), trait_.clone()),
                     Some(Impl {
                         arguments: Rc::new([]),
-                        types_: Rc::new(hashmap![output_name => type_.clone()]),
+                        types: Rc::new(hashmap![output_name => type_.clone()]),
                         functions: Rc::new(hashmap![function => abstraction]),
                     }),
                 );
@@ -1428,7 +1440,7 @@ impl Env {
                     (type_.clone(), trait_.clone()),
                     Some(Impl {
                         arguments: Rc::new([type_.clone()]),
-                        types_: Rc::new(hashmap![output_name => type_.clone()]),
+                        types: Rc::new(hashmap![output_name => type_.clone()]),
                         functions: Rc::new(hashmap![function => abstraction]),
                     }),
                 );
@@ -1501,7 +1513,7 @@ impl Env {
                     (type_.clone(), trait_.clone()),
                     Some(Impl {
                         arguments: Rc::new([type_.clone()]),
-                        types_: Rc::new(HashMap::new()),
+                        types: Rc::new(HashMap::new()),
                         functions: Rc::new(hashmap![function => abstraction]),
                     }),
                 );
@@ -1581,7 +1593,7 @@ impl Env {
                     (type_.clone(), trait_.clone()),
                     Some(Impl {
                         arguments: Rc::new([type_.clone()]),
-                        types_: Rc::new(HashMap::new()),
+                        types: Rc::new(HashMap::new()),
                         functions: Rc::new(functions),
                     }),
                 );
@@ -1623,7 +1635,7 @@ impl Env {
 
         let binding_count = self.bindings.len();
 
-        let term = &self.stmt_to_term(&stmt)?;
+        let term = self.stmt_to_term(&stmt)?;
 
         let uninitialized_bindings = self.bindings[binding_count..].iter().any(|binding| {
             matches!(
@@ -1644,13 +1656,13 @@ impl Env {
 
         self.bindings.truncate(binding_count);
 
-        let term = self.type_check(term)?;
+        let term = self.type_check(&term)?;
 
         self.bindings.truncate(binding_count);
 
         info!("typed: {term:#?}");
 
-        let term = self.infer_types(term)?;
+        let term = self.infer_types(&term)?;
 
         info!("inferred: {term:#?}");
 
@@ -1781,7 +1793,7 @@ impl Env {
 
                 return Some(Impl {
                     arguments: Rc::new([]),
-                    types_: Rc::new(hashmap![target_name => type_.clone()]),
+                    types: Rc::new(hashmap![target_name => type_.clone()]),
                     functions: Rc::new(hashmap![function => abstraction]),
                 });
             } else if *kind == ReferenceKind::UniqueMutable
@@ -1808,7 +1820,7 @@ impl Env {
 
                 return Some(Impl {
                     arguments: Rc::new([]),
-                    types_: Rc::new(hashmap![target_name => type_.clone()]),
+                    types: Rc::new(hashmap![target_name => type_.clone()]),
                     functions: Rc::new(hashmap![function => abstraction]),
                 });
             }
@@ -1847,7 +1859,9 @@ impl Env {
                 self.push_literal(&literal)?;
             }
 
-            Term::Literal(literal) => self.push_literal(literal)?,
+            Term::Literal(literal) => {
+                self.push_literal(literal)?;
+            }
 
             Term::Application {
                 abstraction,
@@ -1858,7 +1872,6 @@ impl Env {
                 }) = abstraction.deref()
                 {
                     let offset = self.stack.offset;
-                    dbg!(offset);
 
                     let mut parameters = arguments
                         .iter()
@@ -2482,16 +2495,14 @@ impl Env {
             Term::Parameter(_) => Ok(term.clone()),
 
             Term::Let { pattern, term } => {
-                let mut scrutinee_is_typed = false;
+                let term = term
+                    .as_deref()
+                    .map(|term| self.type_check(term))
+                    .transpose()?;
 
-                let pattern = self.type_check_pattern(
-                    pattern,
-                    term.as_deref(),
-                    BindingMode::Move,
-                    &mut scrutinee_is_typed,
-                )?;
+                let pattern = self.type_check_pattern(pattern, term.as_ref(), BindingMode::Move)?;
 
-                self.maybe_match_types_for_pattern(term.as_deref(), &pattern, scrutinee_is_typed)?;
+                self.maybe_match_types_for_pattern(term.as_ref(), &pattern)?;
 
                 if self.is_refutable(&pattern) {
                     Err(anyhow!("expected irrefutable pattern; got {pattern:?}"))
@@ -2550,7 +2561,7 @@ impl Env {
 
                 let type_ = term.type_();
 
-                type_.expect_trait(&trait_)?;
+                self.match_trait(&type_, &trait_)?;
 
                 let abstraction = Rc::new(Term::TraitFunction {
                     type_: type_.clone(),
@@ -2559,14 +2570,14 @@ impl Env {
                     return_type: if let UnaryOp::Deref = op {
                         Type::Reference {
                             kind: ReferenceKind::Shared,
-                            type_: Rc::new(Type::TraitAssociated {
+                            type_: Rc::new(Type::TraitType {
                                 type_: Rc::new(type_),
                                 trait_,
                                 name: self.intern("Target"),
                             }),
                         }
                     } else {
-                        Type::TraitAssociated {
+                        Type::TraitType {
                             type_: Rc::new(type_),
                             trait_,
                             name: self.intern("Output"),
@@ -2644,7 +2655,7 @@ impl Env {
                 let trait_ = self.traits.get(&trait_).unwrap().clone();
                 let function = self.intern(function);
 
-                left_type.expect_trait(&trait_)?;
+                self.match_trait(&left_type, &trait_)?;
 
                 let right = self.type_check(right)?;
 
@@ -2706,7 +2717,7 @@ impl Env {
                             type_: left_type.clone(),
                             trait_: trait_.clone(),
                             function,
-                            return_type: Type::TraitAssociated {
+                            return_type: Type::TraitType {
                                 type_: Rc::new(left_type),
                                 trait_,
                                 name: self.intern("Output"),
@@ -2718,31 +2729,23 @@ impl Env {
             }
 
             Term::Match { scrutinee, arms } => {
+                let scrutinee = self.type_check(scrutinee)?;
+
                 let mut my_expected_type = None;
 
                 let mut branch_context = BranchContext::new(&self.bindings);
 
                 let mut typed_arms = Vec::with_capacity(arms.len());
 
-                let mut scrutinee_is_typed = false;
-
                 let binding_count = self.bindings.len();
 
                 // todo: exhaustiveness check
 
                 for arm in arms.iter() {
-                    let pattern = self.type_check_pattern(
-                        &arm.pattern,
-                        Some(scrutinee),
-                        BindingMode::Move,
-                        &mut scrutinee_is_typed,
-                    )?;
+                    let pattern =
+                        self.type_check_pattern(&arm.pattern, Some(&scrutinee), BindingMode::Move)?;
 
-                    self.maybe_match_types_for_pattern(
-                        Some(scrutinee),
-                        &pattern,
-                        scrutinee_is_typed,
-                    )?;
+                    self.match_types_for_pattern(&scrutinee.type_(), &pattern.type_())?;
 
                     // todo: push and pop pattern bindings
 
@@ -3248,7 +3251,7 @@ impl Env {
                                 .map(|Parameter { type_, .. }| type_.clone())
                                 .collect(),
 
-                            types_: Rc::new(hashmap![output_name => body_type.clone()]),
+                            types: Rc::new(hashmap![output_name => body_type.clone()]),
 
                             functions: Rc::new(hashmap![fn_name => call]),
                         },
@@ -3375,76 +3378,174 @@ impl Env {
     }
 
     fn infer_types(&mut self, term: &Term) -> Result<Term> {
-        let mut types = Vec::new();
+        let mut types = vec![None; self.next_inferred_index];
 
-        mem::swap(&mut types, &mut self.inferred_types);
+        self.next_inferred_index = 0;
 
-        for type_ in types {
-            let type_ = type_.borrow().borrow_mut();
+        let mut constraints = Vec::new();
 
-            let is_integer = if let Type::Unknown(traits) = type_.deref() {
-                if traits.contains(&self.integer_trait) {
-                    true
-                } else {
-                    return Err(anyhow!("unable to infer type"));
+        mem::swap(&mut constraints, &mut self.constraints);
+
+        let mut integers = HashSet::new();
+
+        let mut progress;
+        let mut inferred_integer_literals = false;
+
+        loop {
+            progress = false;
+
+            for constraint in &constraints {
+                match constraint {
+                    Constraint::Equal { expected, actual } => {
+                        let a = self.maybe_flatten_type(expected, &types)?;
+                        let b = self.maybe_flatten_type(actual, &types)?;
+
+                        match (&a, &b) {
+                            (Type::Inferred(a), _) => {
+                                if !b.inferred() {
+                                    types[*a] = Some(b.clone());
+                                    progress = true;
+                                }
+                            }
+                            (_, Type::Inferred(b)) => {
+                                if !a.inferred() {
+                                    types[*b] = Some(a.clone());
+                                    progress = true;
+                                }
+                            }
+                            _ => {
+                                if !(a.inferred() || b.inferred()) {
+                                    match_types_now(&a, &b)?;
+                                }
+                            }
+                        }
+                    }
+
+                    Constraint::PatternEqual { scrutinee, pattern } => {
+                        let a = self.maybe_flatten_type(scrutinee, &types)?;
+                        let b = self.maybe_flatten_type(pattern, &types)?;
+
+                        if !(a.inferred() || b.inferred()) {
+                            match_types_for_pattern_now(&a, &b)?;
+                        }
+                    }
+
+                    Constraint::Impl { type_, trait_ } => {
+                        let type_ = self.maybe_flatten_type(type_, &types)?;
+
+                        if let Type::Inferred(index) = &type_ {
+                            if trait_ == &self.integer_trait {
+                                integers.insert(*index);
+                            }
+                        } else if !(type_.inferred()
+                            || trait_ == &self.integer_trait
+                            || self.get_impl(&type_, trait_).is_some())
+                        {
+                            return Err(anyhow!("type {type_:?} does not implement {trait_:?}"));
+                        }
+                    }
                 }
-            } else {
-                false
-            };
+            }
 
-            *type_ = Type::Integer(Integer::I32);
+            if !(progress || inferred_integer_literals) {
+                for (index, type_) in types.iter_mut().enumerate() {
+                    if type_.is_none() && integers.contains(&index) {
+                        *type_ = Some(Type::Integer(Integer::I32));
+                        progress = true;
+                    }
+                }
+
+                inferred_integer_literals = true;
+            }
+
+            if !progress {
+                break;
+            }
         }
 
-        Ok(self.flatten(term))
+        self.flatten_term(
+            term,
+            &types
+                .into_iter()
+                .map(|type_| type_.ok_or_else(|| anyhow!("unable to infer type")))
+                .collect::<Result<Box<[_]>>>()?,
+        )
     }
 
-    fn flatten(&mut self, term: &Term) -> Term {
-        match term {
+    fn flatten_term(&mut self, term: &Term, types: &[Type]) -> Result<Term> {
+        Ok(match term {
             Term::Block { scope, terms } => Term::Block {
                 scope: scope.clone(),
-                terms: terms.iter().map(|term| self.flatten(term)).collect(),
+                terms: terms
+                    .iter()
+                    .map(|term| self.flatten_term(term, types))
+                    .collect::<Result<_>>()?,
             },
-            Term::Sequence(terms) => {
-                Term::Sequence(terms.iter().map(|term| self.flatten(term)).collect())
+            Term::Sequence(terms) => Term::Sequence(
+                terms
+                    .iter()
+                    .map(|term| self.flatten_term(term, types))
+                    .collect::<Result<_>>()?,
+            ),
+            Term::Literal(Literal { offset, type_ }) => {
+                let flattened_type = self.flatten_type(type_, types);
+
+                let offset = if let Type::Integer(integer_type) = &flattened_type {
+                    if type_.inferred() {
+                        let string = str::from_utf8(self.load_slice(*offset)).unwrap().to_owned();
+
+                        integer_type.parse(self, &string)?
+                    } else {
+                        *offset
+                    }
+                } else {
+                    *offset
+                };
+
+                Term::Literal(Literal {
+                    offset,
+                    type_: flattened_type,
+                })
             }
-            Term::Literal(Literal { offset, type_ }) => Term::Literal(Literal {
-                offset: *offset,
-                type_: self.flatten_type(type_),
-            }),
             Term::Reference(reference) => Term::Reference(Rc::new(Reference {
                 kind: reference.kind,
-                term: self.flatten(&reference.term),
+                term: self.flatten_term(&reference.term, types)?,
             })),
             Term::Let { pattern, .. } => Term::Let {
-                pattern: self.flatten_pattern(pattern),
+                pattern: Rc::new(self.flatten_pattern(pattern, types)?),
                 term: None,
             },
-            Term::Variable { index, .. } => Term::Variable {
-                index,
-                type_: Type::Never,
+            Term::Variable { index, type_ } => Term::Variable {
+                index: *index,
+                type_: self.flatten_type(type_, types),
             },
             Term::Assignment { left, right } => Term::Assignment {
-                left: Rc::new(self.flatten(left)),
-                right: Rc::new(self.flatten(right)),
+                left: Rc::new(self.flatten_term(left, types)?),
+                right: Rc::new(self.flatten_term(right, types)?),
             },
             Term::Application {
                 abstraction,
                 arguments,
             } => Term::Application {
-                abstraction: Rc::new(self.flatten(abstraction)),
-                arguments: arguments.map(|term| self.flatten(term)).collect(),
+                abstraction: Rc::new(self.flatten_term(abstraction, types)?),
+                arguments: arguments
+                    .iter()
+                    .map(|term| self.flatten_term(term, types))
+                    .collect::<Result<_>>()?,
             },
-            Term::And(left, right) => {
-                Term::And(Rc::new(self.flatten(left)), Rc::new(self.flatten(right)))
-            }
-            Term::Or(left, right) => {
-                Term::Or(Rc::new(self.flatten(left)), Rc::new(self.flatten(right)))
-            }
-            Term::UnaryOp(op, term) => Term::UnaryOp(*op, Rc::new(self.flatten(term))),
+            Term::And(left, right) => Term::And(
+                Rc::new(self.flatten_term(left, types)?),
+                Rc::new(self.flatten_term(right, types)?),
+            ),
+            Term::Or(left, right) => Term::Or(
+                Rc::new(self.flatten_term(left, types)?),
+                Rc::new(self.flatten_term(right, types)?),
+            ),
+            Term::UnaryOp(op, term) => Term::UnaryOp(*op, Rc::new(self.flatten_term(term, types)?)),
             Term::BinaryOp(op, left, right) => Term::BinaryOp(
                 *op,
-                Rc::new(self.flatten(left)),
-                Rc::new(self.flatten(right)),
+                Rc::new(self.flatten_term(left, types)?),
+                Rc::new(self.flatten_term(right, types)?),
             ),
             Term::Match { scrutinee, arms } => Term::Match {
                 scrutinee: scrutinee.clone(),
@@ -3457,62 +3558,76 @@ impl Env {
                              body,
                          }| {
                             Ok(MatchArm {
-                                pattern: self.flatten_pattern(pattern),
-                                guard: guard.as_ref().map(|guard| self.flatten(guard)),
-                                body: self.flatten(body),
+                                pattern: self.flatten_pattern(pattern, types)?,
+                                guard: guard
+                                    .as_ref()
+                                    .map(|guard| self.flatten_term(guard, types))
+                                    .transpose()?,
+                                body: self.flatten_term(body, types)?,
                             })
                         },
                     )
-                    .collect(),
+                    .collect::<Result<_>>()?,
             },
-            Term::Loop { label, body, .. } => Term::Loop {
+            Term::Loop { label, body, type_ } => Term::Loop {
                 label: *label,
-                body: Rc::new(self.flatten(body)),
-                type_: Type::Never,
+                body: Rc::new(self.flatten_term(body, types)?),
+                type_: self.flatten_type(type_, types),
             },
             Term::Break { label, term } => Term::Break {
                 label: *label,
-                term: Rc::new(self.flatten(term)),
+                term: Rc::new(self.flatten_term(term, types)?),
             },
             Term::Struct { type_, arguments } => Term::Struct {
-                type_: self.flatten_type(type_),
+                type_: self.flatten_type(type_, types),
                 arguments: arguments
                     .iter()
-                    .map(|(name, term)| Ok((*name, self.flatten(term))))
-                    .collect(),
+                    .map(|(name, term)| Ok((*name, self.flatten_term(term, types)?)))
+                    .collect::<Result<_>>()?,
             },
             Term::Variant {
                 type_,
                 name,
                 arguments,
             } => Term::Variant {
-                type_: self.flatten_type(type_),
+                type_: self.flatten_type(type_, types),
                 name: *name,
                 arguments: arguments
                     .iter()
-                    .map(|(name, term)| Ok((*name, self.flatten(term))))
-                    .collect(),
+                    .map(|(name, term)| Ok((*name, self.flatten_term(term, types)?)))
+                    .collect::<Result<_>>()?,
             },
             Term::Field { base, lens, name } => Term::Field {
-                base: Rc::new(self.flatten(base)),
-                lens: self.flatten_lens(lens),
+                base: Rc::new(self.flatten_term(base, types)?),
+                lens: self.flatten_lens(lens, types),
                 name: *name,
             },
-            Term::Capture {
-                index, name, mode, ..
-            } => Term::Capture {
-                index: *index,
-                name: *name,
-                mode: mode.clone(),
-                type_: Type::Never,
-            },
+            Term::Capture { name, mode, .. } => {
+                let self_type = self.self_type.as_ref().unwrap();
+                let lens = self.resolve_field(self_type, *name).unwrap();
+
+                let field = Term::Field {
+                    base: Rc::new(Term::Variable {
+                        index: 0,
+                        type_: self_type.clone(),
+                    }),
+                    lens: self.flatten_lens(&lens, types),
+                    name: *name,
+                };
+
+                if let CaptureMode::Move = mode.get() {
+                    field
+                } else {
+                    Term::UnaryOp(UnaryOp::Deref, Rc::new(field))
+                }
+            }
             Term::TraitFunction {
                 type_,
                 trait_,
                 function,
                 ..
             } => {
-                let type_ = self.flatten_type(type_);
+                let type_ = self.flatten_type(type_, types);
 
                 Term::Abstraction(
                     self.get_impl(&type_, trait_)
@@ -3523,16 +3638,53 @@ impl Env {
                         .clone(),
                 )
             }
+            Term::Abstraction(Abstraction { parameters, body }) => {
+                let parameters = parameters
+                    .iter()
+                    .map(
+                        |Parameter {
+                             name,
+                             mutable,
+                             type_,
+                         }| Parameter {
+                            name: *name,
+                            mutable: *mutable,
+                            type_: self.flatten_type(type_, types),
+                        },
+                    )
+                    .collect::<Rc<[_]>>();
+
+                let mut self_type = if let Some(Parameter { name, type_, .. }) = parameters.get(0) {
+                    if *name == self.intern("self") {
+                        Some(type_.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                mem::swap(&mut self_type, &mut self.self_type);
+
+                let body = Rc::new(self.flatten_term(body, types)?);
+
+                mem::swap(&mut self_type, &mut self.self_type);
+
+                Term::Abstraction(Abstraction { parameters, body })
+            }
 
             _ => todo!("flatten for {term:?}"),
-        }
+        })
     }
 
-    fn flatten_pattern(&mut self, pattern: &Pattern) -> Pattern {
-        match pattern {
+    fn flatten_pattern(&mut self, pattern: &Pattern, types: &[Type]) -> Result<Pattern> {
+        Ok(match pattern {
             Pattern::Literal { required, actual } => Pattern::Literal {
-                required: self.flatten(required),
-                actual: actual.as_ref().map(|actual| self.flatten(actual)),
+                required: self.flatten_term(required, types)?,
+                actual: actual
+                    .as_ref()
+                    .map(|actual| self.flatten_term(actual, types))
+                    .transpose()?,
             },
             Pattern::Variant {
                 required_discriminant,
@@ -3543,25 +3695,26 @@ impl Env {
                 required_discriminant: *required_discriminant,
                 actual_discriminant: actual_discriminant
                     .as_ref()
-                    .map(|actual| self.flatten(actual)),
+                    .map(|actual| self.flatten_term(actual, types))
+                    .transpose()?,
                 parameters: parameters
                     .iter()
-                    .map(|parameter| self.flatten_pattern(parameter))
-                    .collect(),
+                    .map(|parameter| self.flatten_pattern(parameter, types))
+                    .collect::<Result<_>>()?,
                 type_: Type::Never,
             },
             Pattern::Struct { parameters, .. } => Pattern::Struct {
                 parameters: parameters
                     .iter()
-                    .map(|parameter| self.flatten_pattern(parameter))
-                    .collect(),
+                    .map(|parameter| self.flatten_pattern(parameter, types))
+                    .collect::<Result<_>>()?,
                 type_: Type::Never,
             },
             Pattern::Tuple(patterns) => Pattern::Tuple(
                 patterns
                     .iter()
-                    .map(|pattern| self.flatten_pattern(pattern))
-                    .collect(),
+                    .map(|pattern| self.flatten_pattern(pattern, types))
+                    .collect::<Result<_>>()?,
             ),
             Pattern::Binding {
                 binding_mode,
@@ -3570,17 +3723,21 @@ impl Env {
                 index,
                 term,
             } => {
-                let mut term = term.borrow_mut();
+                {
+                    let mut term = term.borrow_mut();
 
-                *term = match term.deref() {
-                    BindingTerm::Uninitialized(type_) => {
-                        BindingTerm::Uninitialized(self.flatten_type(type_))
-                    }
+                    *term = match term.deref() {
+                        BindingTerm::Uninitialized(type_) => {
+                            BindingTerm::Uninitialized(self.flatten_type(type_, types))
+                        }
 
-                    BindingTerm::Typed(term) => BindingTerm::Typed(self.flatten(term)),
+                        BindingTerm::Typed(term) => {
+                            BindingTerm::Typed(self.flatten_term(term, types)?)
+                        }
 
-                    _ => unreachable!("{:?}", term.deref()),
-                };
+                        _ => unreachable!("{:?}", term.deref()),
+                    };
+                }
 
                 Pattern::Binding {
                     binding_mode: *binding_mode,
@@ -3588,47 +3745,61 @@ impl Env {
                     index: *index,
                     subpattern: subpattern
                         .as_ref()
-                        .map(|subpattern| self.flatten_pattern(subpattern)),
+                        .map(|subpattern| {
+                            Ok::<_, Error>(Rc::new(self.flatten_pattern(subpattern, types)?))
+                        })
+                        .transpose()?,
                     term: term.clone(),
                 }
             }
             Pattern::Reference { kind, pattern } => Pattern::Reference {
                 kind: *kind,
-                pattern: Rc::new(self.flatten_pattern(pattern)),
+                pattern: Rc::new(self.flatten_pattern(pattern, types)?),
             },
             _ => pattern.clone(),
-        }
+        })
     }
 
-    fn flatten_lens(&mut self, lens: &Lens) -> Lens {
+    fn flatten_lens(&mut self, lens: &Lens, types: &[Type]) -> Lens {
         match lens {
             Lens::Field(Field { type_, offset }) => Lens::Field(Field {
-                type_: self.flatten_type(type_),
+                type_: self.flatten_type(type_, types),
                 offset: *offset,
             }),
-            Lens::Reference(lens) => Lens::Reference(Rc::new(self.flatten_lens(lens))),
+            Lens::Reference(lens) => Lens::Reference(Rc::new(self.flatten_lens(lens, types))),
             _ => unreachable!(),
         }
     }
 
-    fn flatten_type(&mut self, type_: &Type) -> Type {
+    fn flatten_type(&mut self, type_: &Type, types: &[Type]) -> Type {
         match type_ {
-            Type::Inferred(Inferred { type_, .. }) => {
-                self.flatten_type(type_.borrow().borrow().deref())
-            }
+            Type::Inferred(index) => types[*index].clone(),
             Type::TraitArgument {
                 type_,
                 trait_,
                 index,
             } => {
-                let type_ = self.flatten_type(type_);
+                let type_ = self.flatten_type(type_, types);
 
-                self.get_impl(&type_, trait_).unwrap().arguments[index].clone()
+                self.get_impl(&type_, trait_).unwrap().arguments[*index].clone()
             }
-            Type::TraitAssociated { .. } => todo!(),
+            Type::TraitType {
+                type_,
+                trait_,
+                name,
+            } => {
+                let type_ = self.flatten_type(type_, types);
+
+                self.get_impl(&type_, trait_)
+                    .unwrap()
+                    .types
+                    .get(name)
+                    .unwrap()
+                    .clone()
+            }
             Type::Reference { kind, type_ } => Type::Reference {
                 kind: *kind,
-                type_: Rc::new(self.flatten_type(type_)),
+                type_: Rc::new(self.flatten_type(type_, types)),
             },
             Type::Nominal {
                 item,
@@ -3639,7 +3810,7 @@ impl Env {
                 size: *size,
                 arguments: arguments
                     .iter()
-                    .map(|argument| self.flatten_type(argument))
+                    .map(|argument| self.flatten_type(argument, types))
                     .collect(),
             },
 
@@ -3647,165 +3818,114 @@ impl Env {
         }
     }
 
-    fn match_traits(&mut self, type_: &Type, traits: &[Trait]) -> Result<()> {
-        for trait_ in traits {
-            if self.get_impl(type_, trait_).is_none() {
-                return Err(anyhow!("type {type_:?} does not implement {trait_:?}"));
-            }
-        }
+    fn maybe_flatten_type(&mut self, type_: &Type, types: &[Option<Type>]) -> Result<Type> {
+        Ok(match type_ {
+            Type::Inferred(index) => types[*index]
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| type_.clone()),
+            Type::TraitArgument {
+                type_,
+                trait_,
+                index,
+            } => {
+                let type_ = self.maybe_flatten_type(type_, types)?;
 
-        Ok(())
-    }
-
-    fn unify(&mut self, a: &Type, b: &Type) -> Result<(Type, Type)> {
-        // todo: how do we handle e.g. Type::TraitArgument and Type::TraitAssociatedType here?
-
-        Ok(match (a, b) {
-            (
-                Type::Inferred(Inferred { type_: a, .. }),
-                Type::Inferred(Inferred { type_: b, .. }),
-            ) => {
-                if Rc::ptr_eq(a.borrow().deref(), b.borrow().deref()) {
-                    let type_ = a.borrow().borrow().deref().clone();
-
-                    (type_.clone(), type_)
-                } else {
-                    let a_type = a.borrow().borrow().deref().clone();
-                    let b_type = b.borrow().borrow().deref().clone();
-
-                    match (&a_type, &b_type) {
-                        (Type::Never, _) | (_, Type::Never) => (a_type, b_type),
-
-                        (Type::Unknown(a_traits), Type::Unknown(b_traits)) => {
-                            *a.borrow_mut() = b.borrow().deref().clone();
-
-                            let type_ = Type::Unknown(
-                                a_traits
-                                    .iter()
-                                    .chain(b_traits.iter())
-                                    .cloned()
-                                    .collect::<HashSet<_>>()
-                                    .into_iter()
-                                    .collect(),
-                            );
-
-                            *a.borrow().borrow_mut() = type_.clone();
-
-                            (type_.clone(), type_)
-                        }
-
-                        (Type::Unknown(traits), _) => {
-                            self.match_traits(&b_type, traits)?;
-
-                            *a.borrow_mut() = b.borrow().deref().clone();
-
-                            (b_type.clone(), b_type)
-                        }
-
-                        (_, Type::Unknown(traits)) => {
-                            self.match_traits(&b_type, traits)?;
-
-                            *b.borrow_mut() = a.borrow().deref().clone();
-
-                            (a_type.clone(), a_type)
-                        }
-
-                        _ => (a_type, b_type),
+                if type_.inferred() {
+                    Type::TraitArgument {
+                        type_: Rc::new(type_),
+                        trait_: trait_.clone(),
+                        index: *index,
                     }
+                } else if let Some(impl_) = self.get_impl(&type_, trait_) {
+                    impl_.arguments[*index].clone()
+                } else {
+                    return Err(anyhow!("type {type_:?} does not implement {trait_:?}"));
                 }
             }
+            Type::TraitType {
+                type_,
+                trait_,
+                name,
+            } => {
+                let type_ = self.maybe_flatten_type(type_, types)?;
 
-            (Type::Inferred(Inferred { type_, .. }), Type::Never) => {
-                (type_.borrow().borrow().deref().clone(), Type::Never)
+                if type_.inferred() {
+                    Type::TraitType {
+                        type_: Rc::new(type_),
+                        trait_: trait_.clone(),
+                        name: *name,
+                    }
+                } else if let Some(impl_) = self.get_impl(&type_, trait_) {
+                    impl_.types.get(name).unwrap().clone()
+                } else {
+                    return Err(anyhow!("type {type_:?} does not implement {trait_:?}"));
+                }
             }
+            Type::Reference { kind, type_ } => Type::Reference {
+                kind: *kind,
+                type_: Rc::new(self.maybe_flatten_type(type_, types)?),
+            },
+            Type::Nominal {
+                item,
+                size,
+                arguments,
+            } => Type::Nominal {
+                item: *item,
+                size: *size,
+                arguments: arguments
+                    .iter()
+                    .map(|argument| self.maybe_flatten_type(argument, types))
+                    .collect::<Result<_>>()?,
+            },
 
-            (Type::Inferred(Inferred { type_, .. }), _) => {
-                let type_ = type_.borrow();
-                let mut type_ = type_.borrow_mut();
-
-                (
-                    match type_.deref() {
-                        Type::Unknown(traits) => {
-                            self.match_traits(b, traits)?;
-
-                            *type_ = b.clone();
-
-                            b.clone()
-                        }
-
-                        Type::Inferred(_) => unreachable!(),
-
-                        type_ => type_.clone(),
-                    },
-                    b.clone(),
-                )
-            }
-
-            (Type::Never, Type::Inferred(Inferred { type_, .. })) => {
-                (Type::Never, type_.borrow().borrow().deref().clone())
-            }
-
-            (_, Type::Inferred(Inferred { type_, .. })) => {
-                let type_ = type_.borrow();
-                let mut type_ = type_.borrow_mut();
-
-                (
-                    a.clone(),
-                    match type_.deref() {
-                        Type::Unknown(traits) => {
-                            self.match_traits(a, traits)?;
-
-                            *type_ = a.clone();
-
-                            a.clone()
-                        }
-
-                        Type::Inferred(_) => unreachable!(),
-
-                        type_ => type_.clone(),
-                    },
-                )
-            }
-
-            _ => (a.clone(), b.clone()),
+            _ => type_.clone(),
         })
     }
 
-    fn match_types(&mut self, expected: &Type, actual: &Type) -> Result<()> {
-        let (expected, actual) = self.unify(expected, actual)?;
+    fn match_trait(&mut self, type_: &Type, trait_: &Trait) -> Result<()> {
+        if type_.inferred() {
+            self.constraints.push(Constraint::Impl {
+                type_: type_.clone(),
+                trait_: trait_.clone(),
+            });
 
-        if expected != Type::Never && actual != Type::Never && expected != actual {
-            Err(anyhow!(
-                "type mismatch: expected {expected:?}, got {actual:?}"
-            ))
+            Ok(())
+        } else if self.get_impl(type_, trait_).is_none() {
+            Err(anyhow!("type {type_:?} does not implement {trait_:?}"))
         } else {
             Ok(())
         }
     }
 
+    fn match_types(&mut self, expected: &Type, actual: &Type) -> Result<()> {
+        if expected.inferred() || actual.inferred() {
+            self.constraints.push(Constraint::Equal {
+                expected: expected.clone(),
+                actual: actual.clone(),
+            });
+
+            Ok(())
+        } else {
+            match_types_now(expected, actual)
+        }
+    }
+
     fn match_types_for_pattern(
         &mut self,
-        mut scrutinee_type: &Type,
+        scrutinee_type: &Type,
         pattern_type: &Type,
     ) -> Result<()> {
-        // todo: do unification here like in match_types
+        if scrutinee_type.inferred() || pattern_type.inferred() {
+            self.constraints.push(Constraint::PatternEqual {
+                scrutinee: scrutinee_type.clone(),
+                pattern: pattern_type.clone(),
+            });
 
-        let orig_scrutinee_type = scrutinee_type;
-
-        while scrutinee_type != &Type::Never
-            && pattern_type != &Type::Never
-            && scrutinee_type != pattern_type
-        {
-            if let Type::Reference { type_, .. } = scrutinee_type {
-                scrutinee_type = type_.deref();
-            } else {
-                return Err(anyhow!(
-                    "pattern type mismatch: expected {orig_scrutinee_type:?}, got {pattern_type:?}"
-                ));
-            }
+            Ok(())
+        } else {
+            match_types_for_pattern_now(scrutinee_type, pattern_type)
         }
-
-        Ok(())
     }
 
     fn is_refutable(&self, pattern: &Pattern) -> bool {
@@ -4342,7 +4462,6 @@ impl Env {
         complete: bool,
         scrutinee: Option<&Term>,
         default_binding_mode: BindingMode,
-        scrutinee_is_typed: &mut bool,
     ) -> Result<Pattern> {
         let item = self.find_item(path)?;
 
@@ -4360,14 +4479,13 @@ impl Env {
                         ..
                     }) = variants.get(&name)
                     {
-                        let (scrutinee, type_, parameters) = self.resolve_pattern_parameters(
+                        let (type_, parameters) = self.resolve_pattern_parameters(
                             item,
                             fields,
                             parameters,
                             complete,
                             scrutinee,
                             default_binding_mode,
-                            scrutinee_is_typed,
                         )?;
 
                         Ok(Pattern::Variant {
@@ -4380,7 +4498,7 @@ impl Env {
                                     let type_ = scrutinee.type_();
 
                                     Ok::<_, Error>(Term::Field {
-                                        base: Rc::new(scrutinee),
+                                        base: Rc::new(scrutinee.clone()),
                                         name: NameId(usize::MAX),
                                         lens: self.resolve_known_field(
                                             &type_,
@@ -4404,14 +4522,13 @@ impl Env {
             }
 
             Item::Struct { fields, .. } => {
-                let (_, type_, parameters) = self.resolve_pattern_parameters(
+                let (type_, parameters) = self.resolve_pattern_parameters(
                     item,
                     &fields,
                     parameters,
                     complete,
                     scrutinee,
                     default_binding_mode,
-                    scrutinee_is_typed,
                 )?;
 
                 Ok(Pattern::Struct { type_, parameters })
@@ -4421,7 +4538,6 @@ impl Env {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn resolve_pattern_parameters(
         &mut self,
         item: ItemId,
@@ -4430,18 +4546,10 @@ impl Env {
         complete: bool,
         scrutinee: Option<&Term>,
         default_binding_mode: BindingMode,
-        scrutinee_is_typed: &mut bool,
-    ) -> Result<(Option<Term>, Type, Rc<[Pattern]>)> {
+    ) -> Result<(Type, Rc<[Pattern]>)> {
         let item_type = self.type_for_item(item);
 
-        let scrutinee = scrutinee
-            .map(|scrutinee| self.type_check(scrutinee))
-            .transpose()?;
-
-        *scrutinee_is_typed = true;
-
         let scrutinee_type = scrutinee
-            .as_ref()
             .map(|scrutinee| scrutinee.type_())
             .unwrap_or_else(|| item_type.clone());
 
@@ -4518,7 +4626,6 @@ impl Env {
                                 let pattern = self.type_check_pattern(
                                     pattern,
                                     scrutinee
-                                        .as_ref()
                                         .map(|scrutinee| Term::Field {
                                             base: Rc::new(scrutinee.clone()),
                                             name,
@@ -4526,10 +4633,9 @@ impl Env {
                                         })
                                         .as_ref(),
                                     default_binding_mode,
-                                    scrutinee_is_typed,
                                 )?;
 
-                                if *scrutinee_is_typed && scrutinee.is_some() {
+                                if scrutinee.is_some() {
                                     self.match_types_for_pattern(&field.type_, &pattern.type_())?;
                                 }
 
@@ -4563,7 +4669,6 @@ impl Env {
         }
 
         Ok((
-            scrutinee,
             item_type,
             parameters.into_iter().map(|(_, pattern)| pattern).collect(),
         ))
@@ -4574,16 +4679,9 @@ impl Env {
         pattern: &Pattern,
         scrutinee: Option<&Term>,
         default_binding_mode: BindingMode,
-        scrutinee_is_typed: &mut bool,
     ) -> Result<Pattern> {
         match pattern {
             Pattern::Literal { required, .. } => {
-                let scrutinee = scrutinee
-                    .map(|scrutinee| self.type_check(scrutinee))
-                    .transpose()?;
-
-                *scrutinee_is_typed = true;
-
                 let required = self.type_check(required)?;
 
                 let actual = scrutinee
@@ -4623,14 +4721,7 @@ impl Env {
                 path,
                 parameters,
                 complete,
-            } => self.resolve_pattern(
-                path,
-                parameters,
-                *complete,
-                scrutinee,
-                default_binding_mode,
-                scrutinee_is_typed,
-            ),
+            } => self.resolve_pattern(path, parameters, *complete, scrutinee, default_binding_mode),
 
             // todo: will need to do a lot of the same work as resolve_pattern_parameters here, except we also need
             // to avoid typing the scrutinee
@@ -4685,25 +4776,16 @@ impl Env {
                             subpattern,
                             scrutinee.as_ref(),
                             default_binding_mode,
-                            scrutinee_is_typed,
                         )?;
 
-                        self.maybe_match_types_for_pattern(
-                            scrutinee.as_ref(),
-                            pattern,
-                            *scrutinee_is_typed,
-                        )?;
+                        self.maybe_match_types_for_pattern(scrutinee.as_ref(), pattern)?;
 
                         Ok::<_, Error>(Rc::new(subpattern))
                     })
                     .transpose()?;
 
                 if let Some(scrutinee) = scrutinee {
-                    *term.borrow_mut() = if *scrutinee_is_typed {
-                        BindingTerm::Typed(scrutinee)
-                    } else {
-                        BindingTerm::Untyped(scrutinee)
-                    };
+                    *term.borrow_mut() = BindingTerm::Typed(scrutinee);
                 } else if let Some(subpattern) = subpattern.as_ref() {
                     *term.borrow_mut() = BindingTerm::Uninitialized(subpattern.type_());
                 }
@@ -4737,33 +4819,27 @@ impl Env {
                         .map(|scrutinee| Term::UnaryOp(UnaryOp::Deref, Rc::new(scrutinee.clone())))
                         .as_ref(),
                     default_binding_mode,
-                    scrutinee_is_typed,
                 )?;
 
-                if *scrutinee_is_typed {
-                    if let Some(scrutinee) = scrutinee
-                        .map(|scrutinee| self.type_check(scrutinee))
-                        .transpose()?
+                if let Some(scrutinee) = scrutinee {
+                    if let Type::Reference {
+                        kind: type_kind,
+                        type_,
+                    } = scrutinee.type_()
                     {
-                        if let Type::Reference {
-                            kind: type_kind,
-                            type_,
-                        } = scrutinee.type_()
+                        if *kind == ReferenceKind::UniqueMutable
+                            && type_kind != ReferenceKind::UniqueMutable
                         {
-                            if *kind == ReferenceKind::UniqueMutable
-                                && type_kind != ReferenceKind::UniqueMutable
-                            {
-                                return Err(anyhow!(
-                                    "attempt to match a unique reference pattern to a \
-                                     shared reference type: {type_:?}",
-                                ));
-                            }
-                        } else {
                             return Err(anyhow!(
-                                "attempt to match a reference pattern to a non-reference type: {:?}",
-                                scrutinee.type_(),
+                                "attempt to match a unique reference pattern to a \
+                                     shared reference type: {type_:?}",
                             ));
                         }
+                    } else {
+                        return Err(anyhow!(
+                            "attempt to match a reference pattern to a non-reference type: {:?}",
+                            scrutinee.type_(),
+                        ));
                     }
                 }
 
@@ -4781,18 +4857,12 @@ impl Env {
         &mut self,
         scrutinee: Option<&Term>,
         pattern: &Pattern,
-        scrutinee_is_typed: bool,
     ) -> Result<()> {
-        if scrutinee_is_typed {
-            if let Some(scrutinee) = scrutinee
-                .map(|scrutinee| self.type_check(scrutinee))
-                .transpose()?
-            {
-                self.match_types_for_pattern(&scrutinee.type_(), &pattern.type_())?;
-            }
+        if let Some(scrutinee) = scrutinee {
+            self.match_types_for_pattern(&scrutinee.type_(), &pattern.type_())
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 
     fn stmt_to_term(&mut self, stmt: &Stmt) -> Result<Term> {
@@ -5595,15 +5665,18 @@ impl Env {
     }
 
     fn new_inferred_type(&mut self, traits: &[Trait]) -> Type {
-        let index = self.inferred_types.len();
+        let index = self.next_inferred_index;
 
-        let type_ = Rc::new(RefCell::new(Rc::new(RefCell::new(Type::Unknown(
-            traits.iter().cloned().collect(),
-        )))));
+        self.next_inferred_index += 1;
 
-        self.inferred_types.push(type_.clone());
+        for trait_ in traits {
+            self.constraints.push(Constraint::Impl {
+                type_: Type::Inferred(index),
+                trait_: trait_.clone(),
+            });
+        }
 
-        Type::Inferred(Inferred { index, type_ })
+        Type::Inferred(index)
     }
 
     fn expr_to_referenced_term(&mut self, expr: &Expr) -> Result<Term> {
