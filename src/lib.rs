@@ -553,6 +553,50 @@ fn match_types_for_pattern_now(mut scrutinee_type: &Type, pattern_type: &Type) -
     Ok(())
 }
 
+fn match_inferred(
+    a: &Type,
+    b: &Type,
+    types: &mut [Option<Type>],
+    progress: &mut bool,
+) -> Result<()> {
+    match (&a, &b) {
+        (Type::Never, _) | (_, Type::Never) => (),
+
+        (Type::Inferred(a), _) => {
+            if !b.inferred() {
+                types[*a] = Some(b.clone());
+                *progress = true;
+            }
+        }
+
+        (_, Type::Inferred(b)) => {
+            if !a.inferred() {
+                types[*b] = Some(a.clone());
+                *progress = true;
+            }
+        }
+
+        (
+            Type::Reference {
+                kind: a_kind,
+                type_: a_type,
+            },
+            Type::Reference {
+                kind: b_kind,
+                type_: b_type,
+            },
+        ) if a_kind == b_kind => match_inferred(a_type, b_type, types, progress)?,
+
+        _ => {
+            if !(a.inferred() || b.inferred()) {
+                match_types_now(a, b)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug)]
 enum Constraint {
     Equal { expected: Type, actual: Type },
@@ -862,6 +906,7 @@ impl Term {
                 UnaryOp::Neg | UnaryOp::Not => term.type_(),
                 UnaryOp::Deref => match term.type_() {
                     Type::Reference { type_, .. } => type_.deref().clone(),
+                    // todo: may need to handled inferred type here
                     type_ => unreachable!("expected reference to deref, got {:?}", type_),
                 },
             },
@@ -3433,29 +3478,7 @@ impl Env {
                         let a = self.maybe_flatten_type(expected, &types)?;
                         let b = self.maybe_flatten_type(actual, &types)?;
 
-                        match (&a, &b) {
-                            (Type::Never, _) | (_, Type::Never) => (),
-
-                            (Type::Inferred(a), _) => {
-                                if !b.inferred() {
-                                    types[*a] = Some(b.clone());
-                                    progress = true;
-                                }
-                            }
-
-                            (_, Type::Inferred(b)) => {
-                                if !a.inferred() {
-                                    types[*b] = Some(a.clone());
-                                    progress = true;
-                                }
-                            }
-
-                            _ => {
-                                if !(a.inferred() || b.inferred()) {
-                                    match_types_now(&a, &b)?;
-                                }
-                            }
-                        }
+                        match_inferred(&a, &b, &mut types, &mut progress)?;
                     }
 
                     Constraint::PatternEqual { scrutinee, pattern } => {
@@ -3722,13 +3745,43 @@ impl Env {
 
     fn flatten_pattern(&mut self, pattern: &Pattern, types: &[Type]) -> Result<Pattern> {
         Ok(match pattern {
-            Pattern::Literal { required, actual } => Pattern::Literal {
-                required: self.flatten_term(required, types)?,
-                actual: actual
+            Pattern::Literal { required, actual } => {
+                let required = self.flatten_term(required, types)?;
+
+                let actual = actual
                     .as_ref()
-                    .map(|actual| self.flatten_term(actual, types))
-                    .transpose()?,
-            },
+                    .map(|actual| {
+                        // todo: deduplicate this logic with respect to `match_types_for_pattern`
+                        let mut actual = self.flatten_term(actual, types)?;
+                        let original = actual.clone();
+                        let required_type = required.type_();
+
+                        loop {
+                            let actual_type = actual.type_();
+
+                            if actual_type != Type::Never
+                                && required_type != Type::Never
+                                && actual_type != required_type
+                            {
+                                if let Type::Reference { .. } = actual_type {
+                                    actual = Term::UnaryOp(UnaryOp::Deref, Rc::new(actual.clone()))
+                                } else {
+                                    return Err(anyhow!(
+                                        "pattern type mismatch: expected {:?}, got {required_type:?}",
+                                        original.type_()
+                                    ));
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+
+                        Ok(actual)
+                    })
+                    .transpose()?;
+
+                Pattern::Literal { required, actual }
+            }
             Pattern::Variant {
                 required_discriminant,
                 actual_discriminant,
@@ -4729,11 +4782,6 @@ impl Env {
                     };
 
                     Some(if let Some(field) = fields.get(&name) {
-                        info!(
-                            "dicej name {name:?} {} index {}",
-                            self.unintern(name),
-                            self.bindings.len()
-                        );
                         self.resolve_known_field(&scrutinee_type, field)
                             .and_then(|lens| {
                                 let pattern = self.type_check_pattern(
@@ -4794,41 +4842,10 @@ impl Env {
         default_binding_mode: BindingMode,
     ) -> Result<Pattern> {
         match pattern {
-            Pattern::Literal { required, .. } => {
-                let required = self.type_check(required)?;
-
-                let actual = scrutinee
-                    .map(|scrutinee| {
-                        // todo: deduplicate this logic with respect to `match_types_for_pattern`
-                        let mut actual = scrutinee.clone();
-                        let required_type = required.type_();
-
-                        loop {
-                            let actual_type = actual.type_();
-
-                            if actual_type != Type::Never
-                                && required_type != Type::Never
-                                && actual_type != required_type
-                            {
-                                if let Type::Reference { .. } = actual_type {
-                                    actual = Term::UnaryOp(UnaryOp::Deref, Rc::new(actual.clone()))
-                                } else {
-                                    return Err(anyhow!(
-                                        "pattern type mismatch: expected {:?}, got {required_type:?}",
-                                        scrutinee.type_()
-                                    ));
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-
-                        Ok(actual)
-                    })
-                    .transpose()?;
-
-                Ok(Pattern::Literal { required, actual })
-            }
+            Pattern::Literal { required, .. } => Ok(Pattern::Literal {
+                required: self.type_check(required)?,
+                actual: scrutinee.cloned(),
+            }),
 
             Pattern::Unresolved {
                 path,
@@ -5585,9 +5602,9 @@ impl Env {
                 if !attrs.is_empty() {
                     Err(anyhow!("attributes not yet supported"))
                 } else {
-                    let abstraction = Rc::new(self.expr_to_referenced_term(func)?);
-
                     let binding_count = self.bindings.len();
+
+                    let abstraction = Rc::new(self.expr_to_referenced_term(func)?);
 
                     let application = Term::Application {
                         abstraction,
@@ -5597,11 +5614,7 @@ impl Env {
                             .collect::<Result<_>>()?,
                     };
 
-                    Ok(self.sequence_for_temporaries(
-                        binding_count,
-                        self.bindings.len(),
-                        application,
-                    ))
+                    Ok(self.block_for_temporaries(binding_count, application))
                 }
             }
 
@@ -5611,9 +5624,11 @@ impl Env {
                 if !attrs.is_empty() {
                     Err(anyhow!("attributes not yet supported"))
                 } else {
+                    let binding_count = self.bindings.len();
+
                     let scrutinee = self.expr_to_referenced_term(expr)?;
 
-                    let binding_count = self.bindings.len();
+                    let arm_binding_count = self.bindings.len();
 
                     let term = Term::Match {
                         scrutinee: Rc::new(scrutinee),
@@ -5639,7 +5654,7 @@ impl Env {
                                             body: self.expr_to_term(body)?,
                                         });
 
-                                        self.bindings.truncate(binding_count);
+                                        self.bindings.truncate(arm_binding_count);
 
                                         result
                                     }
@@ -5648,7 +5663,7 @@ impl Env {
                             .collect::<Result<_>>()?,
                     };
 
-                    Ok(self.sequence_for_temporaries(binding_count, self.bindings.len(), term))
+                    Ok(self.block_for_temporaries(binding_count, term))
                 }
             }
 
@@ -6038,38 +6053,42 @@ impl Env {
         })
     }
 
-    fn sequence_for_temporaries(&mut self, start: usize, end: usize, term: Term) -> Term {
+    fn lets_for_temporaries(&self, start: usize, end: usize) -> impl Iterator<Item = Term> + '_ {
+        self.bindings
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(end - start)
+            .map(
+                |(
+                    index,
+                    Binding {
+                        name,
+                        mutable,
+                        term,
+                        ..
+                    },
+                )| Term::Let {
+                    pattern: Rc::new(Pattern::Binding {
+                        binding_mode: Some(if *mutable {
+                            BindingMode::MoveMut
+                        } else {
+                            BindingMode::Move
+                        }),
+                        name: *name,
+                        index,
+                        term: term.clone(),
+                        subpattern: None,
+                    }),
+                    term: None,
+                },
+            )
+    }
+
+    fn sequence_for_temporaries(&self, start: usize, end: usize, term: Term) -> Term {
         if end > start {
             let terms = self
-                .bindings
-                .iter()
-                .enumerate()
-                .skip(start)
-                .take(end - start)
-                .map(
-                    |(
-                        index,
-                        Binding {
-                            name,
-                            mutable,
-                            term,
-                            ..
-                        },
-                    )| Term::Let {
-                        pattern: Rc::new(Pattern::Binding {
-                            binding_mode: Some(if *mutable {
-                                BindingMode::MoveMut
-                            } else {
-                                BindingMode::Move
-                            }),
-                            name: *name,
-                            index,
-                            term: term.clone(),
-                            subpattern: None,
-                        }),
-                        term: None,
-                    },
-                )
+                .lets_for_temporaries(start, end)
                 // todo: store this term in a let binding, append drop calls for any temporaries whose lifetimes
                 // should *not* be extended according to
                 // https://doc.rust-lang.org/reference/destructors.html#temporary-lifetime-extension, and finally
@@ -6078,6 +6097,28 @@ impl Env {
                 .collect();
 
             Term::Sequence(terms)
+        } else {
+            term
+        }
+    }
+
+    fn block_for_temporaries(&mut self, start: usize, term: Term) -> Term {
+        let end = self.bindings.len();
+
+        if end > start {
+            let terms = self
+                .lets_for_temporaries(start, end)
+                .chain(iter::once(term))
+                .collect();
+
+            let block = Term::Block {
+                scope: Rc::new(RefCell::new(Scope::new())),
+                terms,
+            };
+
+            self.bindings.truncate(start);
+
+            block
         } else {
             term
         }
