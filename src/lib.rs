@@ -23,11 +23,11 @@ use {
         punctuated::Punctuated, AngleBracketedGenericArguments, Arm, BinOp, Block, Expr,
         ExprAssign, ExprAssignOp, ExprBinary, ExprBlock, ExprBreak, ExprCall, ExprClosure,
         ExprField, ExprIf, ExprLit, ExprLoop, ExprMatch, ExprParen, ExprPath, ExprReference,
-        ExprStruct, ExprTuple, ExprUnary, FieldPat, Fields, FieldsNamed, FieldsUnnamed,
-        GenericArgument, GenericParam, Generics, ItemEnum, ItemStruct, Lit, LitBool, Local, Member,
-        Pat, PatIdent, PatLit, PatPath, PatReference, PatRest, PatStruct, PatTuple, PatTupleStruct,
-        PatType, PatWild, PathArguments, PathSegment, ReturnType, Stmt, TypePath, TypeReference,
-        UnOp, Visibility,
+        ExprStruct, ExprTuple, ExprUnary, FieldPat, Fields, FieldsNamed, FieldsUnnamed, FnArg,
+        GenericArgument, GenericParam, Generics, ItemEnum, ItemFn, ItemStruct, Lit, LitBool, Local,
+        Member, Pat, PatIdent, PatLit, PatPath, PatReference, PatRest, PatStruct, PatTuple,
+        PatTupleStruct, PatType, PatWild, PathArguments, PathSegment, ReturnType, Signature, Stmt,
+        TypePath, TypeReference, UnOp, Visibility,
     },
 };
 
@@ -468,7 +468,7 @@ enum Type {
     Str(Lifetime),
     Function {
         parameters: Rc<[Type]>,
-        ret: Rc<Type>,
+        return_: Rc<Type>,
     },
     Nominal {
         // todo: add lifetime arguments
@@ -597,6 +597,17 @@ fn match_inferred(
     Ok(())
 }
 
+fn make_body(patterns: Vec<Term>, body: Term) -> Term {
+    if patterns.is_empty() {
+        body
+    } else {
+        Term::Block {
+            scope: Rc::new(RefCell::new(Scope::new())),
+            terms: patterns.into_iter().chain(iter::once(body)).collect(),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Constraint {
     Equal { expected: Type, actual: Type },
@@ -653,6 +664,12 @@ struct Abstraction {
 }
 
 #[derive(Clone, Debug)]
+struct TypedPattern {
+    pattern: Rc<Pattern>,
+    type_: Type,
+}
+
+#[derive(Clone, Debug)]
 enum Pattern {
     Unresolved {
         path: Path,
@@ -685,6 +702,7 @@ enum Pattern {
         kind: ReferenceKind,
         pattern: Rc<Pattern>,
     },
+    Typed(TypedPattern),
     Wildcard,
     Rest,
 }
@@ -824,6 +842,10 @@ enum Term {
         arguments: Rc<[Term]>,
     },
     Abstraction(Abstraction),
+    Function {
+        type_: Type,
+        item: ItemId,
+    },
     And(Rc<Term>, Rc<Term>),
     Or(Rc<Term>, Rc<Term>),
     UnaryOp(UnaryOp, Rc<Term>),
@@ -872,7 +894,6 @@ enum Term {
     Closure {
         capture_style: CaptureStyle,
         parameters: Rc<[Term]>,
-        patterns: Rc<[Term]>,
         return_type: Type,
         body: Rc<Term>,
     },
@@ -936,6 +957,7 @@ impl Term {
             | Self::Loop { type_, .. }
             | Self::Struct { type_, .. }
             | Self::Variant { type_, .. }
+            | Self::Function { type_, .. }
             | Self::Parameter(type_)
             | Self::Literal(Literal { type_, .. }) => type_.clone(),
             Self::Field { lens, .. } => lens.type_(),
@@ -1190,6 +1212,18 @@ enum Item {
         name: NameId,
     },
     Type(Type),
+    UnresolvedFunction {
+        parameters: Rc<[Term]>,
+        return_type: Type,
+        body: Term,
+        unsafe_: bool,
+        offset: usize,
+    },
+    Function {
+        abstraction: Abstraction,
+        unsafe_: bool,
+        offset: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -1814,68 +1848,169 @@ impl Env {
     }
 
     fn get_blanket_impl(&mut self, type_: &Type, trait_: &Trait) -> Option<Impl> {
-        if let Type::Reference { kind, type_: inner } = type_ {
-            let target_name = self.intern("Target");
+        let self_name = self.intern("self");
 
-            if trait_.name == self.intern("Deref") {
-                let self_type = Type::Reference {
+        match type_ {
+            Type::Reference { kind, type_: inner } => {
+                let target_name = self.intern("Target");
+
+                if trait_.name == self.intern("Deref") {
+                    let self_type = Type::Reference {
+                        kind: ReferenceKind::Shared,
+                        type_: Rc::new(type_.clone()),
+                    };
+
+                    let function = self.intern("deref");
+
+                    let abstraction = Abstraction {
+                        parameters: Rc::new([Parameter {
+                            name: self_name,
+                            mutable: false,
+                            type_: self_type.clone(),
+                        }]),
+                        body: Rc::new(Term::UnaryOp(
+                            UnaryOp::Deref,
+                            Rc::new(Term::Variable {
+                                index: 0,
+                                type_: self_type,
+                            }),
+                        )),
+                    };
+
+                    return Some(Impl {
+                        arguments: Rc::new([]),
+                        types: Rc::new(hashmap![target_name => inner.deref().clone()]),
+                        functions: Rc::new(hashmap![function => abstraction]),
+                    });
+                } else if *kind == ReferenceKind::UniqueMutable
+                    && trait_.name == self.intern("DerefMut")
+                {
+                    let self_type = Type::Reference {
+                        kind: ReferenceKind::UniqueMutable,
+                        type_: Rc::new(type_.clone()),
+                    };
+
+                    let function = self.intern("deref_mut");
+
+                    let abstraction = Abstraction {
+                        parameters: Rc::new([Parameter {
+                            name: self_name,
+                            mutable: false,
+                            type_: self_type.clone(),
+                        }]),
+                        body: Rc::new(Term::UnaryOp(
+                            UnaryOp::Deref,
+                            Rc::new(Term::Variable {
+                                index: 0,
+                                type_: self_type,
+                            }),
+                        )),
+                    };
+
+                    return Some(Impl {
+                        arguments: Rc::new([]),
+                        types: Rc::new(hashmap![target_name => inner.deref().clone()]),
+                        functions: Rc::new(hashmap![function => abstraction]),
+                    });
+                }
+            }
+
+            Type::Function {
+                parameters,
+                return_,
+            } => {
+                let output_name = self.intern("Output");
+
+                let fn_self_type = Type::Reference {
                     kind: ReferenceKind::Shared,
                     type_: Rc::new(type_.clone()),
                 };
 
-                let function = self.intern("deref");
-
-                let abstraction = Abstraction {
-                    parameters: Rc::new([Parameter {
-                        name: self.intern("self"),
-                        mutable: false,
-                        type_: self_type.clone(),
-                    }]),
-                    body: Rc::new(Term::UnaryOp(
-                        UnaryOp::Deref,
-                        Rc::new(Term::Variable {
-                            index: 0,
-                            type_: self_type,
-                        }),
-                    )),
-                };
-
-                return Some(Impl {
-                    arguments: Rc::new([]),
-                    types: Rc::new(hashmap![target_name => inner.deref().clone()]),
-                    functions: Rc::new(hashmap![function => abstraction]),
-                });
-            } else if *kind == ReferenceKind::UniqueMutable
-                && trait_.name == self.intern("DerefMut")
-            {
-                let self_type = Type::Reference {
+                let fn_mut_self_type = Type::Reference {
                     kind: ReferenceKind::UniqueMutable,
                     type_: Rc::new(type_.clone()),
                 };
 
-                let function = self.intern("deref_mut");
-
-                let abstraction = Abstraction {
-                    parameters: Rc::new([Parameter {
-                        name: self.intern("self"),
-                        mutable: false,
-                        type_: self_type.clone(),
-                    }]),
-                    body: Rc::new(Term::UnaryOp(
-                        UnaryOp::Deref,
-                        Rc::new(Term::Variable {
+                let traits = [
+                    (
+                        "Fn",
+                        "call",
+                        fn_self_type.clone(),
+                        Term::UnaryOp(
+                            UnaryOp::Deref,
+                            Rc::new(Term::Variable {
+                                index: 0,
+                                type_: fn_self_type,
+                            }),
+                        ),
+                    ),
+                    (
+                        "FnMut",
+                        "call_mut",
+                        fn_mut_self_type.clone(),
+                        Term::UnaryOp(
+                            UnaryOp::Deref,
+                            Rc::new(Term::Variable {
+                                index: 0,
+                                type_: fn_mut_self_type,
+                            }),
+                        ),
+                    ),
+                    (
+                        "FnOnce",
+                        "call_once",
+                        type_.clone(),
+                        Term::Variable {
                             index: 0,
-                            type_: self_type,
-                        }),
-                    )),
-                };
+                            type_: type_.clone(),
+                        },
+                    ),
+                ];
 
-                return Some(Impl {
-                    arguments: Rc::new([]),
-                    types: Rc::new(hashmap![target_name => inner.deref().clone()]),
-                    functions: Rc::new(hashmap![function => abstraction]),
-                });
+                for (trait_name, fn_name, self_type, self_dereffed) in traits {
+                    let trait_name = self.intern(trait_name);
+                    let fn_name = self.intern(fn_name);
+
+                    if trait_.name == trait_name {
+                        let abstraction =
+                            Abstraction {
+                                parameters: iter::once(Parameter {
+                                    name: self_name,
+                                    mutable: false,
+                                    type_: self_type,
+                                })
+                                .chain(parameters.iter().enumerate().map(|(index, type_)| {
+                                    Parameter {
+                                        name: self.intern(&index.to_string()),
+                                        mutable: false,
+                                        type_: type_.clone(),
+                                    }
+                                }))
+                                .collect(),
+
+                                body: Rc::new(Term::Application {
+                                    abstraction: Rc::new(self_dereffed),
+                                    arguments: parameters
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(index, type_)| Term::Variable {
+                                            index: index + 1,
+                                            type_: type_.clone(),
+                                        })
+                                        .collect(),
+                                }),
+                            };
+
+                        return Some(Impl {
+                            arguments: Rc::new([]),
+                            types: Rc::new(hashmap![output_name => return_.deref().clone()]),
+                            functions: Rc::new(hashmap![fn_name => abstraction]),
+                        });
+                    }
+                }
             }
+
+            _ => (),
         }
 
         // todo: search for matching blanket impl and, if found, monomophize it and return the result.
@@ -1919,49 +2054,59 @@ impl Env {
                 abstraction,
                 arguments,
             } => {
-                if let Term::Abstraction(Abstraction {
-                    body, parameters, ..
-                }) = abstraction.deref()
-                {
-                    let offset = self.stack.offset;
+                let Abstraction { parameters, body } =
+                    if let Term::Abstraction(abstraction) = abstraction.deref() {
+                        abstraction.clone()
+                    } else {
+                        assert!(matches!(abstraction.type_(), Type::Function { .. }));
 
-                    let mut parameters = arguments
-                        .iter()
-                        .zip(parameters.iter())
-                        .map(|(term, Parameter { name, mutable, .. })| {
-                            let offset = self.stack.offset;
+                        self.eval_term(abstraction)?;
 
-                            self.eval_term(term)?;
+                        let item = self.pop::<usize>();
 
-                            Ok(Binding {
-                                name: *name,
-                                mutable: *mutable,
-                                term: Rc::new(RefCell::new(BindingTerm::Typed(term.clone()))),
-                                offset,
-                            })
+                        if let Item::Function { abstraction, .. } = &self.items[item] {
+                            abstraction.clone()
+                        } else {
+                            unreachable!()
+                        }
+                    };
+
+                let offset = self.stack.offset;
+
+                let mut parameters = arguments
+                    .iter()
+                    .zip(parameters.iter())
+                    .map(|(term, Parameter { name, mutable, .. })| {
+                        let offset = self.stack.offset;
+
+                        self.eval_term(term)?;
+
+                        Ok(Binding {
+                            name: *name,
+                            mutable: *mutable,
+                            term: Rc::new(RefCell::new(BindingTerm::Typed(term.clone()))),
+                            offset,
                         })
-                        .collect::<Result<Vec<_>, _>>()?;
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
 
-                    mem::swap(&mut parameters, &mut self.bindings);
+                mem::swap(&mut parameters, &mut self.bindings);
 
-                    let result = self.eval_term(body);
+                let result = self.eval_term(body.deref());
 
-                    mem::swap(&mut parameters, &mut self.bindings);
+                mem::swap(&mut parameters, &mut self.bindings);
 
-                    result?;
+                result?;
 
-                    let size = body.type_().size();
+                let size = body.type_().size();
 
-                    let limit = self.stack.offset;
+                let limit = self.stack.offset;
 
-                    let src = limit - size;
+                let src = limit - size;
 
-                    self.heap.copy_within(src..limit, offset);
+                self.heap.copy_within(src..limit, offset);
 
-                    self.stack.offset = offset + size;
-                } else {
-                    todo!("eval abstraction before applying it")
-                }
+                self.stack.offset = offset + size;
             }
 
             Term::And(left, right) => {
@@ -3164,7 +3309,6 @@ impl Env {
             Term::Closure {
                 capture_style,
                 parameters,
-                patterns,
                 return_type,
                 body,
             } => {
@@ -3180,45 +3324,18 @@ impl Env {
 
                 let parameters = parameters
                     .iter()
-                    .map(|parameter| {
-                        self.type_check(parameter)?;
-
-                        if let Term::Let {
-                            pattern,
-                            term: Some(term),
-                        } = parameter
-                        {
-                            if let Pattern::Binding {
-                                name, binding_mode, ..
-                            } = pattern.deref()
-                            {
-                                Ok(Parameter {
-                                    type_: term.type_(),
-                                    name: *name,
-                                    mutable: matches!(binding_mode, Some(BindingMode::MoveMut)),
-                                })
-                            } else {
-                                unreachable!("{:?}", pattern.deref())
-                            }
-                        } else {
-                            unreachable!("{:?}", term)
-                        }
-                    })
+                    .map(|parameter| self.type_check_parameter(parameter))
                     .collect::<Result<Vec<_>>>()?;
 
-                for pattern in patterns.iter() {
-                    self.type_check(pattern)?;
-                }
-
                 let body = self.type_check(body)?;
-
-                let body_type = body.type_();
-
-                self.match_types(return_type, &body_type)?;
 
                 mem::swap(&mut context, &mut self.closure_context);
 
                 self.bindings.truncate(binding_count);
+
+                let body_type = body.type_();
+
+                self.match_types(return_type, &body_type)?;
 
                 let context = context.unwrap();
 
@@ -4065,7 +4182,9 @@ impl Env {
                 .map(|subpattern| self.is_refutable(subpattern))
                 .unwrap_or(false),
 
-            Pattern::Reference { pattern, .. } => self.is_refutable(pattern.deref()),
+            Pattern::Reference { pattern, .. } | Pattern::Typed(TypedPattern { pattern, .. }) => {
+                self.is_refutable(pattern.deref())
+            }
 
             Pattern::Unresolved { .. } => unreachable!(),
         }
@@ -4085,9 +4204,17 @@ impl Env {
                     arguments,
                 },
 
-                _ => {
+                Item::Function { offset, .. } => Term::Application {
+                    abstraction: Rc::new(Term::Literal(Literal {
+                        type_: self.type_for_item(item),
+                        offset: *offset,
+                    })),
+                    arguments: arguments.iter().map(|(_, term)| term.clone()).collect(),
+                },
+
+                item => {
                     return Err(anyhow!(
-                        "cannot resolve {} as an expression",
+                        "cannot resolve {} as an expression: {item:?}",
                         self.unintern_path(path)
                     ))
                 }
@@ -4155,6 +4282,31 @@ impl Env {
         }
 
         false
+    }
+
+    fn type_check_parameter(&mut self, parameter: &Term) -> Result<Parameter> {
+        self.type_check(parameter)?;
+
+        if let Term::Let {
+            pattern,
+            term: Some(term),
+        } = parameter
+        {
+            if let Pattern::Binding {
+                name, binding_mode, ..
+            } = pattern.deref()
+            {
+                Ok(Parameter {
+                    type_: term.type_(),
+                    name: *name,
+                    mutable: matches!(binding_mode, Some(BindingMode::MoveMut)),
+                })
+            } else {
+                unreachable!("{:?}", pattern.deref())
+            }
+        } else {
+            unreachable!("{:?}", parameter)
+        }
     }
 
     fn type_check_arguments(
@@ -4428,7 +4580,7 @@ impl Env {
 
         self.items[index.0] = Item::Unavailable;
 
-        // todo: type check method bodies (or else do that lazily elsewhere, e.g. on first invocation)
+        // todo: type check function bodies (or else do that lazily elsewhere, e.g. on first invocation)
         #[allow(clippy::single_match)]
         match item.deref() {
             Item::Struct {
@@ -4465,9 +4617,56 @@ impl Env {
                 }
             }
 
+            Item::UnresolvedFunction {
+                parameters,
+                body,
+                return_type,
+                unsafe_,
+                offset,
+            } => {
+                let mut next_inferred_index = 0;
+
+                mem::swap(&mut next_inferred_index, &mut self.next_inferred_index);
+
+                let mut constraints = Vec::new();
+
+                mem::swap(&mut constraints, &mut self.constraints);
+
+                let mut bindings = Vec::new();
+
+                mem::swap(&mut bindings, &mut self.bindings);
+
+                let parameters = parameters
+                    .iter()
+                    .map(|parameter| self.type_check_parameter(parameter))
+                    .collect::<Result<_>>()?;
+
+                let body = self.type_check(body)?;
+
+                mem::swap(&mut bindings, &mut self.bindings);
+
+                let body_type = body.type_();
+
+                self.match_types(return_type, &body_type)?;
+
+                let body = Rc::new(self.infer_types(&body)?);
+
+                mem::swap(&mut constraints, &mut self.constraints);
+
+                mem::swap(&mut next_inferred_index, &mut self.next_inferred_index);
+
+                self.items[index.0] = Item::Function {
+                    abstraction: Abstraction { parameters, body },
+                    unsafe_: *unsafe_,
+                    offset: *offset,
+                };
+            }
+
             Item::Type(_) | Item::Variant { .. } => (),
 
-            Item::Unavailable | Item::Unresolved(_) => unreachable!(),
+            Item::Unavailable | Item::Unresolved(_) | Item::Function { .. } => {
+                unreachable!()
+            }
         }
 
         Ok(())
@@ -4615,6 +4814,19 @@ impl Env {
                         .max()
                         .unwrap_or(discriminant_size),
                     arguments: Rc::new([]),
+                }
+            }
+            Item::Function {
+                abstraction: Abstraction { parameters, body },
+                ..
+            } => {
+                // todo: include unsafe, abi, async, etc. in the type
+                Type::Function {
+                    parameters: parameters
+                        .iter()
+                        .map(|Parameter { type_, .. }| type_.clone())
+                        .collect(),
+                    return_: Rc::new(body.type_()),
                 }
             }
             item => unreachable!("type_for_item {:?}", item),
@@ -4963,7 +5175,7 @@ impl Env {
                         {
                             return Err(anyhow!(
                                 "attempt to match a unique reference pattern to a \
-                                     shared reference type: {type_:?}",
+                                 shared reference type: {type_:?}",
                             ));
                         }
                     } else {
@@ -4975,6 +5187,17 @@ impl Env {
                 }
 
                 Ok(pattern)
+            }
+
+            Pattern::Typed(TypedPattern { pattern, type_ }) => {
+                let pattern = self.type_check_pattern(pattern, scrutinee, default_binding_mode)?;
+
+                self.match_types_for_pattern(&pattern.type_(), type_)?;
+
+                Ok(Pattern::Typed(TypedPattern {
+                    pattern: Rc::new(pattern),
+                    type_: type_.clone(),
+                }))
             }
 
             Pattern::Variant { .. }
@@ -5046,157 +5269,154 @@ impl Env {
         match stmt {
             Stmt::Semi(expr, _) | Stmt::Expr(expr) => self.expr_to_term(expr),
 
-            Stmt::Item(item) => match item {
-                syn::Item::Struct(ItemStruct {
-                    ident,
-                    generics:
-                        Generics {
-                            params,
-                            where_clause,
-                            ..
-                        },
-                    fields,
-                    vis,
-                    attrs,
-                    ..
-                }) => {
-                    if !attrs.is_empty() {
-                        Err(anyhow!("attributes not yet supported"))
-                    } else if !params
-                        .iter()
-                        .all(|param| matches!(param, GenericParam::Lifetime(_)))
-                    {
-                        // todo: handle lifetimes
-                        Err(anyhow!("generic parameters not yet supported"))
-                    } else if where_clause.is_some() {
-                        Err(anyhow!("where clauses not yet supported"))
-                    } else if *vis != Visibility::Inherited {
-                        Err(anyhow!("visibility not yet supported"))
-                    } else {
-                        let name = self.intern(&ident.to_string());
-
-                        let fields = Rc::new(self.fields_to_fields(fields)?);
-
-                        let item = self.add_item(Item::Unresolved(Rc::new(Item::Struct {
-                            parameters: Rc::new([]),
-                            fields,
-                            methods: Rc::new([]),
-                        })));
-
-                        let items = &mut self.scopes.last().unwrap().borrow_mut().items;
-
-                        if let Entry::Vacant(e) = items.entry(name) {
-                            e.insert(item);
-
-                            Ok(Term::Literal(self.unit.clone()))
+            Stmt::Item(item) => {
+                let (name, item) = match item {
+                    syn::Item::Struct(ItemStruct {
+                        ident,
+                        generics:
+                            Generics {
+                                params,
+                                where_clause,
+                                ..
+                            },
+                        fields,
+                        vis,
+                        attrs,
+                        ..
+                    }) => {
+                        if !attrs.is_empty() {
+                            Err(anyhow!("attributes not yet supported"))
+                        } else if !params
+                            .iter()
+                            .all(|param| matches!(param, GenericParam::Lifetime(_)))
+                        {
+                            // todo: handle lifetimes
+                            Err(anyhow!("generic parameters not yet supported"))
+                        } else if where_clause.is_some() {
+                            Err(anyhow!("where clauses not yet supported"))
+                        } else if *vis != Visibility::Inherited {
+                            Err(anyhow!("visibility not yet supported"))
                         } else {
-                            Err(anyhow!("duplicate item identifier: {}", ident.to_string()))
+                            let name = self.intern(&ident.to_string());
+
+                            let fields = Rc::new(self.fields_to_fields(fields)?);
+
+                            Ok((
+                                name,
+                                self.add_item(Item::Unresolved(Rc::new(Item::Struct {
+                                    parameters: Rc::new([]),
+                                    fields,
+                                    methods: Rc::new([]),
+                                }))),
+                            ))
                         }
                     }
-                }
 
-                syn::Item::Enum(ItemEnum {
-                    ident,
-                    generics:
-                        Generics {
-                            params,
-                            where_clause,
-                            ..
-                        },
-                    variants,
-                    attrs,
-                    vis,
-                    ..
-                }) => {
-                    if !attrs.is_empty() {
-                        Err(anyhow!("attributes not yet supported"))
-                    } else if !params
-                        .iter()
-                        .all(|param| matches!(param, GenericParam::Lifetime(_)))
-                    {
-                        // todo: handle lifetimes
-                        Err(anyhow!("generic parameters not yet supported"))
-                    } else if where_clause.is_some() {
-                        Err(anyhow!("where clauses not yet supported"))
-                    } else if *vis != Visibility::Inherited {
-                        Err(anyhow!("visibility not yet supported"))
-                    } else {
-                        let name = self.intern(&ident.to_string());
+                    syn::Item::Enum(ItemEnum {
+                        ident,
+                        generics:
+                            Generics {
+                                params,
+                                where_clause,
+                                ..
+                            },
+                        variants,
+                        attrs,
+                        vis,
+                        ..
+                    }) => {
+                        if !attrs.is_empty() {
+                            Err(anyhow!("attributes not yet supported"))
+                        } else if !params
+                            .iter()
+                            .all(|param| matches!(param, GenericParam::Lifetime(_)))
+                        {
+                            // todo: handle lifetimes
+                            Err(anyhow!("generic parameters not yet supported"))
+                        } else if where_clause.is_some() {
+                            Err(anyhow!("where clauses not yet supported"))
+                        } else if *vis != Visibility::Inherited {
+                            Err(anyhow!("visibility not yet supported"))
+                        } else {
+                            let name = self.intern(&ident.to_string());
 
-                        let mut default_discriminant = 0;
-                        let mut min_discriminant = None;
-                        let mut max_discriminant = None;
+                            let mut default_discriminant = 0;
+                            let mut min_discriminant = None;
+                            let mut max_discriminant = None;
 
-                        let variants = Rc::new(
-                            variants
-                                .iter()
-                                .map(
-                                    |syn::Variant {
-                                         ident,
-                                         fields,
-                                         discriminant,
-                                         attrs,
-                                     }| {
-                                        if !attrs.is_empty() {
-                                            Err(anyhow!("attributes not yet supported"))
-                                        } else {
-                                            let discriminant = discriminant
-                                                .as_ref()
-                                                .map(|(_, expr)| {
-                                                    let term = self.expr_to_term(expr)?;
+                            let variants = Rc::new(
+                                variants
+                                    .iter()
+                                    .map(
+                                        |syn::Variant {
+                                             ident,
+                                             fields,
+                                             discriminant,
+                                             attrs,
+                                         }| {
+                                            if !attrs.is_empty() {
+                                                Err(anyhow!("attributes not yet supported"))
+                                            } else {
+                                                let discriminant = discriminant
+                                                    .as_ref()
+                                                    .map(|(_, expr)| {
+                                                        let term = self.expr_to_term(expr)?;
 
-                                                    self.eval_discriminant(&term)
-                                                })
-                                                .transpose()?
-                                                .unwrap_or(default_discriminant);
+                                                        self.eval_discriminant(&term)
+                                                    })
+                                                    .transpose()?
+                                                    .unwrap_or(default_discriminant);
 
-                                            min_discriminant =
-                                                Some(if let Some(min) = min_discriminant {
-                                                    if min > discriminant {
-                                                        discriminant
+                                                min_discriminant =
+                                                    Some(if let Some(min) = min_discriminant {
+                                                        if min > discriminant {
+                                                            discriminant
+                                                        } else {
+                                                            min
+                                                        }
                                                     } else {
-                                                        min
-                                                    }
-                                                } else {
-                                                    discriminant
-                                                });
-
-                                            max_discriminant =
-                                                Some(if let Some(max) = max_discriminant {
-                                                    if max < discriminant {
                                                         discriminant
+                                                    });
+
+                                                max_discriminant =
+                                                    Some(if let Some(max) = max_discriminant {
+                                                        if max < discriminant {
+                                                            discriminant
+                                                        } else {
+                                                            max
+                                                        }
                                                     } else {
-                                                        max
-                                                    }
-                                                } else {
-                                                    discriminant
-                                                });
+                                                        discriminant
+                                                    });
 
-                                            default_discriminant = discriminant + 1;
+                                                default_discriminant = discriminant + 1;
 
-                                            let name = self.intern(&ident.to_string());
+                                                let name = self.intern(&ident.to_string());
 
-                                            Ok((
-                                                name,
-                                                Variant {
-                                                    item: self.add_item(Item::Variant {
-                                                        item: ItemId(usize::MAX),
-                                                        name,
-                                                    }),
-                                                    fields: Rc::new(self.fields_to_fields(fields)?),
-                                                    discriminant,
-                                                },
-                                            ))
-                                        }
-                                    },
-                                )
-                                .collect::<Result<HashMap<_, _>>>()?,
-                        );
+                                                Ok((
+                                                    name,
+                                                    Variant {
+                                                        item: self.add_item(Item::Variant {
+                                                            item: ItemId(usize::MAX),
+                                                            name,
+                                                        }),
+                                                        fields: Rc::new(
+                                                            self.fields_to_fields(fields)?,
+                                                        ),
+                                                        discriminant,
+                                                    },
+                                                ))
+                                            }
+                                        },
+                                    )
+                                    .collect::<Result<HashMap<_, _>>>()?,
+                            );
 
-                        // todo: use #[repr(_)] attribute if present (but still check that bounds fit)
+                            // todo: use #[repr(_)] attribute if present (but still check that bounds fit)
 
-                        let discriminant_type =
-                            if let (Some(min), Some(max)) = (min_discriminant, max_discriminant) {
+                            let discriminant_type = if let (Some(min), Some(max)) =
+                                (min_discriminant, max_discriminant)
+                            {
                                 Some(if min >= i8::MIN.into() && max <= i8::MAX.into() {
                                     Integer::I8
                                 } else if min >= u8::MIN.into() && max <= u8::MAX.into() {
@@ -5220,39 +5440,141 @@ impl Env {
                                 None
                             };
 
-                        let item = self.add_item(Item::Unresolved(Rc::new(Item::Enum {
-                            parameters: Rc::new([]),
-                            discriminant_type,
-                            variants: variants.clone(),
-                            methods: Rc::new([]),
-                        })));
+                            let item = self.add_item(Item::Unresolved(Rc::new(Item::Enum {
+                                parameters: Rc::new([]),
+                                discriminant_type,
+                                variants: variants.clone(),
+                                methods: Rc::new([]),
+                            })));
 
-                        for Variant {
-                            item: variant_item, ..
-                        } in variants.values()
-                        {
-                            if let Item::Variant {
+                            for Variant {
                                 item: variant_item, ..
-                            } = &mut self.items[variant_item.0]
+                            } in variants.values()
                             {
-                                *variant_item = item;
+                                if let Item::Variant {
+                                    item: variant_item, ..
+                                } = &mut self.items[variant_item.0]
+                                {
+                                    *variant_item = item;
+                                }
                             }
-                        }
 
-                        let items = &mut self.scopes.last().unwrap().borrow_mut().items;
-
-                        if let Entry::Vacant(e) = items.entry(name) {
-                            e.insert(item);
-
-                            Ok(Term::Literal(self.unit.clone()))
-                        } else {
-                            Err(anyhow!("duplicate item identifier: {}", ident.to_string()))
+                            Ok((name, item))
                         }
                     }
-                }
 
-                _ => Err(anyhow!("item not yet supported: {item:#?}")),
-            },
+                    syn::Item::Fn(ItemFn {
+                        sig:
+                            Signature {
+                                asyncness,
+                                unsafety,
+                                abi,
+                                ident,
+                                generics:
+                                    Generics {
+                                        params,
+                                        where_clause,
+                                        ..
+                                    },
+                                inputs,
+                                variadic,
+                                output,
+                                ..
+                            },
+                        block,
+                        vis,
+                        attrs,
+                    }) => {
+                        if !attrs.is_empty() {
+                            Err(anyhow!("attributes not yet supported"))
+                        } else if *vis != Visibility::Inherited {
+                            Err(anyhow!("visibility not yet supported"))
+                        } else if asyncness.is_some() {
+                            Err(anyhow!("async fns not yet supported"))
+                        } else if abi.is_some() {
+                            Err(anyhow!("fn abi not yet supported"))
+                        } else if where_clause.is_some() {
+                            Err(anyhow!("where clauses not yet supported"))
+                        } else if variadic.is_some() {
+                            Err(anyhow!("variadic functions not yet supported"))
+                        } else if !params
+                            .iter()
+                            .all(|param| matches!(param, GenericParam::Lifetime(_)))
+                        {
+                            // todo: handle lifetimes
+                            Err(anyhow!("generic parameters not yet supported"))
+                        } else {
+                            let mut bindings = Vec::new();
+
+                            mem::swap(&mut bindings, &mut self.bindings);
+
+                            let name = self.intern(&ident.to_string());
+
+                            let mut pats = Vec::with_capacity(inputs.len());
+
+                            let parameters = inputs
+                                .iter()
+                                .map(|arg| match arg {
+                                    FnArg::Receiver(_) => todo!(),
+                                    FnArg::Typed(PatType { pat, ty, attrs, .. }) => {
+                                        if !attrs.is_empty() {
+                                            Err(anyhow!("attributes not yet supported"))
+                                        } else {
+                                            let type_ = self.type_to_type(ty)?;
+
+                                            self.pat_to_param(pat, type_, &mut pats)
+                                        }
+                                    }
+                                })
+                                .collect::<Result<_>>()?;
+
+                            let patterns = self.pats_to_patterns(pats)?;
+
+                            let body = self.block_to_term(&block.stmts)?;
+
+                            mem::swap(&mut bindings, &mut self.bindings);
+
+                            let body = make_body(patterns, body);
+
+                            let return_type = if let ReturnType::Type(_, type_) = output {
+                                self.type_to_type(type_)?
+                            } else {
+                                Type::Unit
+                            };
+
+                            let offset = self.store(self.items.len())?;
+
+                            Ok((
+                                name,
+                                self.add_item(Item::Unresolved(Rc::new(
+                                    Item::UnresolvedFunction {
+                                        parameters,
+                                        body,
+                                        return_type,
+                                        unsafe_: unsafety.is_some(),
+                                        offset,
+                                    },
+                                ))),
+                            ))
+                        }
+                    }
+
+                    _ => Err(anyhow!("item not yet supported: {item:#?}")),
+                }?;
+
+                let items = &mut self.scopes.last().unwrap().borrow_mut().items;
+
+                if let Entry::Vacant(e) = items.entry(name) {
+                    e.insert(item);
+
+                    Ok(Term::Literal(self.unit.clone()))
+                } else {
+                    Err(anyhow!(
+                        "duplicate item identifier: {}",
+                        self.unintern(name)
+                    ))
+                }
+            }
 
             _ => Err(anyhow!("stmt not yet supported: {stmt:#?}")),
         }
@@ -5713,61 +6035,23 @@ impl Env {
                     let parameters = inputs
                         .iter()
                         .map(|pat| {
-                            let index = self.bindings.len();
-
-                            // todo: use type ascription if present
-                            let term = Some(Rc::new(Term::Parameter(self.new_inferred_type(&[]))));
-
-                            Ok(if is_trivial(pat) {
-                                Term::Let {
-                                    pattern: Rc::new(self.pat_to_pattern(pat)?),
-                                    term,
-                                }
+                            let (pat, type_) = if let Pat::Type(PatType { pat, ty, .. }) = pat {
+                                (pat.deref(), self.type_to_type(ty)?)
                             } else {
-                                pats.push((index, pat));
+                                (pat, self.new_inferred_type(&[]))
+                            };
 
-                                let name = self.intern(&index.to_string());
-
-                                let binding_term =
-                                    Rc::new(RefCell::new(BindingTerm::UntypedAndUninitialized));
-
-                                self.bindings.push(Binding {
-                                    name,
-                                    mutable: true,
-                                    term: binding_term.clone(),
-                                    offset: 0,
-                                });
-
-                                Term::Let {
-                                    pattern: Rc::new(Pattern::Binding {
-                                        binding_mode: Some(BindingMode::MoveMut),
-                                        name,
-                                        index,
-                                        term: binding_term,
-                                        subpattern: None,
-                                    }),
-                                    term,
-                                }
-                            })
+                            self.pat_to_param(pat, type_, &mut pats)
                         })
                         .collect::<Result<_>>()?;
 
-                    let patterns = pats
-                        .into_iter()
-                        .map(|(index, pat)| {
-                            Ok(Term::Let {
-                                pattern: Rc::new(self.pat_to_pattern(pat)?),
-                                term: Some(Rc::new(Term::Variable {
-                                    index,
-                                    type_: Type::Never,
-                                })),
-                            })
-                        })
-                        .collect::<Result<_>>()?;
+                    let patterns = self.pats_to_patterns(pats)?;
 
-                    let body = Rc::new(self.expr_to_term(body.deref())?);
+                    let body = self.expr_to_term(body.deref())?;
 
                     self.bindings.truncate(binding_count);
+
+                    let body = Rc::new(make_body(patterns, body));
 
                     Ok(Term::Closure {
                         capture_style: if capture.is_some() {
@@ -5783,7 +6067,6 @@ impl Env {
                         },
 
                         parameters,
-                        patterns,
                         body,
                     })
                 }
@@ -5791,6 +6074,62 @@ impl Env {
 
             _ => Err(anyhow!("expr not yet supported: {expr:#?}")),
         }
+    }
+
+    fn pat_to_param<'a>(
+        &mut self,
+        pat: &'a Pat,
+        type_: Type,
+        pats: &mut Vec<(usize, &'a Pat)>,
+    ) -> Result<Term> {
+        let index = self.bindings.len();
+
+        let term = Some(Rc::new(Term::Parameter(type_)));
+
+        Ok(if is_trivial(pat) {
+            Term::Let {
+                pattern: Rc::new(self.pat_to_pattern(pat)?),
+                term,
+            }
+        } else {
+            pats.push((index, pat));
+
+            let name = self.intern(&index.to_string());
+
+            let binding_term = Rc::new(RefCell::new(BindingTerm::UntypedAndUninitialized));
+
+            self.bindings.push(Binding {
+                name,
+                mutable: true,
+                term: binding_term.clone(),
+                offset: 0,
+            });
+
+            Term::Let {
+                pattern: Rc::new(Pattern::Binding {
+                    binding_mode: Some(BindingMode::MoveMut),
+                    name,
+                    index,
+                    term: binding_term,
+                    subpattern: None,
+                }),
+                term,
+            }
+        })
+    }
+
+    fn pats_to_patterns(&mut self, pats: Vec<(usize, &Pat)>) -> Result<Vec<Term>> {
+        pats.into_iter()
+            .map(|(index, pat)| {
+                Ok(Term::Let {
+                    pattern: Rc::new(self.pat_to_pattern(pat)?),
+                    term: Some(Rc::new(Term::Variable {
+                        index,
+                        type_: Type::Never,
+                    })),
+                })
+            })
+            .collect()
     }
 
     fn new_inferred_type(&mut self, traits: &[Trait]) -> Type {
@@ -6727,13 +7066,34 @@ mod test {
     }
 
     #[test]
+    fn named_lambda() {
+        assert_eq!(34_i32, eval("let x = (|| 34); x()").unwrap())
+    }
+
+    #[test]
     fn identity_lambda() {
         assert_eq!(61_i32, eval("(|x| x)(61)").unwrap())
     }
 
     #[test]
+    fn pattern_lambda() {
+        assert_eq!(
+            62_u32,
+            eval("struct Foo(u32); (|Foo(x): &Foo| *x)(&Foo(62))").unwrap()
+        )
+    }
+
+    #[test]
     fn shared_ref_closure() {
         assert_eq!(68_i32, eval("{ let y = 7; (|x| x + y)(61) }").unwrap())
+    }
+
+    #[test]
+    fn named_shared_ref_closure() {
+        assert_eq!(
+            68_i32,
+            eval("{ let y = 7; let z = (|x| x + y); z(61) }").unwrap()
+        )
     }
 
     #[test]
@@ -6803,7 +7163,97 @@ mod test {
     }
 
     #[test]
-    fn nested_closure() {
+    fn simple_nested_closure() {
         assert_eq!(90_i32, eval("{ let y = 90; (|| (|| y)())() }").unwrap())
+    }
+
+    #[test]
+    fn nested_closure() {
+        assert_eq!(
+            99_i32,
+            eval("{ let y = 90; (|x| (|z| x + y + z)(3))(6) }").unwrap()
+        )
+    }
+
+    #[test]
+    fn simple_function() {
+        assert_eq!(33_u32, eval("{ fn foo() -> u32 { 33 } foo() }").unwrap())
+    }
+
+    #[test]
+    fn function() {
+        assert_eq!(
+            21_u32,
+            eval("{ fn foo(x: u32) -> u32 { x * 3 } foo(7) }").unwrap()
+        )
+    }
+
+    #[test]
+    fn simple_inherent_method() {
+        assert_eq!(
+            33_u32,
+            eval(
+                "{ struct Foo; \
+                  impl Foo { fn foo() -> u32 { 33 } } \
+                  Foo.foo() }"
+            )
+            .unwrap()
+        )
+    }
+
+    #[test]
+    fn inherent_self_move_method() {
+        assert_eq!(
+            5_u32,
+            eval(
+                "{ struct Foo(u32); \
+                  impl Foo { fn foo(self) -> u32 { self.0 + 2 } } \
+                  Foo(3).foo() }"
+            )
+            .unwrap()
+        )
+    }
+
+    #[test]
+    fn inherent_self_shared_reference_method() {
+        assert_eq!(
+            41_u32,
+            eval(
+                "{ struct Foo(u32); \
+                  impl Foo { fn foo(&self) -> u32 { self.0 + 33 } } \
+                  Foo(8).foo() }"
+            )
+            .unwrap()
+        )
+    }
+
+    #[test]
+    fn inherent_self_unique_reference_method() {
+        assert_eq!(
+            50_u32,
+            eval(
+                "{ struct Foo(u32); \
+                  impl Foo { fn foo(&mut self) -> u32 { self.0 -= 33; 12 } } \
+                  let x = Foo(71); \
+                  x.foo() + x.0 }"
+            )
+            .unwrap()
+        )
+    }
+
+    #[test]
+    fn trait_method() {
+        assert_eq!(
+            128_u32,
+            eval(
+                "{ struct Foo(u32); \
+                  struct Bar(u32); \
+                  trait Baz { fn foo(self, x: u32) -> u32; } \
+                  impl Baz for Foo { fn foo(self, x: u32) -> u32 { self.0 + x + 82 } } \
+                  impl Baz for Bar { fn foo(self, x: u32) -> u32 { self.0 + x + 7 } } \
+                  Foo(5).foo(14) + Bar::foo(Bar(8), 12) }"
+            )
+            .unwrap()
+        )
     }
 }
