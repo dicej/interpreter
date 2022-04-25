@@ -22,12 +22,13 @@ use {
     syn::{
         punctuated::Punctuated, AngleBracketedGenericArguments, Arm, BinOp, Block, Expr,
         ExprAssign, ExprAssignOp, ExprBinary, ExprBlock, ExprBreak, ExprCall, ExprClosure,
-        ExprField, ExprIf, ExprLit, ExprLoop, ExprMatch, ExprParen, ExprPath, ExprReference,
-        ExprStruct, ExprTuple, ExprUnary, FieldPat, Fields, FieldsNamed, FieldsUnnamed, FnArg,
-        GenericArgument, GenericParam, Generics, ItemEnum, ItemFn, ItemStruct, Lit, LitBool, Local,
-        Member, Pat, PatIdent, PatLit, PatPath, PatReference, PatRest, PatStruct, PatTuple,
-        PatTupleStruct, PatType, PatWild, PathArguments, PathSegment, ReturnType, Signature, Stmt,
-        TypePath, TypeReference, UnOp, Visibility,
+        ExprField, ExprIf, ExprLit, ExprLoop, ExprMatch, ExprMethodCall, ExprParen, ExprPath,
+        ExprReference, ExprStruct, ExprTuple, ExprUnary, FieldPat, Fields, FieldsNamed,
+        FieldsUnnamed, FnArg, GenericArgument, GenericParam, Generics, ImplItemMethod, ItemEnum,
+        ItemFn, ItemStruct, Lit, LitBool, Local, Member, Pat, PatIdent, PatLit, PatPath,
+        PatReference, PatRest, PatStruct, PatTuple, PatTupleStruct, PatType, PatWild,
+        PathArguments, PathSegment, Receiver, ReturnType, Signature, Stmt, TypePath, TypeReference,
+        UnOp, Visibility,
     },
 };
 
@@ -916,6 +917,11 @@ enum Term {
         function: NameId,
         return_type: Type,
     },
+    MethodCall {
+        receiver: Rc<Term>,
+        method: NameId,
+        args: Rc<[Term]>,
+    },
 }
 
 impl Term {
@@ -1214,13 +1220,13 @@ enum Item {
     Struct {
         parameters: Rc<[Type]>,
         fields: Rc<HashMap<NameId, Field>>,
-        methods: Rc<[Abstraction]>,
+        methods: Rc<HashMap<NameId, ItemId>>,
     },
     Enum {
         parameters: Rc<[Type]>,
         discriminant_type: Option<Integer>,
         variants: Rc<HashMap<NameId, Variant>>,
-        methods: Rc<[Abstraction]>,
+        methods: Rc<HashMap<NameId, ItemId>>,
     },
     Variant {
         item: ItemId,
@@ -1244,14 +1250,24 @@ enum Item {
 }
 
 #[derive(Debug)]
+struct ItemImpl {
+    unsafe_: bool,
+    trait_: Option<Path>,
+    type_: Type,
+    items: HashMap<NameId, ItemId>,
+}
+
+#[derive(Debug)]
 struct Scope {
     items: HashMap<NameId, ItemId>,
+    impls: Vec<ItemImpl>,
 }
 
 impl Scope {
     fn new() -> Self {
         Self {
             items: HashMap::new(),
+            impls: Vec::new(),
         }
     }
 }
@@ -1956,7 +1972,7 @@ impl Env {
                     };
 
                     return Some(Impl {
-                        arguments: Rc::new([]),
+                        arguments: parameters.clone(),
                         types: Rc::new(hashmap![output_name => return_.deref().clone()]),
                         functions: Rc::new(hashmap![fn_name => abstraction]),
                     });
@@ -3426,7 +3442,7 @@ impl Env {
 
                     fields: fields.clone(),
 
-                    methods: Rc::new([]),
+                    methods: Rc::new(HashMap::new()),
                 });
 
                 let type_ = self.type_for_item(item);
@@ -3601,6 +3617,43 @@ impl Env {
                     }
 
                     Err(anyhow!("Fn, FnMut, or FnOnce impl not found for {type_:?}"))
+                }
+            }
+
+            Term::MethodCall {
+                receiver,
+                method,
+                arguments,
+            } => {
+                let receiver = self.type_check(receiver)?;
+
+                let receiver_type = receiver.type_();
+
+                if let Type::Nominal { item, .. } = &receiver_type {
+                    // todo: resolve trait methods and/or use Deref/DerefMut to find method
+                    let method = match &self.items[item.0] {
+                        Item::Enum { methods, .. } | Item::Struct { methods, .. } => {
+                            if let Some(method) = methods.get(&path[0]) {
+                                *method
+                            } else {
+                                return Err(anyhow!(
+                                    "method {} not present in type {receiver_type:?}",
+                                    self.unintern(path[0])
+                                ));
+                            }
+                        }
+
+                        _ => todo!("method lookup for {receiver_type:?}"),
+                    };
+
+                    todo!("arguments");
+
+                    self.resolve_item_term(method, Some(arguments))
+                } else {
+                    // todo: support calls through references
+                    Err(anyhow!(
+                        "method calls not yet supported for type: {receiver_type:?}"
+                    ))
                 }
             }
 
@@ -4237,39 +4290,47 @@ impl Env {
         }
     }
 
+    fn resolve_item_term(
+        &mut self,
+        item: ItemId,
+        arguments: Option<Rc<[(NameId, Term)]>>,
+    ) -> Result<Term> {
+        match &self.items[item.0] {
+            Item::Variant { item, name } => Term::Variant {
+                type_: self.type_for_item(*item),
+                name: *name,
+                arguments: arguments.unwrap_or_else(|| Rc::new([])),
+            },
+
+            Item::Struct { .. } => Term::Struct {
+                type_: self.type_for_item(item),
+                arguments: arguments.unwrap_or_else(|| Rc::new([])),
+            },
+
+            Item::Function { offset, .. } => maybe_apply(
+                Term::Literal(Literal {
+                    type_: self.type_for_item(item),
+                    offset: *offset,
+                }),
+                arguments,
+            ),
+
+            item => {
+                return Err(anyhow!(
+                    "cannot resolve {} as an expression: {item:?}",
+                    self.unintern_path(path)
+                ))
+            }
+        }
+    }
+
     fn resolve_term(
         &mut self,
         path: &Path,
         arguments: Option<Rc<[(NameId, Term)]>>,
     ) -> Result<Term> {
         if let Some(item) = self.maybe_find_item(path)? {
-            Some(match &self.items[item.0] {
-                Item::Variant { item, name } => Term::Variant {
-                    type_: self.type_for_item(*item),
-                    name: *name,
-                    arguments: arguments.unwrap_or_else(|| Rc::new([])),
-                },
-
-                Item::Struct { .. } => Term::Struct {
-                    type_: self.type_for_item(item),
-                    arguments: arguments.unwrap_or_else(|| Rc::new([])),
-                },
-
-                Item::Function { offset, .. } => maybe_apply(
-                    Term::Literal(Literal {
-                        type_: self.type_for_item(item),
-                        offset: *offset,
-                    }),
-                    arguments,
-                ),
-
-                item => {
-                    return Err(anyhow!(
-                        "cannot resolve {} as an expression: {item:?}",
-                        self.unintern_path(path)
-                    ))
-                }
-            })
+            Some(self.resolve_item_term(item, arguments)?)
         } else if !path.absolute && path.segments.len() == 1 {
             let name = path.segments[0];
 
@@ -4614,8 +4675,76 @@ impl Env {
     fn resolve_scope(&mut self) -> Result<()> {
         let scope = self.scopes.last().unwrap().clone();
 
-        for item in scope.borrow().items.values() {
+        let scope = scope.borrow();
+
+        for item in scope.items.values() {
             self.resolve_item(*item)?;
+        }
+
+        for ItemImpl {
+            trait_,
+            type_,
+            items,
+            ..
+        } in scope.impls.iter()
+        {
+            if let Some(_trait_) = trait_ {
+                todo!()
+            } else {
+                let type_ = self.resolve_type(type_)?;
+
+                if let Type::Nominal { item, .. } = &type_ {
+                    // todo: handle type arguments
+
+                    // todo: handle non-method items (or rename Item::{Struct|Enum}::methods to items and let them
+                    // hold any and all items)
+                    match self.items[item.0].clone() {
+                        Item::Struct { methods, .. } | Item::Enum { methods, .. } => {
+                            let mut names = methods.keys().copied().collect::<HashSet<_>>();
+                            let type_item = *item;
+                            let self_name = self.intern("Self");
+
+                            for (name, item) in items.iter() {
+                                if names.contains(name) {
+                                    return Err(anyhow!(
+                                        "duplicate method name: {}",
+                                        self.unintern(*name)
+                                    ));
+                                } else {
+                                    names.insert(*name);
+
+                                    self.scopes.push(Rc::new(RefCell::new(Scope {
+                                        items: hashmap![self_name => type_item],
+                                        impls: Vec::new(),
+                                    })));
+
+                                    self.resolve_item(*item)?;
+
+                                    self.scopes.pop();
+                                }
+                            }
+                        }
+
+                        item => return Err(anyhow!("impl not supported for item: {:?}", item)),
+                    }
+
+                    match &mut self.items[item.0] {
+                        Item::Struct { methods, .. } | Item::Enum { methods, .. } => {
+                            *methods = Rc::new(
+                                methods
+                                    .iter()
+                                    .map(|(name, item)| (*name, *item))
+                                    .chain(items.iter().map(|(name, item)| (*name, *item)))
+                                    .collect(),
+                            );
+                        }
+
+                        _ => unreachable!(),
+                    }
+                } else {
+                    todo!("impl for non-nominal type: {:?}", type_)
+                }
+            }
         }
 
         Ok(())
@@ -4628,13 +4757,14 @@ impl Env {
                 // unnecessarily:
                 return Err(anyhow!("infinite type detected"));
             }
+
             Item::Unresolved(item) => item.clone(),
+
             _ => return Ok(()),
         };
 
         self.items[index.0] = Item::Unavailable;
 
-        // todo: type check function bodies (or else do that lazily elsewhere, e.g. on first invocation)
         #[allow(clippy::single_match)]
         match item.deref() {
             Item::Struct {
@@ -4789,13 +4919,30 @@ impl Env {
             Ok(item)
         } else {
             let item = match &self.items[item.0] {
-                Item::Enum { variants, .. } => {
-                    variants
-                        .get(&path[0])
-                        .ok_or_else(|| {
-                            anyhow!("variant {} not present in enum", self.unintern(path[0]))
-                        })?
-                        .item
+                Item::Enum {
+                    variants, methods, ..
+                } => {
+                    if let Some(variant) = variants.get(&path[0]) {
+                        variant.item
+                    } else if let Some(method) = methods.get(&path[0]) {
+                        *method
+                    } else {
+                        return Err(anyhow!(
+                            "symbol {} not present in enum",
+                            self.unintern(path[0])
+                        ));
+                    }
+                }
+
+                Item::Struct { methods, .. } => {
+                    if let Some(method) = methods.get(&path[0]) {
+                        *method
+                    } else {
+                        return Err(anyhow!(
+                            "symbol {} not present in struct",
+                            self.unintern(path[0])
+                        ));
+                    }
                 }
 
                 _ => todo!("find_item_in_item {:?}", self.items[item.0]),
@@ -5364,7 +5511,7 @@ impl Env {
                                 self.add_item(Item::Unresolved(Rc::new(Item::Struct {
                                     parameters: Rc::new([]),
                                     fields,
-                                    methods: Rc::new([]),
+                                    methods: Rc::new(HashMap::new()),
                                 }))),
                             ))
                         }
@@ -5502,7 +5649,7 @@ impl Env {
                                 parameters: Rc::new([]),
                                 discriminant_type,
                                 variants: variants.clone(),
-                                methods: Rc::new([]),
+                                methods: Rc::new(HashMap::new()),
                             })));
 
                             for Variant {
@@ -5522,23 +5669,7 @@ impl Env {
                     }
 
                     syn::Item::Fn(ItemFn {
-                        sig:
-                            Signature {
-                                asyncness,
-                                unsafety,
-                                abi,
-                                ident,
-                                generics:
-                                    Generics {
-                                        params,
-                                        where_clause,
-                                        ..
-                                    },
-                                inputs,
-                                variadic,
-                                output,
-                                ..
-                            },
+                        sig,
                         block,
                         vis,
                         attrs,
@@ -5547,87 +5678,102 @@ impl Env {
                             Err(anyhow!("attributes not yet supported"))
                         } else if *vis != Visibility::Inherited {
                             Err(anyhow!("visibility not yet supported"))
-                        } else if asyncness.is_some() {
-                            Err(anyhow!("async fns not yet supported"))
-                        } else if abi.is_some() {
-                            Err(anyhow!("fn abi not yet supported"))
-                        } else if where_clause.is_some() {
-                            Err(anyhow!("where clauses not yet supported"))
-                        } else if variadic.is_some() {
-                            Err(anyhow!("variadic functions not yet supported"))
+                        } else {
+                            self.fn_to_function(sig, &block.stmts)
+                        }
+                    }
+
+                    syn::Item::Impl(syn::ItemImpl {
+                        unsafety,
+                        generics:
+                            Generics {
+                                params,
+                                where_clause,
+                                ..
+                            },
+                        trait_,
+                        self_ty,
+                        items,
+                        defaultness,
+                        attrs,
+                        ..
+                    }) => {
+                        if !attrs.is_empty() {
+                            Err(anyhow!("attributes not yet supported"))
+                        } else if defaultness.is_some() {
+                            // what is a default impl?
+                            Err(anyhow!("default impls not yet supported"))
                         } else if !params
                             .iter()
                             .all(|param| matches!(param, GenericParam::Lifetime(_)))
                         {
                             // todo: handle lifetimes
                             Err(anyhow!("generic parameters not yet supported"))
+                        } else if where_clause.is_some() {
+                            Err(anyhow!("where clauses not yet supported"))
                         } else {
-                            let mut next_inferred_index = 0;
+                            let mut item_map = HashMap::with_capacity(items.len());
 
-                            mem::swap(&mut next_inferred_index, &mut self.next_inferred_index);
-
-                            let mut constraints = Vec::new();
-
-                            mem::swap(&mut constraints, &mut self.constraints);
-
-                            let mut bindings = Vec::new();
-
-                            mem::swap(&mut bindings, &mut self.bindings);
-
-                            let name = self.intern(&ident.to_string());
-
-                            let mut pats = Vec::with_capacity(inputs.len());
-
-                            let parameters = inputs
-                                .iter()
-                                .map(|arg| match arg {
-                                    FnArg::Receiver(_) => todo!(),
-                                    FnArg::Typed(PatType { pat, ty, attrs, .. }) => {
+                            for item in items.iter() {
+                                let (name, item) = match item {
+                                    syn::ImplItem::Method(ImplItemMethod {
+                                        sig,
+                                        block: Block { stmts, .. },
+                                        attrs,
+                                        vis,
+                                        defaultness,
+                                    }) => {
                                         if !attrs.is_empty() {
                                             Err(anyhow!("attributes not yet supported"))
+                                        } else if *vis != Visibility::Inherited {
+                                            Err(anyhow!("visibility not yet supported"))
+                                        } else if defaultness.is_some() {
+                                            // what is a default method?
+                                            Err(anyhow!("default methods not yet supported"))
                                         } else {
-                                            let type_ = self.type_to_type(ty)?;
-
-                                            self.pat_to_param(pat, type_, &mut pats)
+                                            self.fn_to_function(sig, stmts)
                                         }
                                     }
+
+                                    _ => Err(anyhow!("item not yet supported: {item:#?}")),
+                                }?;
+
+                                if let Entry::Vacant(e) = item_map.entry(name) {
+                                    e.insert(item);
+                                } else {
+                                    return Err(anyhow!(
+                                        "duplicate item identifier: {}",
+                                        self.unintern(name)
+                                    ));
+                                }
+                            }
+
+                            let type_ = self.type_to_type(self_ty)?;
+
+                            let trait_ = trait_
+                                .as_ref()
+                                .map(|(bang, trait_, _)| {
+                                    if bang.is_some() {
+                                        Err(anyhow!("bang impls not yet supported"))
+                                    } else {
+                                        self.path_to_path(trait_)
+                                    }
                                 })
-                                .collect::<Result<_>>()?;
+                                .transpose()?;
 
-                            let patterns = self.pats_to_patterns(pats)?;
+                            self.scopes
+                                .last()
+                                .unwrap()
+                                .borrow_mut()
+                                .impls
+                                .push(ItemImpl {
+                                    unsafe_: unsafety.is_some(),
+                                    trait_,
+                                    type_,
+                                    items: item_map,
+                                });
 
-                            let body = self.block_to_term(&block.stmts)?;
-
-                            mem::swap(&mut bindings, &mut self.bindings);
-
-                            mem::swap(&mut constraints, &mut self.constraints);
-
-                            mem::swap(&mut next_inferred_index, &mut self.next_inferred_index);
-
-                            let body = make_body(patterns, body);
-
-                            let return_type = if let ReturnType::Type(_, type_) = output {
-                                self.type_to_type(type_)?
-                            } else {
-                                Type::Unit
-                            };
-
-                            let offset = self.store(self.items.len())?;
-
-                            Ok((
-                                name,
-                                self.add_item(Item::Unresolved(Rc::new(
-                                    Item::UnresolvedFunction {
-                                        parameters,
-                                        body,
-                                        return_type,
-                                        next_inferred_index,
-                                        constraints,
-                                        unsafe_: unsafety.is_some(),
-                                        offset,
-                                    },
-                                ))),
-                            ))
+                            return Ok(Term::Literal(self.unit.clone()));
                         }
                     }
 
@@ -5649,6 +5795,168 @@ impl Env {
             }
 
             _ => Err(anyhow!("stmt not yet supported: {stmt:#?}")),
+        }
+    }
+
+    fn fn_to_function(
+        &mut self,
+        Signature {
+            asyncness,
+            unsafety,
+            abi,
+            ident,
+            generics:
+                Generics {
+                    params,
+                    where_clause,
+                    ..
+                },
+            inputs,
+            variadic,
+            output,
+            ..
+        }: &Signature,
+        stmts: &[Stmt],
+    ) -> Result<(NameId, ItemId)> {
+        if asyncness.is_some() {
+            Err(anyhow!("async fns not yet supported"))
+        } else if abi.is_some() {
+            Err(anyhow!("fn abi not yet supported"))
+        } else if where_clause.is_some() {
+            Err(anyhow!("where clauses not yet supported"))
+        } else if variadic.is_some() {
+            Err(anyhow!("variadic functions not yet supported"))
+        } else if !params
+            .iter()
+            .all(|param| matches!(param, GenericParam::Lifetime(_)))
+        {
+            // todo: handle lifetimes
+            Err(anyhow!("generic parameters not yet supported"))
+        } else {
+            let mut next_inferred_index = 0;
+
+            mem::swap(&mut next_inferred_index, &mut self.next_inferred_index);
+
+            let mut constraints = Vec::new();
+
+            mem::swap(&mut constraints, &mut self.constraints);
+
+            let mut bindings = Vec::new();
+
+            mem::swap(&mut bindings, &mut self.bindings);
+
+            let name = self.intern(&ident.to_string());
+
+            let mut pats = Vec::with_capacity(inputs.len());
+
+            let parameters = inputs
+                .iter()
+                .map(|arg| match arg {
+                    FnArg::Receiver(Receiver {
+                        reference,
+                        mutability,
+                        attrs,
+                        ..
+                    }) => {
+                        if !attrs.is_empty() {
+                            Err(anyhow!("attributes not yet supported"))
+                        } else {
+                            let type_ = Type::Unresolved(Path {
+                                absolute: false,
+                                segments: Rc::new([self.intern("Self")]),
+                            });
+
+                            // todo: handle lifetime
+                            let type_ = if reference.is_some() {
+                                Type::Reference {
+                                    kind: if mutability.is_some() {
+                                        ReferenceKind::UniqueMutable
+                                    } else {
+                                        ReferenceKind::Shared
+                                    },
+                                    type_: Rc::new(type_),
+                                }
+                            } else {
+                                type_
+                            };
+
+                            let index = self.bindings.len();
+
+                            let term = Some(Rc::new(Term::Parameter(type_)));
+
+                            let binding_term =
+                                Rc::new(RefCell::new(BindingTerm::UntypedAndUninitialized));
+
+                            self.bindings.push(Binding {
+                                name,
+                                mutable: true,
+                                term: binding_term.clone(),
+                                offset: 0,
+                            });
+
+                            Ok(Term::Let {
+                                pattern: Rc::new(Pattern::Binding {
+                                    binding_mode: Some(
+                                        if reference.is_none() && mutability.is_some() {
+                                            BindingMode::MoveMut
+                                        } else {
+                                            BindingMode::Move
+                                        },
+                                    ),
+                                    name: self.intern("self"),
+                                    index,
+                                    term: binding_term,
+                                    subpattern: None,
+                                }),
+                                term,
+                            })
+                        }
+                    }
+
+                    FnArg::Typed(PatType { pat, ty, attrs, .. }) => {
+                        if !attrs.is_empty() {
+                            Err(anyhow!("attributes not yet supported"))
+                        } else {
+                            let type_ = self.type_to_type(ty)?;
+
+                            self.pat_to_param(pat, type_, &mut pats)
+                        }
+                    }
+                })
+                .collect::<Result<_>>()?;
+
+            let patterns = self.pats_to_patterns(pats)?;
+
+            let body = self.block_to_term(stmts)?;
+
+            mem::swap(&mut bindings, &mut self.bindings);
+
+            mem::swap(&mut constraints, &mut self.constraints);
+
+            mem::swap(&mut next_inferred_index, &mut self.next_inferred_index);
+
+            let body = make_body(patterns, body);
+
+            let return_type = if let ReturnType::Type(_, type_) = output {
+                self.type_to_type(type_)?
+            } else {
+                Type::Unit
+            };
+
+            let offset = self.store(self.items.len())?;
+
+            Ok((
+                name,
+                self.add_item(Item::Unresolved(Rc::new(Item::UnresolvedFunction {
+                    parameters,
+                    body,
+                    return_type,
+                    next_inferred_index,
+                    constraints,
+                    unsafe_: unsafety.is_some(),
+                    offset,
+                }))),
+            ))
         }
     }
 
@@ -6140,6 +6448,36 @@ impl Env {
 
                         parameters,
                         body,
+                    })
+                }
+            }
+
+            Expr::MethodCall(ExprMethodCall {
+                receiver,
+                method,
+                args,
+                turbofish,
+                attrs,
+                ..
+            }) => {
+                if !attrs.is_empty() {
+                    Err(anyhow!("attributes not yet supported"))
+                } else if turbofish.is_some() {
+                    Err(anyhow!("turbofish not yet supported"))
+                } else {
+                    let receiver = Rc::new(self.expr_to_term(receiver)?);
+
+                    let method = self.intern(&method.to_string());
+
+                    let arguments = args
+                        .iter()
+                        .map(|arg| self.expr_to_term(arg))
+                        .collect::<Result<_>>()?;
+
+                    Ok(Term::MethodCall {
+                        receiver,
+                        method,
+                        arguments,
                     })
                 }
             }
@@ -7274,8 +7612,8 @@ mod test {
             33_u32,
             eval(
                 "{ struct Foo; \
-                  impl Foo { fn foo() -> u32 { 33 } } \
-                  Foo.foo() }"
+                 impl Foo { fn foo() -> u32 { 33 } } \
+                 Foo::foo() }"
             )
             .unwrap()
         )
@@ -7287,8 +7625,8 @@ mod test {
             5_u32,
             eval(
                 "{ struct Foo(u32); \
-                  impl Foo { fn foo(self) -> u32 { self.0 + 2 } } \
-                  Foo(3).foo() }"
+                 impl Foo { fn foo(self) -> u32 { self.0 + 2 } } \
+                 Foo(3).foo() }"
             )
             .unwrap()
         )
@@ -7300,8 +7638,8 @@ mod test {
             41_u32,
             eval(
                 "{ struct Foo(u32); \
-                  impl Foo { fn foo(&self) -> u32 { self.0 + 33 } } \
-                  Foo(8).foo() }"
+                 impl Foo { fn foo(&self) -> u32 { self.0 + 33 } } \
+                 Foo(8).foo() }"
             )
             .unwrap()
         )
@@ -7313,9 +7651,9 @@ mod test {
             50_u32,
             eval(
                 "{ struct Foo(u32); \
-                  impl Foo { fn foo(&mut self) -> u32 { self.0 -= 33; 12 } } \
-                  let x = Foo(71); \
-                  x.foo() + x.0 }"
+                 impl Foo { fn foo(&mut self) -> u32 { self.0 -= 33; 12 } } \
+                 let x = Foo(71); \
+                 x.foo() + x.0 }"
             )
             .unwrap()
         )
@@ -7327,11 +7665,11 @@ mod test {
             128_u32,
             eval(
                 "{ struct Foo(u32); \
-                  struct Bar(u32); \
-                  trait Baz { fn foo(self, x: u32) -> u32; } \
-                  impl Baz for Foo { fn foo(self, x: u32) -> u32 { self.0 + x + 82 } } \
-                  impl Baz for Bar { fn foo(self, x: u32) -> u32 { self.0 + x + 7 } } \
-                  Foo(5).foo(14) + Bar::foo(Bar(8), 12) }"
+                 struct Bar(u32); \
+                 trait Baz { fn foo(self, x: u32) -> u32; } \
+                 impl Baz for Foo { fn foo(self, x: u32) -> u32 { self.0 + x + 82 } } \
+                 impl Baz for Bar { fn foo(self, x: u32) -> u32 { self.0 + x + 7 } } \
+                 Foo(5).foo(14) + Bar::foo(Bar(8), 12) }"
             )
             .unwrap()
         )
