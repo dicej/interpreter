@@ -523,6 +523,14 @@ impl Type {
             _ => false,
         }
     }
+
+    fn deref_all(&self) -> Type {
+        if let Type::Reference { type_, .. } = self {
+            type_.deref_all()
+        } else {
+            self.clone()
+        }
+    }
 }
 
 fn match_types_now(expected: &Type, actual: &Type) -> Result<()> {
@@ -920,7 +928,7 @@ enum Term {
     MethodCall {
         receiver: Rc<Term>,
         method: NameId,
-        args: Rc<[Term]>,
+        arguments: Rc<[Term]>,
     },
 }
 
@@ -3627,18 +3635,21 @@ impl Env {
             } => {
                 let receiver = self.type_check(receiver)?;
 
+                // todo: how should we handle inferred types here?
+
+                // todo: handle more exotic self types, e.g. Pin<&mut Self>
                 let receiver_type = receiver.type_();
 
-                if let Type::Nominal { item, .. } = &receiver_type {
+                if let Type::Nominal { item, .. } = &receiver_type.deref_all() {
                     // todo: resolve trait methods and/or use Deref/DerefMut to find method
                     let method = match &self.items[item.0] {
                         Item::Enum { methods, .. } | Item::Struct { methods, .. } => {
-                            if let Some(method) = methods.get(&path[0]) {
+                            if let Some(method) = methods.get(method) {
                                 *method
                             } else {
                                 return Err(anyhow!(
                                     "method {} not present in type {receiver_type:?}",
-                                    self.unintern(path[0])
+                                    self.unintern(*method)
                                 ));
                             }
                         }
@@ -3646,11 +3657,71 @@ impl Env {
                         _ => todo!("method lookup for {receiver_type:?}"),
                     };
 
-                    todo!("arguments");
+                    if let Item::Function {
+                        abstraction: Abstraction { parameters, .. },
+                        ..
+                    } = self.items[method.0].clone()
+                    {
+                        if let Some(Parameter { name, type_, .. }) = parameters.get(0) {
+                            if *name == self.intern("self") {
+                                let mut receiver = receiver;
 
-                    self.resolve_item_term(method, Some(arguments))
+                                loop {
+                                    let receiver_type = receiver.type_();
+
+                                    if &receiver_type == type_ {
+                                        break;
+                                    }
+
+                                    if let Type::Reference { kind, type_ } = type_ {
+                                        if &receiver_type == type_.deref() {
+                                            receiver = Term::Reference(Rc::new(Reference {
+                                                kind: *kind,
+                                                term: if let ReferenceKind::UniqueMutable = kind {
+                                                    self.as_mutable(&receiver).ok_or_else(|| {
+                                                        anyhow!(
+                                                            "cannot create mutable reference to \
+                                                             immutable term: {receiver:?}"
+                                                        )
+                                                    })?
+                                                } else {
+                                                    receiver
+                                                },
+                                            }));
+
+                                            continue;
+                                        } else if let Type::Reference { .. } = &receiver_type {
+                                            receiver =
+                                                Term::UnaryOp(UnaryOp::Deref, Rc::new(receiver));
+
+                                            continue;
+                                        }
+                                    }
+
+                                    return Err(anyhow!(
+                                        "cannot coerce {receiver_type:?} to {type_:?} for method call"
+                                    ));
+                                }
+
+                                let arguments = iter::once(receiver)
+                                    .chain(arguments.iter().cloned())
+                                    .enumerate()
+                                    .map(|(index, term)| (self.intern(&index.to_string()), term))
+                                    .collect();
+
+                                self.resolve_item_term(method, Some(arguments))
+                            } else {
+                                Err(anyhow!(
+                                    "cannot call method with no self parameter with a receiver"
+                                ))
+                            }
+                        } else {
+                            Err(anyhow!("cannot call zero-parameter method with a receiver"))
+                        }
+                    } else {
+                        unreachable!()
+                    }
                 } else {
-                    // todo: support calls through references
                     Err(anyhow!(
                         "method calls not yet supported for type: {receiver_type:?}"
                     ))
@@ -4295,7 +4366,7 @@ impl Env {
         item: ItemId,
         arguments: Option<Rc<[(NameId, Term)]>>,
     ) -> Result<Term> {
-        match &self.items[item.0] {
+        Ok(match &self.items[item.0] {
             Item::Variant { item, name } => Term::Variant {
                 type_: self.type_for_item(*item),
                 name: *name,
@@ -4315,13 +4386,8 @@ impl Env {
                 arguments,
             ),
 
-            item => {
-                return Err(anyhow!(
-                    "cannot resolve {} as an expression: {item:?}",
-                    self.unintern_path(path)
-                ))
-            }
-        }
+            item => return Err(anyhow!("cannot resolve item as an expression: {item:?}")),
+        })
     }
 
     fn resolve_term(
@@ -6465,7 +6531,9 @@ impl Env {
                 } else if turbofish.is_some() {
                     Err(anyhow!("turbofish not yet supported"))
                 } else {
-                    let receiver = Rc::new(self.expr_to_term(receiver)?);
+                    let binding_count = self.bindings.len();
+
+                    let receiver = Rc::new(self.expr_to_referenced_term(receiver)?);
 
                     let method = self.intern(&method.to_string());
 
@@ -6474,11 +6542,14 @@ impl Env {
                         .map(|arg| self.expr_to_term(arg))
                         .collect::<Result<_>>()?;
 
-                    Ok(Term::MethodCall {
-                        receiver,
-                        method,
-                        arguments,
-                    })
+                    Ok(self.block_for_temporaries(
+                        binding_count,
+                        Term::MethodCall {
+                            receiver,
+                            method,
+                            arguments,
+                        },
+                    ))
                 }
             }
 
@@ -7633,6 +7704,16 @@ mod test {
     }
 
     #[test]
+    fn bad_inherent_self_move_method() {
+        assert!(eval::<()>(
+            "{ struct Foo(u32); \
+                 impl Foo { fn foo(self) -> u32 { self.0 + 2 } } \
+                 (&Foo(3)).foo() }"
+        )
+        .is_err())
+    }
+
+    #[test]
     fn inherent_self_shared_reference_method() {
         assert_eq!(
             41_u32,
@@ -7646,17 +7727,66 @@ mod test {
     }
 
     #[test]
+    fn inherent_self_shared_reference_method_through_reference() {
+        assert_eq!(
+            41_u32,
+            eval(
+                "{ struct Foo(u32); \
+                 impl Foo { fn foo(&self) -> u32 { self.0 + 33 } } \
+                 (&Foo(8)).foo() }"
+            )
+            .unwrap()
+        )
+    }
+
+    #[test]
     fn inherent_self_unique_reference_method() {
         assert_eq!(
             50_u32,
             eval(
                 "{ struct Foo(u32); \
                  impl Foo { fn foo(&mut self) -> u32 { self.0 -= 33; 12 } } \
-                 let x = Foo(71); \
+                 let mut x = Foo(71); \
                  x.foo() + x.0 }"
             )
             .unwrap()
         )
+    }
+
+    #[test]
+    fn bad_inherent_self_unique_reference_method() {
+        assert!(eval::<()>(
+            "{ struct Foo(u32); \
+             impl Foo { fn foo(&mut self) -> u32 { self.0 -= 33; 12 } } \
+             let x = Foo(71); \
+             x.foo() + x.0 }"
+        )
+        .is_err())
+    }
+
+    #[test]
+    fn inherent_self_unique_reference_method_through_reference() {
+        assert_eq!(
+            50_u32,
+            eval(
+                "{ struct Foo(u32); \
+                 impl Foo { fn foo(&mut self) -> u32 { self.0 -= 33; 12 } } \
+                 let x = &mut Foo(71); \
+                 x.foo() + x.0 }"
+            )
+            .unwrap()
+        )
+    }
+
+    #[test]
+    fn bad_inherent_self_unique_reference_method_through_reference() {
+        assert!(eval::<()>(
+            "{ struct Foo(u32); \
+             impl Foo { fn foo(&mut self) -> u32 { self.0 -= 33; 12 } } \
+             let x = &Foo(71); \
+             x.foo() + x.0 }"
+        )
+        .is_err())
     }
 
     #[test]
