@@ -25,10 +25,10 @@ use {
         ExprField, ExprIf, ExprLit, ExprLoop, ExprMatch, ExprMethodCall, ExprParen, ExprPath,
         ExprReference, ExprStruct, ExprTuple, ExprUnary, FieldPat, Fields, FieldsNamed,
         FieldsUnnamed, FnArg, GenericArgument, GenericParam, Generics, ImplItemMethod, ItemEnum,
-        ItemFn, ItemStruct, Lit, LitBool, Local, Member, Pat, PatIdent, PatLit, PatPath,
+        ItemFn, ItemStruct, ItemTrait, Lit, LitBool, Local, Member, Pat, PatIdent, PatLit, PatPath,
         PatReference, PatRest, PatStruct, PatTuple, PatTupleStruct, PatType, PatWild,
-        PathArguments, PathSegment, Receiver, ReturnType, Signature, Stmt, TypePath, TypeReference,
-        UnOp, Visibility,
+        PathArguments, PathSegment, Receiver, ReturnType, Stmt, TraitItemMethod, TypePath,
+        TypeReference, UnOp, Visibility,
     },
 };
 
@@ -1254,6 +1254,20 @@ enum Item {
         abstraction: Abstraction,
         unsafe_: bool,
         offset: usize,
+    },
+    UnresolvedSignature {
+        parameters: Rc<[Term]>,
+        return_type: Type,
+        unsafe_: bool,
+    },
+    Signature {
+        parameters: Rc<[Parameter]>,
+        return_type: Type,
+        unsafe_: bool,
+    },
+    Trait {
+        unsafe_: bool,
+        items: HashMap<NameId, ItemId>,
     },
 }
 
@@ -4770,6 +4784,11 @@ impl Env {
                             let type_item = *item;
                             let self_name = self.intern("Self");
 
+                            self.scopes.push(Rc::new(RefCell::new(Scope {
+                                items: hashmap![self_name => type_item],
+                                impls: Vec::new(),
+                            })));
+
                             for (name, item) in items.iter() {
                                 if names.contains(name) {
                                     return Err(anyhow!(
@@ -4779,16 +4798,11 @@ impl Env {
                                 } else {
                                     names.insert(*name);
 
-                                    self.scopes.push(Rc::new(RefCell::new(Scope {
-                                        items: hashmap![self_name => type_item],
-                                        impls: Vec::new(),
-                                    })));
-
                                     self.resolve_item(*item)?;
-
-                                    self.scopes.pop();
                                 }
                             }
+
+                            self.scopes.pop();
                         }
 
                         item => return Err(anyhow!("impl not supported for item: {:?}", item)),
@@ -4916,9 +4930,53 @@ impl Env {
                 };
             }
 
+            Item::UnresolvedSignature {
+                parameters,
+                return_type,
+                unsafe_,
+            } => {
+                let return_type = self.resolve_type(return_type)?;
+
+                let binding_count = self.bindings.len();
+
+                let parameters = parameters
+                    .iter()
+                    .map(|parameter| self.type_check_parameter(parameter))
+                    .collect::<Result<_>>()?;
+
+                self.bindings.truncate(binding_count);
+
+                self.items[index.0] = Item::Signature {
+                    parameters,
+                    return_type,
+                    unsafe_: *unsafe_,
+                };
+            }
+
+            Item::Trait { items, .. } => {
+                let self_name = self.intern("Self");
+
+                // todo: use a polymorphic type variable here instead of Type::Never
+                let never_item = self.add_item(Item::Type(Type::Never));
+
+                self.scopes.push(Rc::new(RefCell::new(Scope {
+                    items: hashmap![self_name => never_item],
+                    impls: Vec::new(),
+                })));
+
+                for &item in items.values() {
+                    self.resolve_item(item)?;
+                }
+
+                self.scopes.pop();
+            }
+
             Item::Type(_) | Item::Variant { .. } => (),
 
-            Item::Unavailable | Item::Unresolved(_) | Item::Function { .. } => {
+            Item::Unavailable
+            | Item::Unresolved(_)
+            | Item::Function { .. }
+            | Item::Signature { .. } => {
                 unreachable!()
             }
         }
@@ -5843,6 +5901,83 @@ impl Env {
                         }
                     }
 
+                    syn::Item::Trait(ItemTrait {
+                        unsafety,
+                        ident,
+                        generics:
+                            Generics {
+                                params,
+                                where_clause,
+                                ..
+                            },
+                        supertraits,
+                        items,
+                        attrs,
+                        vis,
+                        auto_token,
+                        ..
+                    }) => {
+                        if !attrs.is_empty() {
+                            Err(anyhow!("attributes not yet supported"))
+                        } else if *vis != Visibility::Inherited {
+                            Err(anyhow!("visibility not yet supported"))
+                        } else if auto_token.is_some() {
+                            Err(anyhow!("auto traits not yet supported"))
+                        } else if !params
+                            .iter()
+                            .all(|param| matches!(param, GenericParam::Lifetime(_)))
+                        {
+                            // todo: handle lifetimes
+                            Err(anyhow!("generic parameters not yet supported"))
+                        } else if where_clause.is_some() {
+                            Err(anyhow!("where clauses not yet supported"))
+                        } else if !supertraits.is_empty() {
+                            Err(anyhow!("supertraits not yet supported"))
+                        } else {
+                            let name = self.intern(&ident.to_string());
+
+                            let mut item_map = HashMap::with_capacity(items.len());
+
+                            for item in items.iter() {
+                                let (name, item) = match item {
+                                    syn::TraitItem::Method(TraitItemMethod {
+                                        sig,
+                                        default,
+                                        attrs,
+                                        ..
+                                    }) => {
+                                        if !attrs.is_empty() {
+                                            Err(anyhow!("attributes not yet supported"))
+                                        } else if let Some(Block { stmts, .. }) = default {
+                                            self.fn_to_function(sig, stmts)
+                                        } else {
+                                            self.sig_to_signature(sig)
+                                        }
+                                    }
+
+                                    _ => Err(anyhow!("item not yet supported: {item:#?}")),
+                                }?;
+
+                                if let Entry::Vacant(e) = item_map.entry(name) {
+                                    e.insert(item);
+                                } else {
+                                    return Err(anyhow!(
+                                        "duplicate item identifier: {}",
+                                        self.unintern(name)
+                                    ));
+                                }
+                            }
+
+                            Ok((
+                                name,
+                                self.add_item(Item::Unresolved(Rc::new(Item::Trait {
+                                    unsafe_: unsafety.is_some(),
+                                    items: item_map,
+                                }))),
+                            ))
+                        }
+                    }
+
                     _ => Err(anyhow!("item not yet supported: {item:#?}")),
                 }?;
 
@@ -5864,9 +5999,94 @@ impl Env {
         }
     }
 
+    fn inputs_to_params<'a>(
+        &mut self,
+        inputs: impl IntoIterator<Item = &'a FnArg>,
+        mut pats: Option<&mut Vec<(usize, &'a Pat)>>,
+    ) -> Result<Rc<[Term]>> {
+        inputs
+            .into_iter()
+            .map(|arg| match arg {
+                FnArg::Receiver(Receiver {
+                    reference,
+                    mutability,
+                    attrs,
+                    ..
+                }) => {
+                    if !attrs.is_empty() {
+                        Err(anyhow!("attributes not yet supported"))
+                    } else {
+                        let type_ = Type::Unresolved(Path {
+                            absolute: false,
+                            segments: Rc::new([self.intern("Self")]),
+                        });
+
+                        // todo: handle lifetime
+                        let type_ = if reference.is_some() {
+                            Type::Reference {
+                                kind: if mutability.is_some() {
+                                    ReferenceKind::UniqueMutable
+                                } else {
+                                    ReferenceKind::Shared
+                                },
+                                type_: Rc::new(type_),
+                            }
+                        } else {
+                            type_
+                        };
+
+                        let index = self.bindings.len();
+
+                        let term = Some(Rc::new(Term::Parameter(type_)));
+
+                        let binding_term =
+                            Rc::new(RefCell::new(BindingTerm::UntypedAndUninitialized));
+
+                        let name = self.intern("self");
+
+                        self.bindings.push(Binding {
+                            name,
+                            mutable: true,
+                            term: binding_term.clone(),
+                            offset: 0,
+                        });
+
+                        Ok(Term::Let {
+                            pattern: Rc::new(Pattern::Binding {
+                                binding_mode: Some(
+                                    if reference.is_none() && mutability.is_some() {
+                                        BindingMode::MoveMut
+                                    } else {
+                                        BindingMode::Move
+                                    },
+                                ),
+                                name,
+                                index,
+                                term: binding_term,
+                                subpattern: None,
+                            }),
+                            term,
+                        })
+                    }
+                }
+
+                FnArg::Typed(PatType { pat, ty, attrs, .. }) => {
+                    if !attrs.is_empty() {
+                        Err(anyhow!("attributes not yet supported"))
+                    } else {
+                        let type_ = self.type_to_type(ty)?;
+
+                        #[allow(clippy::needless_option_as_deref)]
+                        self.pat_to_param(pat, type_, pats.as_deref_mut())
+                    }
+                }
+            })
+            .collect()
+    }
+
     fn fn_to_function(
         &mut self,
-        Signature {
+        syn::Signature {
             asyncness,
             unsafety,
             abi,
@@ -5881,7 +6101,7 @@ impl Env {
             variadic,
             output,
             ..
-        }: &Signature,
+        }: &syn::Signature,
         stmts: &[Stmt],
     ) -> Result<(NameId, ItemId)> {
         if asyncness.is_some() {
@@ -5915,81 +6135,7 @@ impl Env {
 
             let mut pats = Vec::with_capacity(inputs.len());
 
-            let parameters = inputs
-                .iter()
-                .map(|arg| match arg {
-                    FnArg::Receiver(Receiver {
-                        reference,
-                        mutability,
-                        attrs,
-                        ..
-                    }) => {
-                        if !attrs.is_empty() {
-                            Err(anyhow!("attributes not yet supported"))
-                        } else {
-                            let type_ = Type::Unresolved(Path {
-                                absolute: false,
-                                segments: Rc::new([self.intern("Self")]),
-                            });
-
-                            // todo: handle lifetime
-                            let type_ = if reference.is_some() {
-                                Type::Reference {
-                                    kind: if mutability.is_some() {
-                                        ReferenceKind::UniqueMutable
-                                    } else {
-                                        ReferenceKind::Shared
-                                    },
-                                    type_: Rc::new(type_),
-                                }
-                            } else {
-                                type_
-                            };
-
-                            let index = self.bindings.len();
-
-                            let term = Some(Rc::new(Term::Parameter(type_)));
-
-                            let binding_term =
-                                Rc::new(RefCell::new(BindingTerm::UntypedAndUninitialized));
-
-                            self.bindings.push(Binding {
-                                name,
-                                mutable: true,
-                                term: binding_term.clone(),
-                                offset: 0,
-                            });
-
-                            Ok(Term::Let {
-                                pattern: Rc::new(Pattern::Binding {
-                                    binding_mode: Some(
-                                        if reference.is_none() && mutability.is_some() {
-                                            BindingMode::MoveMut
-                                        } else {
-                                            BindingMode::Move
-                                        },
-                                    ),
-                                    name: self.intern("self"),
-                                    index,
-                                    term: binding_term,
-                                    subpattern: None,
-                                }),
-                                term,
-                            })
-                        }
-                    }
-
-                    FnArg::Typed(PatType { pat, ty, attrs, .. }) => {
-                        if !attrs.is_empty() {
-                            Err(anyhow!("attributes not yet supported"))
-                        } else {
-                            let type_ = self.type_to_type(ty)?;
-
-                            self.pat_to_param(pat, type_, &mut pats)
-                        }
-                    }
-                })
-                .collect::<Result<_>>()?;
+            let parameters = self.inputs_to_params(inputs, Some(&mut pats))?;
 
             let patterns = self.pats_to_patterns(pats)?;
 
@@ -6021,6 +6167,65 @@ impl Env {
                     constraints,
                     unsafe_: unsafety.is_some(),
                     offset,
+                }))),
+            ))
+        }
+    }
+
+    fn sig_to_signature(
+        &mut self,
+        syn::Signature {
+            asyncness,
+            unsafety,
+            abi,
+            ident,
+            generics:
+                Generics {
+                    params,
+                    where_clause,
+                    ..
+                },
+            inputs,
+            variadic,
+            output,
+            ..
+        }: &syn::Signature,
+    ) -> Result<(NameId, ItemId)> {
+        if asyncness.is_some() {
+            Err(anyhow!("async fns not yet supported"))
+        } else if abi.is_some() {
+            Err(anyhow!("fn abi not yet supported"))
+        } else if where_clause.is_some() {
+            Err(anyhow!("where clauses not yet supported"))
+        } else if variadic.is_some() {
+            Err(anyhow!("variadic functions not yet supported"))
+        } else if !params
+            .iter()
+            .all(|param| matches!(param, GenericParam::Lifetime(_)))
+        {
+            // todo: handle lifetimes
+            Err(anyhow!("generic parameters not yet supported"))
+        } else {
+            let name = self.intern(&ident.to_string());
+
+            let binding_count = self.bindings.len();
+
+            let parameters = self.inputs_to_params(inputs, None)?;
+
+            self.bindings.truncate(binding_count);
+
+            let return_type = if let ReturnType::Type(_, type_) = output {
+                self.type_to_type(type_)?
+            } else {
+                Type::Unit
+            };
+
+            Ok((
+                name,
+                self.add_item(Item::Unresolved(Rc::new(Item::UnresolvedSignature {
+                    parameters,
+                    return_type,
+                    unsafe_: unsafety.is_some(),
                 }))),
             ))
         }
@@ -6487,7 +6692,7 @@ impl Env {
                                 (pat, self.new_inferred_type(&[]))
                             };
 
-                            self.pat_to_param(pat, type_, &mut pats)
+                            self.pat_to_param(pat, type_, Some(&mut pats))
                         })
                         .collect::<Result<_>>()?;
 
@@ -6561,7 +6766,7 @@ impl Env {
         &mut self,
         pat: &'a Pat,
         type_: Type,
-        pats: &mut Vec<(usize, &'a Pat)>,
+        pats: Option<&mut Vec<(usize, &'a Pat)>>,
     ) -> Result<Term> {
         let index = self.bindings.len();
 
@@ -6572,7 +6777,7 @@ impl Env {
                 pattern: Rc::new(self.pat_to_pattern(pat)?),
                 term,
             }
-        } else {
+        } else if let Some(pats) = pats {
             pats.push((index, pat));
 
             let name = self.intern(&index.to_string());
@@ -6596,6 +6801,8 @@ impl Env {
                 }),
                 term,
             }
+        } else {
+            return Err(anyhow!("expected trivial pattern, got {pat:?}"));
         })
     }
 
