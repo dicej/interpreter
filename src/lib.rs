@@ -423,24 +423,12 @@ struct ItemId(usize);
 #[derive(Clone, Hash, Eq, PartialEq, Copy, Debug)]
 struct Lifetime(NameId);
 
-// todo: will need more fields here for associated types, functions, etc.
-#[derive(Clone, Hash, Eq, PartialEq, Debug)]
-struct Trait {
-    name: NameId,
-    parameters: Rc<[Type]>,
-}
-
 #[derive(Clone, Debug)]
 struct Impl {
     arguments: Rc<[Type]>,
     types: Rc<HashMap<NameId, Type>>,
-    functions: Rc<HashMap<NameId, Abstraction>>,
+    functions: Rc<HashMap<NameId, ItemId>>,
 }
-
-// enum Bound {
-//     Lifetime { long: Lifetime, short: Lifetime },
-//     Trait(Type, Trait),
-// }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 enum ReferenceKind {
@@ -481,12 +469,12 @@ enum Type {
     Inferred(usize),
     TraitArgument {
         type_: Rc<Type>,
-        trait_: Trait,
+        trait_: ItemId,
         index: usize,
     },
     TraitType {
         type_: Rc<Type>,
-        trait_: Trait,
+        trait_: ItemId,
         name: NameId,
     },
 }
@@ -620,7 +608,7 @@ fn make_body(patterns: Vec<Term>, body: Term) -> Term {
 fn maybe_apply(term: Term, arguments: Option<Rc<[(NameId, Term)]>>) -> Term {
     if let Some(arguments) = arguments {
         Term::Application {
-            abstraction: Rc::new(term),
+            function: Rc::new(term),
             arguments: arguments.iter().map(|(_, term)| term.clone()).collect(),
         }
     } else {
@@ -632,7 +620,7 @@ fn maybe_apply(term: Term, arguments: Option<Rc<[(NameId, Term)]>>) -> Term {
 enum Constraint {
     Equal { expected: Type, actual: Type },
     PatternEqual { scrutinee: Type, pattern: Type },
-    Impl { type_: Type, trait_: Trait },
+    Impl { type_: Type, trait_: ItemId },
 }
 
 #[derive(Clone, Debug)]
@@ -674,13 +662,6 @@ struct Parameter {
     name: NameId,
     mutable: bool,
     type_: Type,
-}
-
-#[derive(Clone, Debug)]
-struct Abstraction {
-    // todo: support type and lifetime parameters.
-    parameters: Rc<[Parameter]>,
-    body: Rc<Term>,
 }
 
 #[derive(Clone, Debug)]
@@ -858,10 +839,9 @@ enum Term {
         right: Rc<Term>,
     },
     Application {
-        abstraction: Rc<Term>,
+        function: Rc<Term>,
         arguments: Rc<[Term]>,
     },
-    Abstraction(Abstraction),
     Function {
         type_: Type,
         item: ItemId,
@@ -895,6 +875,10 @@ enum Term {
         type_: Type,
         arguments: Rc<[(NameId, Term)]>,
     },
+    ClosureStruct {
+        type_: Type,
+        arguments: Rc<[(NameId, Term)]>,
+    },
     Variant {
         type_: Type,
         name: NameId,
@@ -921,7 +905,7 @@ enum Term {
     Unresolved(Path),
     TraitFunction {
         type_: Type,
-        trait_: Trait,
+        trait_: ItemId,
         function: NameId,
         return_type: Type,
     },
@@ -939,16 +923,14 @@ impl Term {
                 terms.last().map(|term| term.type_()).unwrap_or(Type::Unit)
             }
             Self::Sequence(terms) => terms.last().map(|term| term.type_()).unwrap_or(Type::Unit),
-            // todo: the return type of an abstraction may be a function of its type parameters
-            Self::Application { abstraction, .. } => match abstraction.deref() {
-                Self::Abstraction(Abstraction { body, .. }) => body.type_(),
-
+            // todo: the return type of an function may depend on its type parameters
+            Self::Application { function, .. } => match function.deref() {
                 Self::TraitFunction { return_type, .. } => return_type.clone(),
 
-                _ => match abstraction.type_() {
+                _ => match function.type_() {
                     Type::Function { return_, .. } => return_.deref().clone(),
 
-                    _ => todo!("{:?}", abstraction.deref()),
+                    _ => todo!("{:?}", function.deref()),
                 },
             },
             Self::And { .. } | Self::Or { .. } => Type::Boolean,
@@ -985,6 +967,7 @@ impl Term {
             | Self::Capture { type_, .. }
             | Self::Loop { type_, .. }
             | Self::Struct { type_, .. }
+            | Self::ClosureStruct { type_, .. }
             | Self::Variant { type_, .. }
             | Self::Function { type_, .. }
             | Self::Parameter(type_)
@@ -1246,12 +1229,14 @@ enum Item {
         return_type: Type,
         body: Term,
         next_inferred_index: usize,
-        constraints: Vec<Constraint>,
+        constraints: Rc<[Constraint]>,
         unsafe_: bool,
         offset: usize,
     },
     Function {
-        abstraction: Abstraction,
+        // todo: support type and lifetime parameters.
+        parameters: Rc<[Parameter]>,
+        body: Term,
         unsafe_: bool,
         offset: usize,
     },
@@ -1267,7 +1252,7 @@ enum Item {
     },
     Trait {
         unsafe_: bool,
-        items: HashMap<NameId, ItemId>,
+        items: Rc<HashMap<NameId, ItemId>>,
     },
 }
 
@@ -1332,13 +1317,12 @@ pub struct Env {
     bindings: Vec<Binding>,
     closure_context: Option<ClosureContext>,
     loops: Vec<Loop>,
-    traits: HashMap<NameId, Trait>,
-    impls: HashMap<(Type, Trait), Option<Impl>>,
+    impls: HashMap<Type, HashMap<ItemId, Option<Impl>>>,
     fn_impls: HashMap<(Type, NameId), Option<Impl>>,
     next_inferred_index: usize,
     constraints: Vec<Constraint>,
     self_type: Option<Type>,
-    integer_trait: Trait,
+    integer_trait: ItemId,
     unit: Literal,
     true_: Literal,
     false_: Literal,
@@ -1397,16 +1381,12 @@ impl Env {
             bindings: Vec::new(),
             closure_context: None,
             loops: Vec::new(),
-            traits: HashMap::new(),
             impls: HashMap::new(),
             fn_impls: HashMap::new(),
             next_inferred_index: 0,
             constraints: Vec::new(),
             self_type: None,
-            integer_trait: Trait {
-                name: NameId(0),
-                parameters: Rc::new([]),
-            },
+            integer_trait: ItemId(0),
             unit: Literal {
                 offset: unit_offset,
                 type_: Type::Unit,
@@ -1421,9 +1401,12 @@ impl Env {
             },
         };
 
-        let integer_trait_name = env.intern("(integer)");
+        let integer_trait = env.add_item(Item::Trait {
+            unsafe_: false,
+            items: Rc::new(HashMap::new()),
+        });
 
-        assert_eq!(env.integer_trait.name, integer_trait_name);
+        assert_eq!(env.integer_trait, integer_trait);
 
         // todo: should load types, traits and impls from core/std source files (lazily if appropriate)
 
@@ -1474,35 +1457,41 @@ impl Env {
         for (op, name, function, types) in unaries {
             let name = env.intern(name);
             let function = env.intern(function);
-            let trait_ = Trait {
-                name,
-                parameters: Rc::new([]),
-            };
 
-            env.traits.insert(name, trait_.clone());
+            // todo: add method signature as item and reference it in trait
+            let trait_ = env.add_item(Item::Trait {
+                unsafe_: false,
+                items: Rc::new(HashMap::new()),
+            });
+
+            env.scopes[0].borrow_mut().items.insert(name, trait_);
 
             for type_ in *types {
-                let abstraction = Abstraction {
+                let offset = env.store(env.items.len())?;
+
+                let method = env.add_item(Item::Function {
                     parameters: Rc::new([Parameter {
                         name: self_,
                         mutable: false,
                         type_: type_.clone(),
                     }]),
-                    body: Rc::new(Term::UnaryOp(
+                    body: Term::UnaryOp(
                         *op,
                         Rc::new(Term::Variable {
                             index: 0,
                             type_: type_.clone(),
                         }),
-                    )),
-                };
+                    ),
+                    unsafe_: false,
+                    offset,
+                });
 
-                env.impls.insert(
-                    (type_.clone(), trait_.clone()),
+                env.impls.entry(type_.clone()).or_default().insert(
+                    trait_,
                     Some(Impl {
                         arguments: Rc::new([]),
                         types: Rc::new(hashmap![output_name => type_.clone()]),
-                        functions: Rc::new(hashmap![function => abstraction]),
+                        functions: Rc::new(hashmap![function => method]),
                     }),
                 );
             }
@@ -1537,15 +1526,19 @@ impl Env {
         for (op, name, function, types) in binaries {
             let name = env.intern(name);
             let function = env.intern(function);
-            let trait_ = Trait {
-                name,
-                parameters: Rc::new([]),
-            };
 
-            env.traits.insert(name, trait_.clone());
+            // todo: add method signature as item and reference it in trait
+            let trait_ = env.add_item(Item::Trait {
+                unsafe_: false,
+                items: Rc::new(HashMap::new()),
+            });
+
+            env.scopes[0].borrow_mut().items.insert(name, trait_);
 
             for type_ in *types {
-                let abstraction = Abstraction {
+                let offset = env.store(env.items.len())?;
+
+                let method = env.add_item(Item::Function {
                     parameters: Rc::new([
                         Parameter {
                             name: self_,
@@ -1558,7 +1551,7 @@ impl Env {
                             type_: type_.clone(),
                         },
                     ]),
-                    body: Rc::new(Term::BinaryOp(
+                    body: Term::BinaryOp(
                         *op,
                         Rc::new(Term::Variable {
                             index: 0,
@@ -1568,15 +1561,17 @@ impl Env {
                             index: 1,
                             type_: type_.clone(),
                         }),
-                    )),
-                };
+                    ),
+                    unsafe_: false,
+                    offset,
+                });
 
-                env.impls.insert(
-                    (type_.clone(), trait_.clone()),
+                env.impls.entry(type_.clone()).or_default().insert(
+                    trait_,
                     Some(Impl {
                         arguments: Rc::new([type_.clone()]),
                         types: Rc::new(hashmap![output_name => type_.clone()]),
-                        functions: Rc::new(hashmap![function => abstraction]),
+                        functions: Rc::new(hashmap![function => method]),
                     }),
                 );
             }
@@ -1593,12 +1588,14 @@ impl Env {
         for (op, name, function, types) in assignments {
             let name = env.intern(name);
             let function = env.intern(function);
-            let trait_ = Trait {
-                name,
-                parameters: Rc::new([]),
-            };
 
-            env.traits.insert(name, trait_.clone());
+            // todo: add method signature as item and reference it in trait
+            let trait_ = env.add_item(Item::Trait {
+                unsafe_: false,
+                items: Rc::new(HashMap::new()),
+            });
+
+            env.scopes[0].borrow_mut().items.insert(name, trait_);
 
             for type_ in *types {
                 let self_type = Type::Reference {
@@ -1606,7 +1603,9 @@ impl Env {
                     type_: Rc::new(type_.clone()),
                 };
 
-                let abstraction = Abstraction {
+                let offset = env.store(env.items.len())?;
+
+                let method = env.add_item(Item::Function {
                     parameters: Rc::new([
                         Parameter {
                             name: self_,
@@ -1619,7 +1618,7 @@ impl Env {
                             type_: type_.clone(),
                         },
                     ]),
-                    body: Rc::new(Term::Assignment {
+                    body: Term::Assignment {
                         left: Rc::new(Term::UnaryOp(
                             UnaryOp::Deref,
                             Rc::new(Term::Variable {
@@ -1641,15 +1640,17 @@ impl Env {
                                 type_: type_.clone(),
                             }),
                         )),
-                    }),
-                };
+                    },
+                    unsafe_: false,
+                    offset,
+                });
 
-                env.impls.insert(
-                    (type_.clone(), trait_.clone()),
+                env.impls.entry(type_.clone()).or_default().insert(
+                    trait_,
                     Some(Impl {
                         arguments: Rc::new([type_.clone()]),
                         types: Rc::new(HashMap::new()),
-                        functions: Rc::new(hashmap![function => abstraction]),
+                        functions: Rc::new(hashmap![function => method]),
                     }),
                 );
             }
@@ -1671,12 +1672,14 @@ impl Env {
 
         for (name, ops_and_functions, types) in comparisons {
             let name = env.intern(name);
-            let trait_ = Trait {
-                name,
-                parameters: Rc::new([]),
-            };
 
-            env.traits.insert(name, trait_.clone());
+            // todo: add method signature as item and reference it in trait
+            let trait_ = env.add_item(Item::Trait {
+                unsafe_: false,
+                items: Rc::new(HashMap::new()),
+            });
+
+            env.scopes[0].borrow_mut().items.insert(name, trait_);
 
             for type_ in *types {
                 let ref_type = Type::Reference {
@@ -1687,45 +1690,48 @@ impl Env {
                 let functions = ops_and_functions
                     .iter()
                     .map(|(op, function)| {
-                        (
-                            env.intern(function),
-                            Abstraction {
-                                parameters: Rc::new([
-                                    Parameter {
-                                        name: self_,
-                                        mutable: false,
-                                        type_: ref_type.clone(),
-                                    },
-                                    Parameter {
-                                        name: other,
-                                        mutable: false,
-                                        type_: ref_type.clone(),
-                                    },
-                                ]),
-                                body: Rc::new(Term::BinaryOp(
-                                    *op,
-                                    Rc::new(Term::UnaryOp(
-                                        UnaryOp::Deref,
-                                        Rc::new(Term::Variable {
-                                            index: 0,
-                                            type_: ref_type.clone(),
-                                        }),
-                                    )),
-                                    Rc::new(Term::UnaryOp(
-                                        UnaryOp::Deref,
-                                        Rc::new(Term::Variable {
-                                            index: 1,
-                                            type_: ref_type.clone(),
-                                        }),
-                                    )),
-                                )),
-                            },
-                        )
-                    })
-                    .collect();
+                        let offset = env.store(env.items.len())?;
 
-                env.impls.insert(
-                    (type_.clone(), trait_.clone()),
+                        let method = env.add_item(Item::Function {
+                            parameters: Rc::new([
+                                Parameter {
+                                    name: self_,
+                                    mutable: false,
+                                    type_: ref_type.clone(),
+                                },
+                                Parameter {
+                                    name: other,
+                                    mutable: false,
+                                    type_: ref_type.clone(),
+                                },
+                            ]),
+                            body: Term::BinaryOp(
+                                *op,
+                                Rc::new(Term::UnaryOp(
+                                    UnaryOp::Deref,
+                                    Rc::new(Term::Variable {
+                                        index: 0,
+                                        type_: ref_type.clone(),
+                                    }),
+                                )),
+                                Rc::new(Term::UnaryOp(
+                                    UnaryOp::Deref,
+                                    Rc::new(Term::Variable {
+                                        index: 1,
+                                        type_: ref_type.clone(),
+                                    }),
+                                )),
+                            ),
+                            unsafe_: false,
+                            offset,
+                        });
+
+                        Ok((env.intern(function), method))
+                    })
+                    .collect::<Result<_>>()?;
+
+                env.impls.entry(type_.clone()).or_default().insert(
+                    trait_,
                     Some(Impl {
                         arguments: Rc::new([type_.clone()]),
                         types: Rc::new(HashMap::new()),
@@ -1889,19 +1895,21 @@ impl Env {
         ItemId(index)
     }
 
-    fn get_fn_impl(&mut self, type_: &Type, trait_: NameId) -> Option<Impl> {
-        if let Some(result) = self.fn_impls.get(&(type_.clone(), trait_)) {
-            result.clone()
-        } else {
-            let impl_ = self.get_blanket_fn_impl(type_, trait_);
+    fn get_fn_impl(&mut self, type_: &Type, trait_: NameId) -> Result<Option<Impl>> {
+        Ok(
+            if let Some(result) = self.fn_impls.get(&(type_.clone(), trait_)) {
+                result.clone()
+            } else {
+                let impl_ = self.get_blanket_fn_impl(type_, trait_)?;
 
-            self.fn_impls.insert((type_.clone(), trait_), impl_.clone());
+                self.fn_impls.insert((type_.clone(), trait_), impl_.clone());
 
-            impl_
-        }
+                impl_
+            },
+        )
     }
 
-    fn get_blanket_fn_impl(&mut self, type_: &Type, trait_: NameId) -> Option<Impl> {
+    fn get_blanket_fn_impl(&mut self, type_: &Type, trait_: NameId) -> Result<Option<Impl>> {
         let self_name = self.intern("self");
 
         if let Type::Function {
@@ -1962,26 +1970,30 @@ impl Env {
                 let fn_name = self.intern(fn_name);
 
                 if trait_ == trait_name {
-                    let abstraction = Abstraction {
-                        parameters: iter::once(Parameter {
-                            name: self_name,
-                            mutable: false,
-                            type_: self_type,
-                        })
-                        .chain(
-                            parameters
-                                .iter()
-                                .enumerate()
-                                .map(|(index, type_)| Parameter {
-                                    name: self.intern(&index.to_string()),
-                                    mutable: false,
-                                    type_: type_.clone(),
-                                }),
-                        )
-                        .collect(),
+                    let offset = self.store(self.items.len())?;
 
-                        body: Rc::new(Term::Application {
-                            abstraction: Rc::new(self_dereffed),
+                    let my_parameters = iter::once(Parameter {
+                        name: self_name,
+                        mutable: false,
+                        type_: self_type,
+                    })
+                    .chain(
+                        parameters
+                            .iter()
+                            .enumerate()
+                            .map(|(index, type_)| Parameter {
+                                name: self.intern(&index.to_string()),
+                                mutable: false,
+                                type_: type_.clone(),
+                            }),
+                    )
+                    .collect();
+
+                    let method = self.add_item(Item::Function {
+                        parameters: my_parameters,
+
+                        body: Term::Application {
+                            function: Rc::new(self_dereffed),
                             arguments: parameters
                                 .iter()
                                 .enumerate()
@@ -1990,42 +2002,51 @@ impl Env {
                                     type_: type_.clone(),
                                 })
                                 .collect(),
-                        }),
-                    };
+                        },
 
-                    return Some(Impl {
+                        unsafe_: false,
+                        offset,
+                    });
+
+                    return Ok(Some(Impl {
                         arguments: parameters.clone(),
                         types: Rc::new(hashmap![output_name => return_.deref().clone()]),
-                        functions: Rc::new(hashmap![fn_name => abstraction]),
-                    });
+                        functions: Rc::new(hashmap![fn_name => method]),
+                    }));
                 }
             }
         }
 
         // todo: search for matching blanket impl and, if found, monomophize it and return the result.
-        None
+        Ok(None)
     }
 
-    fn get_impl(&mut self, type_: &Type, trait_: &Trait) -> Option<Impl> {
-        if let Some(result) = self.impls.get(&(type_.clone(), trait_.clone())) {
-            result.clone()
-        } else {
-            let impl_ = self.get_blanket_impl(type_, trait_);
+    fn get_impl(&mut self, type_: &Type, trait_: ItemId) -> Result<Option<Impl>> {
+        Ok(
+            if let Some(result) = self.impls.get(type_).and_then(|traits| traits.get(&trait_)) {
+                result.clone()
+            } else {
+                let impl_ = self.get_blanket_impl(type_, trait_)?;
 
-            self.impls
-                .insert((type_.clone(), trait_.clone()), impl_.clone());
+                self.impls
+                    .entry(type_.clone())
+                    .or_default()
+                    .insert(trait_, impl_.clone());
 
-            impl_
-        }
+                impl_
+            },
+        )
     }
 
-    fn get_blanket_impl(&mut self, type_: &Type, trait_: &Trait) -> Option<Impl> {
+    fn get_blanket_impl(&mut self, type_: &Type, trait_: ItemId) -> Result<Option<Impl>> {
         let self_name = self.intern("self");
 
         if let Type::Reference { kind, type_: inner } = type_ {
             let target_name = self.intern("Target");
+            let deref_name = self.intern("Deref");
+            let deref_mut_name = self.intern("DerefMut");
 
-            if trait_.name == self.intern("Deref") {
+            if trait_ == *self.scopes[0].borrow().items.get(&deref_name).unwrap() {
                 let self_type = Type::Reference {
                     kind: ReferenceKind::Shared,
                     type_: Rc::new(type_.clone()),
@@ -2033,28 +2054,32 @@ impl Env {
 
                 let function = self.intern("deref");
 
-                let abstraction = Abstraction {
+                let offset = self.store(self.items.len())?;
+
+                let method = self.add_item(Item::Function {
                     parameters: Rc::new([Parameter {
                         name: self_name,
                         mutable: false,
                         type_: self_type.clone(),
                     }]),
-                    body: Rc::new(Term::UnaryOp(
+                    body: Term::UnaryOp(
                         UnaryOp::Deref,
                         Rc::new(Term::Variable {
                             index: 0,
                             type_: self_type,
                         }),
-                    )),
-                };
+                    ),
+                    unsafe_: false,
+                    offset,
+                });
 
-                return Some(Impl {
+                return Ok(Some(Impl {
                     arguments: Rc::new([]),
                     types: Rc::new(hashmap![target_name => inner.deref().clone()]),
-                    functions: Rc::new(hashmap![function => abstraction]),
-                });
+                    functions: Rc::new(hashmap![function => method]),
+                }));
             } else if *kind == ReferenceKind::UniqueMutable
-                && trait_.name == self.intern("DerefMut")
+                && trait_ == *self.scopes[0].borrow().items.get(&deref_mut_name).unwrap()
             {
                 let self_type = Type::Reference {
                     kind: ReferenceKind::UniqueMutable,
@@ -2063,31 +2088,35 @@ impl Env {
 
                 let function = self.intern("deref_mut");
 
-                let abstraction = Abstraction {
+                let offset = self.store(self.items.len())?;
+
+                let method = self.add_item(Item::Function {
                     parameters: Rc::new([Parameter {
                         name: self_name,
                         mutable: false,
                         type_: self_type.clone(),
                     }]),
-                    body: Rc::new(Term::UnaryOp(
+                    body: Term::UnaryOp(
                         UnaryOp::Deref,
                         Rc::new(Term::Variable {
                             index: 0,
                             type_: self_type,
                         }),
-                    )),
-                };
+                    ),
+                    unsafe_: false,
+                    offset,
+                });
 
-                return Some(Impl {
+                return Ok(Some(Impl {
                     arguments: Rc::new([]),
                     types: Rc::new(hashmap![target_name => inner.deref().clone()]),
-                    functions: Rc::new(hashmap![function => abstraction]),
-                });
+                    functions: Rc::new(hashmap![function => method]),
+                }));
             }
         }
 
         // todo: search for matching blanket impl and, if found, monomophize it and return the result.
-        None
+        Ok(None)
     }
 
     fn eval_term(&mut self, term: &Term) -> Result<(), EvalException> {
@@ -2124,25 +2153,23 @@ impl Env {
             }
 
             Term::Application {
-                abstraction,
+                function,
                 arguments,
             } => {
-                let Abstraction { parameters, body } =
-                    if let Term::Abstraction(abstraction) = abstraction.deref() {
-                        abstraction.clone()
-                    } else {
-                        assert!(matches!(abstraction.type_(), Type::Function { .. }));
+                assert!(matches!(function.type_(), Type::Function { .. }));
 
-                        self.eval_term(abstraction)?;
+                self.eval_term(function)?;
 
-                        let item = self.pop::<usize>();
+                let item = self.pop::<usize>();
 
-                        if let Item::Function { abstraction, .. } = &self.items[item] {
-                            abstraction.clone()
-                        } else {
-                            unreachable!()
-                        }
-                    };
+                let (parameters, body) = if let Item::Function {
+                    parameters, body, ..
+                } = &self.items[item]
+                {
+                    (parameters.clone(), body.clone())
+                } else {
+                    unreachable!()
+                };
 
                 let offset = self.stack.offset;
 
@@ -2165,7 +2192,7 @@ impl Env {
 
                 mem::swap(&mut parameters, &mut self.bindings);
 
-                let result = self.eval_term(body.deref());
+                let result = self.eval_term(&body);
 
                 mem::swap(&mut parameters, &mut self.bindings);
 
@@ -2833,14 +2860,14 @@ impl Env {
                 };
 
                 let trait_ = self.intern(trait_);
-                let trait_ = self.traits.get(&trait_).unwrap().clone();
+                let trait_ = *self.scopes[0].borrow().items.get(&trait_).unwrap();
                 let function = self.intern(function);
 
-                self.match_trait(&type_, &trait_)?;
+                self.match_trait(&type_, trait_)?;
 
-                let abstraction = Rc::new(Term::TraitFunction {
+                let function = Rc::new(Term::TraitFunction {
                     type_: type_.clone(),
-                    trait_: trait_.clone(),
+                    trait_,
                     function,
                     return_type: if let UnaryOp::Deref = op {
                         let associated = Type::TraitType {
@@ -2868,7 +2895,7 @@ impl Env {
                     Term::UnaryOp(
                         *op,
                         Rc::new(Term::Application {
-                            abstraction,
+                            function,
                             arguments: Rc::new([Term::Reference(Rc::new(Reference {
                                 kind: ReferenceKind::Shared,
                                 term,
@@ -2877,7 +2904,7 @@ impl Env {
                     )
                 } else {
                     Term::Application {
-                        abstraction,
+                        function,
                         arguments: Rc::new([term]),
                     }
                 })
@@ -2931,10 +2958,10 @@ impl Env {
                 };
 
                 let trait_ = self.intern(trait_);
-                let trait_ = self.traits.get(&trait_).unwrap().clone();
+                let trait_ = *self.scopes[0].borrow().items.get(&trait_).unwrap();
                 let function = self.intern(function);
 
-                self.match_trait(&left_type, &trait_)?;
+                self.match_trait(&left_type, trait_)?;
 
                 let right = self.type_check(right)?;
 
@@ -2942,7 +2969,7 @@ impl Env {
 
                 let argument = self.maybe_resolve(Type::TraitArgument {
                     type_: Rc::new(left_type.clone()),
-                    trait_: trait_.clone(),
+                    trait_,
                     index: 0,
                 })?;
 
@@ -2954,7 +2981,7 @@ impl Env {
                     | BinaryOp::MulAssign
                     | BinaryOp::DivAssign
                     | BinaryOp::RemAssign => Term::Application {
-                        abstraction: Rc::new(Term::TraitFunction {
+                        function: Rc::new(Term::TraitFunction {
                             type_: left_type,
                             trait_,
                             function,
@@ -2971,7 +2998,7 @@ impl Env {
 
                     BinaryOp::Eq | BinaryOp::Ge | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Lt => {
                         Term::Application {
-                            abstraction: Rc::new(Term::TraitFunction {
+                            function: Rc::new(Term::TraitFunction {
                                 type_: left_type,
                                 trait_,
                                 function,
@@ -2993,12 +3020,12 @@ impl Env {
                     _ => {
                         let associated = Type::TraitType {
                             type_: Rc::new(left_type.clone()),
-                            trait_: trait_.clone(),
+                            trait_,
                             name: self.intern("Output"),
                         };
 
                         Term::Application {
-                            abstraction: Rc::new(Term::TraitFunction {
+                            function: Rc::new(Term::TraitFunction {
                                 type_: left_type,
                                 trait_,
                                 function,
@@ -3500,7 +3527,9 @@ impl Env {
                     let trait_name = self.intern(trait_name);
                     let fn_name = self.intern(fn_name);
 
-                    let call = Abstraction {
+                    let offset = self.store(self.items.len())?;
+
+                    let method = self.add_item(Item::Function {
                         parameters: iter::once(Parameter {
                             name: self_name,
                             mutable: false,
@@ -3509,8 +3538,12 @@ impl Env {
                         .chain(parameters.iter().cloned())
                         .collect(),
 
-                        body: Rc::new(body.clone()),
-                    };
+                        body: body.clone(),
+
+                        unsafe_: false,
+
+                        offset,
+                    });
 
                     self.fn_impls.insert(
                         (type_.clone(), trait_name),
@@ -3522,7 +3555,7 @@ impl Env {
 
                             types: Rc::new(hashmap![output_name => body_type.clone()]),
 
-                            functions: Rc::new(hashmap![fn_name => call]),
+                            functions: Rc::new(hashmap![fn_name => method]),
                         }),
                     );
                 }
@@ -3557,17 +3590,17 @@ impl Env {
                     })
                     .collect::<Box<[_]>>();
 
-                Ok(Term::Struct {
+                Ok(Term::ClosureStruct {
                     type_,
                     arguments: self.type_check_arguments(fields.deref(), &arguments)?,
                 })
             }
 
             Term::Application {
-                abstraction,
+                function,
                 arguments,
             } => {
-                if let Term::Unresolved(path) = abstraction.deref() {
+                if let Term::Unresolved(path) = function.deref() {
                     let arguments = arguments
                         .iter()
                         .enumerate()
@@ -3578,7 +3611,7 @@ impl Env {
 
                     self.type_check(&term)
                 } else {
-                    let term = self.type_check(abstraction)?;
+                    let term = self.type_check(function)?;
 
                     let type_ = term.type_();
 
@@ -3603,31 +3636,30 @@ impl Env {
                     for (name, self_) in traits {
                         let name = self.intern(name);
 
-                        // todo: if a given type F implements Fn, then so does &F
+                        // todo: if a given type F implements Fn, then so does &F (likewise for FnMut and &mut F)
+
+                        // todo: move this lookup to after type inference is complete
+
                         if let Some(Impl {
                             arguments: impl_arguments,
                             functions,
                             ..
-                        }) = self.get_fn_impl(&type_, name)
+                        }) = self.get_fn_impl(&type_, name)?
                         {
                             return if impl_arguments.len() == arguments.len() {
-                                Ok(Term::Application {
-                                    abstraction: Rc::new(Term::Abstraction(
-                                        functions.values().next().unwrap().clone(),
-                                    )),
+                                let arguments = iter::once(Ok(self_))
+                                    .chain(arguments.iter().zip(impl_arguments.iter()).map(
+                                        |(argument, type_)| {
+                                            let argument = self.type_check(argument)?;
 
-                                    arguments: iter::once(Ok(self_))
-                                        .chain(arguments.iter().zip(impl_arguments.iter()).map(
-                                            |(argument, type_)| {
-                                                let argument = self.type_check(argument)?;
+                                            self.match_types(type_, &argument.type_())?;
 
-                                                self.match_types(type_, &argument.type_())?;
+                                            Ok(argument)
+                                        },
+                                    ))
+                                    .collect::<Result<_>>()?;
 
-                                                Ok(argument)
-                                            },
-                                        ))
-                                        .collect::<Result<_>>()?,
-                                })
+                                Ok(self.apply_item(*functions.values().next().unwrap(), arguments))
                             } else {
                                 Err(anyhow!(
                                     "incorrect arity for {type_:?} -- expected {}, got {}",
@@ -3654,91 +3686,67 @@ impl Env {
                 // todo: handle more exotic self types, e.g. Pin<&mut Self>
                 let receiver_type = receiver.type_();
 
-                if let Type::Nominal { item, .. } = &receiver_type.deref_all() {
-                    // todo: resolve trait methods and/or use Deref/DerefMut to find method
-                    let method = match &self.items[item.0] {
-                        Item::Enum { methods, .. } | Item::Struct { methods, .. } => {
-                            if let Some(method) = methods.get(method) {
-                                *method
-                            } else {
-                                return Err(anyhow!(
-                                    "method {} not present in type {receiver_type:?}",
-                                    self.unintern(*method)
-                                ));
+                let method = self.find_method(&receiver_type.deref_all(), *method)?;
+
+                let parameters = if let Item::Function { parameters, .. } = &self.items[method.0] {
+                    parameters.clone()
+                } else {
+                    unreachable!()
+                };
+
+                if let Some(Parameter { name, type_, .. }) = parameters.get(0) {
+                    if *name == self.intern("self") {
+                        let mut receiver = receiver;
+
+                        loop {
+                            let receiver_type = receiver.type_();
+
+                            if &receiver_type == type_ {
+                                break;
                             }
-                        }
 
-                        _ => todo!("method lookup for {receiver_type:?}"),
-                    };
-
-                    if let Item::Function {
-                        abstraction: Abstraction { parameters, .. },
-                        ..
-                    } = self.items[method.0].clone()
-                    {
-                        if let Some(Parameter { name, type_, .. }) = parameters.get(0) {
-                            if *name == self.intern("self") {
-                                let mut receiver = receiver;
-
-                                loop {
-                                    let receiver_type = receiver.type_();
-
-                                    if &receiver_type == type_ {
-                                        break;
-                                    }
-
-                                    if let Type::Reference { kind, type_ } = type_ {
-                                        if &receiver_type == type_.deref() {
-                                            receiver = Term::Reference(Rc::new(Reference {
-                                                kind: *kind,
-                                                term: if let ReferenceKind::UniqueMutable = kind {
-                                                    self.as_mutable(&receiver).ok_or_else(|| {
-                                                        anyhow!(
-                                                            "cannot create mutable reference to \
+                            if let Type::Reference { kind, type_ } = type_ {
+                                if &receiver_type == type_.deref() {
+                                    receiver = Term::Reference(Rc::new(Reference {
+                                        kind: *kind,
+                                        term: if let ReferenceKind::UniqueMutable = kind {
+                                            self.as_mutable(&receiver).ok_or_else(|| {
+                                                anyhow!(
+                                                    "cannot create mutable reference to \
                                                              immutable term: {receiver:?}"
-                                                        )
-                                                    })?
-                                                } else {
-                                                    receiver
-                                                },
-                                            }));
+                                                )
+                                            })?
+                                        } else {
+                                            receiver
+                                        },
+                                    }));
 
-                                            continue;
-                                        } else if let Type::Reference { .. } = &receiver_type {
-                                            receiver =
-                                                Term::UnaryOp(UnaryOp::Deref, Rc::new(receiver));
+                                    continue;
+                                } else if let Type::Reference { .. } = &receiver_type {
+                                    receiver = Term::UnaryOp(UnaryOp::Deref, Rc::new(receiver));
 
-                                            continue;
-                                        }
-                                    }
-
-                                    return Err(anyhow!(
-                                        "cannot coerce {receiver_type:?} to {type_:?} for method call"
-                                    ));
+                                    continue;
                                 }
-
-                                let arguments = iter::once(receiver)
-                                    .chain(arguments.iter().cloned())
-                                    .enumerate()
-                                    .map(|(index, term)| (self.intern(&index.to_string()), term))
-                                    .collect();
-
-                                self.resolve_item_term(method, Some(arguments))
-                            } else {
-                                Err(anyhow!(
-                                    "cannot call method with no self parameter with a receiver"
-                                ))
                             }
-                        } else {
-                            Err(anyhow!("cannot call zero-parameter method with a receiver"))
+
+                            return Err(anyhow!(
+                                "cannot coerce {receiver_type:?} to {type_:?} for method call"
+                            ));
                         }
+
+                        Ok(self.apply_item(
+                            method,
+                            iter::once(receiver)
+                                .chain(arguments.iter().cloned())
+                                .collect(),
+                        ))
                     } else {
-                        unreachable!()
+                        Err(anyhow!(
+                            "cannot call method with no self parameter with a receiver"
+                        ))
                     }
                 } else {
-                    Err(anyhow!(
-                        "method calls not yet supported for type: {receiver_type:?}"
-                    ))
+                    Err(anyhow!("cannot call zero-parameter method with a receiver"))
                 }
             }
 
@@ -3804,7 +3812,7 @@ impl Env {
                                 } else {
                                     return Err(anyhow!("expected integer, got {type_:?}"));
                                 }
-                            } else if self.get_impl(&type_, trait_).is_none() {
+                            } else if self.get_impl(&type_, *trait_)?.is_none() {
                                 return Err(anyhow!(
                                     "type {type_:?} does not implement {trait_:?}"
                                 ));
@@ -3855,7 +3863,7 @@ impl Env {
                     .collect::<Result<_>>()?,
             ),
             Term::Literal(Literal { offset, type_ }) => {
-                let flattened_type = self.flatten_type(type_, types);
+                let flattened_type = self.flatten_type(type_, types)?;
 
                 let offset = if let Type::Integer(integer_type) = &flattened_type {
                     if type_.inferred() {
@@ -3884,17 +3892,17 @@ impl Env {
             },
             Term::Variable { index, type_ } => Term::Variable {
                 index: *index,
-                type_: self.flatten_type(type_, types),
+                type_: self.flatten_type(type_, types)?,
             },
             Term::Assignment { left, right } => Term::Assignment {
                 left: Rc::new(self.flatten_term(left, types)?),
                 right: Rc::new(self.flatten_term(right, types)?),
             },
             Term::Application {
-                abstraction,
+                function,
                 arguments,
             } => Term::Application {
-                abstraction: Rc::new(self.flatten_term(abstraction, types)?),
+                function: Rc::new(self.flatten_term(function, types)?),
                 arguments: arguments
                     .iter()
                     .map(|term| self.flatten_term(term, types))
@@ -3939,14 +3947,14 @@ impl Env {
             Term::Loop { label, body, type_ } => Term::Loop {
                 label: *label,
                 body: Rc::new(self.flatten_term(body, types)?),
-                type_: self.flatten_type(type_, types),
+                type_: self.flatten_type(type_, types)?,
             },
             Term::Break { label, term } => Term::Break {
                 label: *label,
                 term: Rc::new(self.flatten_term(term, types)?),
             },
             Term::Struct { type_, arguments } => Term::Struct {
-                type_: self.flatten_type(type_, types),
+                type_: self.flatten_type(type_, types)?,
                 arguments: arguments
                     .iter()
                     .map(|(name, term)| Ok((*name, self.flatten_term(term, types)?)))
@@ -3957,7 +3965,7 @@ impl Env {
                 name,
                 arguments,
             } => Term::Variant {
-                type_: self.flatten_type(type_, types),
+                type_: self.flatten_type(type_, types)?,
                 name: *name,
                 arguments: arguments
                     .iter()
@@ -3966,7 +3974,7 @@ impl Env {
             },
             Term::Field { base, lens, name } => Term::Field {
                 base: Rc::new(self.flatten_term(base, types)?),
-                lens: self.flatten_lens(lens, types),
+                lens: self.flatten_lens(lens, types)?,
                 name: *name,
             },
             Term::Capture { name, mode, .. } => {
@@ -3978,7 +3986,7 @@ impl Env {
                         index: 0,
                         type_: self_type.clone(),
                     }),
-                    lens: self.flatten_lens(&lens, types),
+                    lens: self.flatten_lens(&lens, types)?,
                     name: *name,
                 };
 
@@ -3994,50 +4002,59 @@ impl Env {
                 function,
                 ..
             } => {
-                let type_ = self.flatten_type(type_, types);
+                let type_ = self.flatten_type(type_, types)?;
 
-                Term::Abstraction(
-                    self.get_impl(&type_, trait_)
-                        .unwrap()
-                        .functions
-                        .get(function)
-                        .unwrap()
-                        .clone(),
-                )
+                let function = *self
+                    .get_impl(&type_, *trait_)?
+                    .unwrap()
+                    .functions
+                    .get(function)
+                    .unwrap();
+
+                self.resolve_item_term(function, None)?
             }
-            Term::Abstraction(Abstraction { parameters, body }) => {
-                let parameters = parameters
-                    .iter()
-                    .map(
-                        |Parameter {
-                             name,
-                             mutable,
-                             type_,
-                         }| Parameter {
-                            name: *name,
-                            mutable: *mutable,
-                            type_: self.flatten_type(type_, types),
-                        },
-                    )
-                    .collect::<Rc<[_]>>();
+            Term::ClosureStruct { type_, arguments } => {
+                for trait_name in ["Fn", "FnMut", "FnOnce"] {
+                    let trait_name = self.intern(trait_name);
 
-                let mut self_type = if let Some(Parameter { name, type_, .. }) = parameters.get(0) {
-                    if *name == self.intern("self") {
-                        Some(type_.clone())
-                    } else {
-                        None
+                    if let Some(function) = self
+                        .fn_impls
+                        .get(&(type_.clone(), trait_name))
+                        .and_then(|impl_| impl_.as_ref())
+                        .map(|Impl { functions, .. }| *functions.values().next().unwrap())
+                    {
+                        let (mut self_type, body) = if let Item::Function {
+                            parameters, body, ..
+                        } = &self.items[function.0]
+                        {
+                            (Some(parameters[0].type_.clone()), body.clone())
+                        } else {
+                            unreachable!()
+                        };
+
+                        mem::swap(&mut self_type, &mut self.self_type);
+
+                        let flattened_body = self.flatten_term(&body, types)?;
+
+                        dbg!(&flattened_body);
+
+                        mem::swap(&mut self_type, &mut self.self_type);
+
+                        if let Item::Function { body, .. } = &mut self.items[function.0] {
+                            *body = flattened_body
+                        } else {
+                            unreachable!()
+                        };
                     }
-                } else {
-                    None
-                };
+                }
 
-                mem::swap(&mut self_type, &mut self.self_type);
-
-                let body = Rc::new(self.flatten_term(body, types)?);
-
-                mem::swap(&mut self_type, &mut self.self_type);
-
-                Term::Abstraction(Abstraction { parameters, body })
+                Term::Struct {
+                    type_: type_.clone(),
+                    arguments: arguments
+                        .iter()
+                        .map(|(name, term)| Ok((*name, self.flatten_term(term, types)?)))
+                        .collect::<Result<_>>()?,
+                }
             }
 
             _ => todo!("flatten for {term:?}"),
@@ -4125,7 +4142,7 @@ impl Env {
 
                     *term = match term.deref() {
                         BindingTerm::Uninitialized(type_) => {
-                            BindingTerm::Uninitialized(self.flatten_type(type_, types))
+                            BindingTerm::Uninitialized(self.flatten_type(type_, types)?)
                         }
 
                         BindingTerm::Typed(term) => {
@@ -4157,19 +4174,19 @@ impl Env {
         })
     }
 
-    fn flatten_lens(&mut self, lens: &Lens, types: &[Type]) -> Lens {
-        match lens {
+    fn flatten_lens(&mut self, lens: &Lens, types: &[Type]) -> Result<Lens> {
+        Ok(match lens {
             Lens::Field(Field { type_, offset }) => Lens::Field(Field {
-                type_: self.flatten_type(type_, types),
+                type_: self.flatten_type(type_, types)?,
                 offset: *offset,
             }),
-            Lens::Reference(lens) => Lens::Reference(Rc::new(self.flatten_lens(lens, types))),
+            Lens::Reference(lens) => Lens::Reference(Rc::new(self.flatten_lens(lens, types)?)),
             _ => unreachable!(),
-        }
+        })
     }
 
-    fn flatten_type(&mut self, type_: &Type, types: &[Type]) -> Type {
-        match type_ {
+    fn flatten_type(&mut self, type_: &Type, types: &[Type]) -> Result<Type> {
+        Ok(match type_ {
             Type::Unresolved(_) => unreachable!(),
             Type::Inferred(index) => types[*index].clone(),
             Type::TraitArgument {
@@ -4177,18 +4194,18 @@ impl Env {
                 trait_,
                 index,
             } => {
-                let type_ = self.flatten_type(type_, types);
+                let type_ = self.flatten_type(type_, types)?;
 
-                self.get_impl(&type_, trait_).unwrap().arguments[*index].clone()
+                self.get_impl(&type_, *trait_)?.unwrap().arguments[*index].clone()
             }
             Type::TraitType {
                 type_,
                 trait_,
                 name,
             } => {
-                let type_ = self.flatten_type(type_, types);
+                let type_ = self.flatten_type(type_, types)?;
 
-                self.get_impl(&type_, trait_)
+                self.get_impl(&type_, *trait_)?
                     .unwrap()
                     .types
                     .get(name)
@@ -4197,7 +4214,7 @@ impl Env {
             }
             Type::Reference { kind, type_ } => Type::Reference {
                 kind: *kind,
-                type_: Rc::new(self.flatten_type(type_, types)),
+                type_: Rc::new(self.flatten_type(type_, types)?),
             },
             Type::Nominal {
                 item,
@@ -4209,11 +4226,21 @@ impl Env {
                 arguments: arguments
                     .iter()
                     .map(|argument| self.flatten_type(argument, types))
-                    .collect(),
+                    .collect::<Result<_>>()?,
+            },
+            Type::Function {
+                parameters,
+                return_,
+            } => Type::Function {
+                parameters: parameters
+                    .iter()
+                    .map(|parameter| self.flatten_type(parameter, types))
+                    .collect::<Result<_>>()?,
+                return_: Rc::new(self.flatten_type(return_, types)?),
             },
 
             _ => type_.clone(),
-        }
+        })
     }
 
     fn maybe_flatten_type(&mut self, type_: &Type, types: &[Option<Type>]) -> Result<Type> {
@@ -4232,10 +4259,10 @@ impl Env {
                 if type_.inferred() {
                     Type::TraitArgument {
                         type_: Rc::new(type_),
-                        trait_: trait_.clone(),
+                        trait_: *trait_,
                         index: *index,
                     }
-                } else if let Some(impl_) = self.get_impl(&type_, trait_) {
+                } else if let Some(impl_) = self.get_impl(&type_, *trait_)? {
                     impl_.arguments[*index].clone()
                 } else {
                     return Err(anyhow!("type {type_:?} does not implement {trait_:?}"));
@@ -4251,10 +4278,10 @@ impl Env {
                 if type_.inferred() {
                     Type::TraitType {
                         type_: Rc::new(type_),
-                        trait_: trait_.clone(),
+                        trait_: *trait_,
                         name: *name,
                     }
-                } else if let Some(impl_) = self.get_impl(&type_, trait_) {
+                } else if let Some(impl_) = self.get_impl(&type_, *trait_)? {
                     impl_.types.get(name).unwrap().clone()
                 } else {
                     return Err(anyhow!("type {type_:?} does not implement {trait_:?}"));
@@ -4281,15 +4308,15 @@ impl Env {
         })
     }
 
-    fn match_trait(&mut self, type_: &Type, trait_: &Trait) -> Result<()> {
+    fn match_trait(&mut self, type_: &Type, trait_: ItemId) -> Result<()> {
         if type_.inferred() {
             self.constraints.push(Constraint::Impl {
                 type_: type_.clone(),
-                trait_: trait_.clone(),
+                trait_,
             });
 
             Ok(())
-        } else if self.get_impl(type_, trait_).is_none() {
+        } else if self.get_impl(type_, trait_)?.is_none() {
             Err(anyhow!("type {type_:?} does not implement {trait_:?}"))
         } else {
             Ok(())
@@ -4372,6 +4399,20 @@ impl Env {
             }
 
             Pattern::Unresolved { .. } => unreachable!(),
+        }
+    }
+
+    fn apply_item(&mut self, item: ItemId, arguments: Rc<[Term]>) -> Term {
+        match &self.items[item.0] {
+            Item::Function { offset, .. } => Term::Application {
+                function: Rc::new(Term::Literal(Literal {
+                    type_: self.type_for_item(item),
+                    offset: *offset,
+                })),
+                arguments,
+            },
+
+            _ => unreachable!(),
         }
     }
 
@@ -4572,31 +4613,31 @@ impl Env {
         match term {
             Term::UnaryOp(UnaryOp::Deref, inner) => match inner.deref() {
                 Term::Application {
-                    abstraction,
+                    function,
                     arguments,
                 } => {
                     if let (Term::TraitFunction { type_, .. }, Term::Reference(reference)) =
-                        (abstraction.deref(), &arguments[0])
+                        (function.deref(), &arguments[0])
                     {
                         let trait_ = self.intern("DerefMut");
-                        let trait_ = self.traits.get(&trait_).unwrap().clone();
+                        let trait_ = *self.scopes[0].borrow().items.get(&trait_).unwrap();
                         let function = self.intern("deref_mut");
 
                         self.constraints.push(Constraint::Impl {
                             type_: type_.clone(),
-                            trait_: trait_.clone(),
+                            trait_,
                         });
 
                         let associated = Type::TraitType {
                             type_: Rc::new(type_.clone()),
-                            trait_: trait_.clone(),
+                            trait_,
                             name: self.intern("Target"),
                         };
 
                         Some(Term::UnaryOp(
                             UnaryOp::Deref,
                             Rc::new(Term::Application {
-                                abstraction: Rc::new(Term::TraitFunction {
+                                function: Rc::new(Term::TraitFunction {
                                     type_: type_.clone(),
                                     trait_,
                                     function,
@@ -4768,45 +4809,120 @@ impl Env {
             ..
         } in scope.impls.iter()
         {
-            if let Some(_trait_) = trait_ {
-                todo!()
-            } else {
-                let type_ = self.resolve_type(type_)?;
+            let type_ = self.resolve_type(type_)?;
 
-                if let Type::Nominal { item, .. } = &type_ {
-                    // todo: handle type arguments
+            if let Type::Nominal { item, .. } = &type_ {
+                // todo: handle type arguments
 
-                    // todo: handle non-method items (or rename Item::{Struct|Enum}::methods to items and let them
-                    // hold any and all items)
-                    match self.items[item.0].clone() {
+                // todo: handle non-method items (or rename Item::{Struct|Enum}::methods to items and let them
+                // hold any and all items)
+
+                if let Some(path) = trait_ {
+                    let trait_ = self.find_item(path)?;
+
+                    // todo: enforce orphan rule
+
+                    if self.get_impl(&type_, trait_)?.is_some() {
+                        return Err(anyhow!(
+                            "duplicate trait impl {} for {type_:?}",
+                            self.unintern_path(path)
+                        ));
+                    }
+
+                    let trait_items = if let Item::Trait { items, .. } = &self.items[trait_.0] {
+                        items.clone()
+                    } else {
+                        return Err(anyhow!(
+                            "expected {} to resolve to a trait, but got {:?}",
+                            self.unintern_path(path),
+                            self.items[trait_.0]
+                        ));
+                    };
+
+                    for name in items.keys() {
+                        if !trait_items.contains_key(name) {
+                            return Err(anyhow!(
+                                "unknown item {} for trait {}",
+                                self.unintern(*name),
+                                self.unintern_path(path)
+                            ));
+                        }
+                    }
+
+                    let type_item = *item;
+                    let self_name = self.intern("Self");
+
+                    self.scopes.push(Rc::new(RefCell::new(Scope {
+                        items: hashmap![self_name => type_item],
+                        impls: Vec::new(),
+                    })));
+
+                    for &item in items.values() {
+                        self.resolve_item(item)?;
+                    }
+
+                    self.scopes.pop();
+
+                    let functions = Rc::new(
+                        trait_items
+                            .iter()
+                            .map(|(name, item)| {
+                                Ok((
+                                    *name,
+                                    if let Some(item) = items.get(name) {
+                                        *item
+                                    } else {
+                                        match &self.items[item.0] {
+                                            Item::Function { .. } => *item,
+                                            Item::Signature { .. } => {
+                                                return Err(anyhow!(
+                                                    "missing required item {} for trait {}",
+                                                    self.unintern(*name),
+                                                    self.unintern_path(path)
+                                                ))
+                                            }
+                                            _ => todo!(),
+                                        }
+                                    },
+                                ))
+                            })
+                            .collect::<Result<_>>()?,
+                    );
+
+                    self.impls.entry(type_).or_default().insert(
+                        trait_,
+                        Some(Impl {
+                            arguments: Rc::new([]),
+                            types: Rc::new(HashMap::new()),
+                            functions,
+                        }),
+                    );
+                } else {
+                    let methods = match &self.items[item.0] {
                         Item::Struct { methods, .. } | Item::Enum { methods, .. } => {
-                            let mut names = methods.keys().copied().collect::<HashSet<_>>();
-                            let type_item = *item;
-                            let self_name = self.intern("Self");
-
-                            self.scopes.push(Rc::new(RefCell::new(Scope {
-                                items: hashmap![self_name => type_item],
-                                impls: Vec::new(),
-                            })));
-
-                            for (name, item) in items.iter() {
-                                if names.contains(name) {
-                                    return Err(anyhow!(
-                                        "duplicate method name: {}",
-                                        self.unintern(*name)
-                                    ));
-                                } else {
-                                    names.insert(*name);
-
-                                    self.resolve_item(*item)?;
-                                }
-                            }
-
-                            self.scopes.pop();
+                            methods.clone()
                         }
 
                         item => return Err(anyhow!("impl not supported for item: {:?}", item)),
+                    };
+
+                    let type_item = *item;
+                    let self_name = self.intern("Self");
+
+                    self.scopes.push(Rc::new(RefCell::new(Scope {
+                        items: hashmap![self_name => type_item],
+                        impls: Vec::new(),
+                    })));
+
+                    for (name, item) in items.iter() {
+                        if methods.contains_key(name) {
+                            return Err(anyhow!("duplicate method name: {}", self.unintern(*name)));
+                        } else {
+                            self.resolve_item(*item)?;
+                        }
                     }
+
+                    self.scopes.pop();
 
                     match &mut self.items[item.0] {
                         Item::Struct { methods, .. } | Item::Enum { methods, .. } => {
@@ -4821,9 +4937,9 @@ impl Env {
 
                         _ => unreachable!(),
                     }
-                } else {
-                    todo!("impl for non-nominal type: {:?}", type_)
                 }
+            } else {
+                todo!("impl for non-nominal type: {:?}", type_)
             }
         }
 
@@ -4896,7 +5012,7 @@ impl Env {
 
                 mem::swap(&mut next_inferred_index, &mut self.next_inferred_index);
 
-                let mut constraints = constraints.clone();
+                let mut constraints = constraints.deref().to_owned();
 
                 mem::swap(&mut constraints, &mut self.constraints);
 
@@ -4917,14 +5033,15 @@ impl Env {
 
                 self.match_types(&return_type, &body_type)?;
 
-                let body = Rc::new(self.infer_types(&body)?);
+                let body = self.infer_types(&body)?;
 
                 mem::swap(&mut constraints, &mut self.constraints);
 
                 mem::swap(&mut next_inferred_index, &mut self.next_inferred_index);
 
                 self.items[index.0] = Item::Function {
-                    abstraction: Abstraction { parameters, body },
+                    parameters,
+                    body,
                     unsafe_: *unsafe_,
                     offset: *offset,
                 };
@@ -4969,6 +5086,8 @@ impl Env {
                 }
 
                 self.scopes.pop();
+
+                self.items[index.0] = item.deref().clone();
             }
 
             Item::Type(_) | Item::Variant { .. } => (),
@@ -5036,41 +5155,77 @@ impl Env {
             .collect()
     }
 
+    fn find_method_in_item(
+        &self,
+        item: ItemId,
+        type_: Option<Type>,
+        method: NameId,
+    ) -> Result<ItemId> {
+        // todo: use Deref/DerefMut to find method if necessary
+
+        let type_ = type_.unwrap_or_else(|| self.type_for_item(item));
+
+        let candidates = match &self.items[item.0] {
+            Item::Enum { methods, .. } | Item::Struct { methods, .. } => {
+                methods.get(&method).copied()
+            }
+
+            item => todo!("method lookup for {item:?}"),
+        }
+        .into_iter()
+        .chain(
+            self.impls
+                .get(&type_)
+                .map(|impls| {
+                    impls.values().filter_map(|impl_| {
+                        impl_
+                            .as_ref()
+                            .and_then(|impl_| impl_.functions.get(&method).copied())
+                    })
+                })
+                .into_iter()
+                .flatten(),
+        )
+        .collect::<Box<[_]>>();
+
+        match candidates.deref() {
+            [] => Err(anyhow!(
+                "method {} not found for {type_:?}",
+                self.unintern(method)
+            )),
+
+            [method] => Ok(*method),
+
+            _ => Err(anyhow!(
+                "ambiguous method {} for {type_:?}",
+                self.unintern(method)
+            )),
+        }
+    }
+
+    fn find_method(&self, type_: &Type, method: NameId) -> Result<ItemId> {
+        if let Type::Nominal { item, .. } = type_ {
+            self.find_method_in_item(*item, Some(type_.clone()), method)
+        } else {
+            Err(anyhow!(
+                "method lookup not yet supported for type: {type_:?}"
+            ))
+        }
+    }
+
     fn find_item_in_item(&mut self, item: ItemId, path: &[NameId]) -> Result<ItemId> {
         self.resolve_item(item)?;
 
         if path.is_empty() {
             Ok(item)
         } else {
-            let item = match &self.items[item.0] {
-                Item::Enum {
-                    variants, methods, ..
-                } => {
-                    if let Some(variant) = variants.get(&path[0]) {
-                        variant.item
-                    } else if let Some(method) = methods.get(&path[0]) {
-                        *method
-                    } else {
-                        return Err(anyhow!(
-                            "symbol {} not present in enum",
-                            self.unintern(path[0])
-                        ));
-                    }
-                }
+            let item = match &self.items[item.0].clone() {
+                Item::Enum { variants, .. } => variants.get(&path[0]).map(|variant| variant.item),
 
-                Item::Struct { methods, .. } => {
-                    if let Some(method) = methods.get(&path[0]) {
-                        *method
-                    } else {
-                        return Err(anyhow!(
-                            "symbol {} not present in struct",
-                            self.unintern(path[0])
-                        ));
-                    }
-                }
-
-                _ => todo!("find_item_in_item {:?}", self.items[item.0]),
-            };
+                _ => None,
+            }
+            .map(Ok)
+            .unwrap_or_else(|| self.find_method_in_item(item, None, path[0]))?;
 
             self.find_item_in_item(item, &path[1..])
         }
@@ -5144,8 +5299,7 @@ impl Env {
                 }
             }
             Item::Function {
-                abstraction: Abstraction { parameters, body },
-                ..
+                parameters, body, ..
             } => {
                 // todo: include unsafe, abi, async, etc. in the type
                 Type::Function {
@@ -5972,7 +6126,7 @@ impl Env {
                                 name,
                                 self.add_item(Item::Unresolved(Rc::new(Item::Trait {
                                     unsafe_: unsafety.is_some(),
-                                    items: item_map,
+                                    items: Rc::new(item_map),
                                 }))),
                             ))
                         }
@@ -6119,6 +6273,8 @@ impl Env {
             // todo: handle lifetimes
             Err(anyhow!("generic parameters not yet supported"))
         } else {
+            // todo: do we need to capture scopes here?
+
             let mut next_inferred_index = 0;
 
             mem::swap(&mut next_inferred_index, &mut self.next_inferred_index);
@@ -6164,7 +6320,7 @@ impl Env {
                     body,
                     return_type,
                     next_inferred_index,
-                    constraints,
+                    constraints: Rc::from(constraints),
                     unsafe_: unsafety.is_some(),
                     offset,
                 }))),
@@ -6268,7 +6424,7 @@ impl Env {
                         Lit::Int(lit) => match lit.suffix() {
                             "" => Ok(Term::Literal(Literal {
                                 offset: self.store_slice(lit.base10_digits().as_bytes())?,
-                                type_: self.new_inferred_type(&[self.integer_trait.clone()]),
+                                type_: self.new_inferred_type(&[self.integer_trait]),
                             })),
 
                             suffix => integer_suffix_op!(parse, suffix, self, lit.base10_digits()),
@@ -6577,10 +6733,10 @@ impl Env {
                 } else {
                     let binding_count = self.bindings.len();
 
-                    let abstraction = Rc::new(self.expr_to_referenced_term(func)?);
+                    let function = Rc::new(self.expr_to_referenced_term(func)?);
 
                     let application = Term::Application {
-                        abstraction,
+                        function,
                         arguments: args
                             .iter()
                             .map(|expr| self.expr_to_term(expr))
@@ -6820,15 +6976,15 @@ impl Env {
             .collect()
     }
 
-    fn new_inferred_type(&mut self, traits: &[Trait]) -> Type {
+    fn new_inferred_type(&mut self, traits: &[ItemId]) -> Type {
         let index = self.next_inferred_index;
 
         self.next_inferred_index += 1;
 
-        for trait_ in traits {
+        for &trait_ in traits {
             self.constraints.push(Constraint::Impl {
                 type_: Type::Inferred(index),
-                trait_: trait_.clone(),
+                trait_,
             });
         }
 
@@ -7781,6 +7937,14 @@ mod test {
         assert_eq!(
             68_i32,
             eval("{ let y = 7; let z = |x| x + y; z(61) }").unwrap()
+        )
+    }
+
+    #[test]
+    fn named_shared_ref_closure_through_shared_ref() {
+        assert_eq!(
+            68_i32,
+            eval("{ let y = 7; let z = |x| x + y; (&z)(61) }").unwrap()
         )
     }
 
