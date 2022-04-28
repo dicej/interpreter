@@ -1228,6 +1228,7 @@ enum Item {
         parameters: Rc<[Term]>,
         return_type: Type,
         body: Term,
+        scopes: Rc<[Rc<RefCell<Scope>>]>,
         next_inferred_index: usize,
         constraints: Rc<[Constraint]>,
         unsafe_: bool,
@@ -4817,6 +4818,14 @@ impl Env {
                 // todo: handle non-method items (or rename Item::{Struct|Enum}::methods to items and let them
                 // hold any and all items)
 
+                let type_item = *item;
+                let self_name = self.intern("Self");
+
+                let scope = Some(Rc::new(RefCell::new(Scope {
+                    items: hashmap![self_name => type_item],
+                    impls: Vec::new(),
+                })));
+
                 if let Some(path) = trait_ {
                     let trait_ = self.find_item(path)?;
 
@@ -4849,19 +4858,9 @@ impl Env {
                         }
                     }
 
-                    let type_item = *item;
-                    let self_name = self.intern("Self");
-
-                    self.scopes.push(Rc::new(RefCell::new(Scope {
-                        items: hashmap![self_name => type_item],
-                        impls: Vec::new(),
-                    })));
-
                     for &item in items.values() {
-                        self.resolve_item(item)?;
+                        self.resolve_item_with_scope(item, scope.clone())?;
                     }
-
-                    self.scopes.pop();
 
                     let functions = Rc::new(
                         trait_items
@@ -4906,23 +4905,13 @@ impl Env {
                         item => return Err(anyhow!("impl not supported for item: {:?}", item)),
                     };
 
-                    let type_item = *item;
-                    let self_name = self.intern("Self");
-
-                    self.scopes.push(Rc::new(RefCell::new(Scope {
-                        items: hashmap![self_name => type_item],
-                        impls: Vec::new(),
-                    })));
-
                     for (name, item) in items.iter() {
                         if methods.contains_key(name) {
                             return Err(anyhow!("duplicate method name: {}", self.unintern(*name)));
                         } else {
-                            self.resolve_item(*item)?;
+                            self.resolve_item_with_scope(*item, scope.clone())?;
                         }
                     }
-
-                    self.scopes.pop();
 
                     match &mut self.items[item.0] {
                         Item::Struct { methods, .. } | Item::Enum { methods, .. } => {
@@ -4947,6 +4936,14 @@ impl Env {
     }
 
     fn resolve_item(&mut self, index: ItemId) -> Result<()> {
+        self.resolve_item_with_scope(index, None)
+    }
+
+    fn resolve_item_with_scope(
+        &mut self,
+        index: ItemId,
+        scope: Option<Rc<RefCell<Scope>>>,
+    ) -> Result<()> {
         let item = match &self.items[index.0] {
             Item::Unavailable => {
                 // if this generates false positives, we might be calling `resolve_item` too early or
@@ -5001,12 +4998,21 @@ impl Env {
                 parameters,
                 body,
                 return_type,
+                scopes,
                 next_inferred_index,
                 constraints,
                 unsafe_,
                 offset,
             } => {
                 let return_type = self.resolve_type(return_type)?;
+
+                let mut scopes = scopes.deref().to_owned();
+
+                if let Some(scope) = scope {
+                    scopes.push(scope);
+                }
+
+                mem::swap(&mut scopes, &mut self.scopes);
 
                 let mut next_inferred_index = *next_inferred_index;
 
@@ -5038,6 +5044,8 @@ impl Env {
                 mem::swap(&mut constraints, &mut self.constraints);
 
                 mem::swap(&mut next_inferred_index, &mut self.next_inferred_index);
+
+                mem::swap(&mut scopes, &mut self.scopes);
 
                 self.items[index.0] = Item::Function {
                     parameters,
@@ -6273,8 +6281,6 @@ impl Env {
             // todo: handle lifetimes
             Err(anyhow!("generic parameters not yet supported"))
         } else {
-            // todo: do we need to capture scopes here?
-
             let mut next_inferred_index = 0;
 
             mem::swap(&mut next_inferred_index, &mut self.next_inferred_index);
@@ -6319,6 +6325,7 @@ impl Env {
                     parameters,
                     body,
                     return_type,
+                    scopes: self.scopes.iter().cloned().collect(),
                     next_inferred_index,
                     constraints: Rc::from(constraints),
                     unsafe_: unsafety.is_some(),
