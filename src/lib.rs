@@ -3778,10 +3778,14 @@ impl Env {
             } => {
                 let receiver = self.type_check(receiver)?;
 
-                // todo: how should we handle inferred types here?
-
                 // todo: handle more exotic self types, e.g. Pin<&mut Self>
                 let receiver_type = receiver.type_();
+
+                if receiver_type.inferred() {
+                    // todo: how should we handle inferred types here?  Can you even call a method on a term whose
+                    // type is not yet known?
+                    return Err(anyhow!("method calls on unknown type not yet supported"));
+                }
 
                 let method = self.find_method(&receiver_type.deref_all(), *method)?;
 
@@ -3831,15 +3835,22 @@ impl Env {
                             ));
                         }
 
-                        let term = self.apply_item(
-                            method,
-                            iter::once(receiver)
-                                .chain(arguments.iter().cloned())
-                                .collect(),
-                        );
+                        let arguments = arguments
+                            .iter()
+                            .zip(parameters.iter().skip(1))
+                            .map(|(argument, Parameter { type_, .. })| {
+                                let argument = self.type_check(argument)?;
 
-                        // todo: this type checks receiver twice -- only need to do that once
-                        self.type_check(&term)
+                                self.match_types(type_, &argument.type_())?;
+
+                                Ok(argument)
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+
+                        Ok(self.apply_item(
+                            method,
+                            iter::once(receiver).chain(arguments.into_iter()).collect(),
+                        ))
                     } else {
                         Err(anyhow!(
                             "cannot call method with no self parameter with a receiver"
