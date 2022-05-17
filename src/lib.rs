@@ -6471,7 +6471,7 @@ impl Env {
 
             let body = self.block_to_term(stmts)?;
 
-            mem::swap(&mut bindings, &mut self.bindings);
+            self.bindings = bindings;
 
             mem::swap(&mut closures, &mut self.closures);
 
@@ -8348,6 +8348,102 @@ mod test {
                  impl Baz for Foo { fn foo(self, x: u32) -> u32 { self.0 + x + 82 } } \
                  impl Baz for Bar { fn foo(self, x: u32) -> u32 { self.0 + x + 7 } } \
                  Foo(5).foo(14) + Bar::foo(Bar(8), 12) }"
+            )
+            .unwrap()
+        )
+    }
+
+    #[test]
+    fn generic_identity_function() {
+        assert_eq!(
+            71_i32,
+            eval("{ fn identity<T>(x: T) -> T { x } identity(71) }").unwrap()
+        )
+    }
+
+    #[test]
+    fn bounded_generic_function() {
+        assert_eq!(
+            38_i32,
+            eval(
+                "{ use std::ops::Add; \
+                 fn add<T: Add>(a: T, b: T) -> <T as Add>::Output { a + b } \
+                 add(29, 9) }"
+            )
+            .unwrap()
+        )
+    }
+
+    #[test]
+    fn bounded_generic_function_with_inference() {
+        assert_eq!(
+            41_i32,
+            eval(
+                "{ use std::ops::Add; \
+                 fn add<T: Add>(a: T, b: T) -> <T as Add>::Output { (|x| a + x)(b) } \
+                 foo(29, 12) }"
+            )
+            .unwrap()
+        )
+    }
+
+    #[test]
+    fn generic_struct() {
+        assert_eq!(43_i32, eval("{ struct Foo<T>(T); Foo(43).0 }").unwrap())
+    }
+
+    #[test]
+    fn generic_inherent_method() {
+        assert_eq!(
+            143_i32,
+            eval(
+                "{ use std::ops::Add; \
+                 struct Foo<T>(T); \
+                 impl <T> Foo<T> { fn add<U>(self, b: U) -> <T as Add<U>>::Output where T: Add<U> { self.0 + b } } \
+                 Foo(43).add(100) }"
+            )
+            .unwrap()
+        )
+    }
+
+    #[test]
+    fn generic_trait_method() {
+        assert_eq!(
+            74_i32,
+            eval(
+                r#"{
+    use std::ops::Add;
+
+    trait Bar<T> {
+        fn bar<U>(self, b: U) -> <T as Add<U>>::Output
+        where
+            T: Add<U>, U: Add<Output = U> + Copy;
+    }
+
+    struct Foo<T>(T);
+
+    impl <T> Bar<T> for Foo<T> {
+        fn bar<U>(self, b: U) -> <T as Add<U>>::Output
+        where
+            T: Add<U>, U: Add<Output = U> + Copy
+        {
+            self.0 + b
+        }
+    }
+
+    struct Baz<T>(T);
+
+    impl <T> Bar<T> for Baz<T> {
+        fn bar<U>(self, b: U) -> <T as Add<U>>::Output
+        where
+            T: Add<U>, U: Add<Output = U> + Copy
+        {
+            self.0 + (b + b)
+        }
+    }
+
+    Foo(43).bar(Baz(7).bar(12))
+}"#
             )
             .unwrap()
         )
